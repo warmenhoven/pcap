@@ -394,10 +394,10 @@ create_session(char *host, uint16_t port)
 		send_tcp(sess, TH_SYN);
 		sess->seqno++;
 		sess->state = TCP_SYN_SENT;
-		printf("%s\n", state_names[sess->state]);
+		printf("%d: %s\n", sess->id, state_names[sess->state]);
 	} else {
 		sess->state = TCP_LISTEN;
-		printf("%s\n", state_names[sess->state]);
+		printf("%d: %s\n", sess->id, state_names[sess->state]);
 	}
 
 	return sess;
@@ -420,7 +420,7 @@ accept_session(struct tcp_session *listener, struct tcp_pkt *pkt)
 	send_tcp(sess, TH_SYN | TH_ACK);
 	sess->seqno++;
 	sess->state = TCP_SYN_RECV;
-	printf("%s\n", state_names[sess->state]);
+	printf("%d: %s\n", sess->id, state_names[sess->state]);
 
 	return sess;
 }
@@ -467,7 +467,7 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 		if (pkt->control & TH_ACK) {
 			sess->ackno = ntohl(pkt->seqno) + 1;
 			sess->state = TCP_ESTABLISHED;
-			printf("%s\n", state_names[sess->state]);
+			printf("%d: %s\n", sess->id, state_names[sess->state]);
 		} else {
 			send_rst(pkt->ip.src_ip, ntohs(pkt->src_prt),
 				 ntohs(pkt->dst_prt), ntohl(pkt->ackno),
@@ -478,14 +478,25 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 		break;
 	case TCP_SYN_SENT:
 		if ((pkt->control & TH_SYN) && (pkt->control & TH_ACK)) {
+			if (ntohl(pkt->ackno) != sess->seqno) {
+				fprintf(stderr, "Invalid ackno\n");
+				send_rst(pkt->ip.src_ip, ntohs(pkt->src_prt),
+					 ntohs(pkt->dst_prt), ntohl(pkt->ackno),
+					 ntohl(pkt->seqno) + 1,
+					 sess->state, pkt->control);
+				remove_session(sess);
+				return;
+			}
 			sess->ackno = ntohl(pkt->seqno) + 1;
 			send_tcp(sess, TH_ACK);
 			sess->state = TCP_ESTABLISHED;
-			printf("%s\n", state_names[sess->state]);
+			printf("%d: %s\n", sess->id, state_names[sess->state]);
+		} else if (pkt->control & TH_SYN) {
+			sess->ackno = ntohl(pkt->seqno) + 1;
+			send_tcp(sess, TH_ACK);
+			sess->state = TCP_SYN_RECV;
+			printf("%d: %s\n", sess->id, state_names[sess->state]);
 		} else {
-			/* XXX actually if we get SYN but no ACK we're supposed
-			 * to send an ACK, go to SYN_RECV, and wait for the ACK
-			 * to our SYN. but I don't care about that. */
 			send_rst(pkt->ip.src_ip, ntohs(pkt->src_prt),
 				 ntohs(pkt->dst_prt), ntohl(pkt->ackno),
 				 ntohl(pkt->seqno) + 1,
@@ -502,11 +513,7 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 			send_tcp(sess, TH_FIN | TH_ACK);
 			sess->seqno++;
 			sess->state = TCP_LAST_ACK;
-			printf("%s\n", state_names[sess->state]);
-		} else if (pkt->control & TH_PUSH) {
-			if (pkt->control & TH_ACK) {
-			} else {
-			}
+			printf("%d: %s\n", sess->id, state_names[sess->state]);
 		}
 		/* XXX there are more cases of things to do here */
 		break;
@@ -516,7 +523,7 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 			sess->ackno = ntohl(pkt->seqno) + 1;
 			send_tcp(sess, TH_ACK);
 			sess->state = TCP_TIME_WAIT;
-			printf("%s\n", state_names[sess->state]);
+			printf("%d: %s\n", sess->id, state_names[sess->state]);
 			/* we should move to TIME_WAIT in case if the other
 			 * side doesn't receive our ACK, but we just assume
 			 * everything went well */
@@ -529,7 +536,7 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 			sess->ackno = ntohl(pkt->seqno) + 1;
 			send_tcp(sess, TH_ACK);
 			sess->state = TCP_CLOSING;
-			printf("%s\n", state_names[sess->state]);
+			printf("%d: %s\n", sess->id, state_names[sess->state]);
 			/* just like TIME_WAIT, we should move to CLOSING, but
 			 * we just assume everything went well */
 			remove_session(sess);
@@ -539,7 +546,7 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 		if (pkt->control & TH_ACK) {
 			/* we've got the ACK, now we're waiting for the FIN */
 			sess->state = TCP_FIN_WAIT2;
-			printf("%s\n", state_names[sess->state]);
+			printf("%d: %s\n", sess->id, state_names[sess->state]);
 			break;
 		}
 
@@ -555,7 +562,7 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 			sess->ackno = ntohl(pkt->seqno) + 1;
 			send_tcp(sess, TH_ACK);
 			sess->state = TCP_TIME_WAIT;
-			printf("%s\n", state_names[sess->state]);
+			printf("%d: %s\n", sess->id, state_names[sess->state]);
 			/* just like above, we should move to TIME_WAIT, but
 			 * we just assume everything went well */
 			remove_session(sess);
@@ -583,7 +590,7 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 		if (pkt->control & TH_ACK) {
 			/* now we can remove the session */
 			sess->state = TCP_CLOSE;
-			printf("%s\n", state_names[sess->state]);
+			printf("%d: %s\n", sess->id, state_names[sess->state]);
 			remove_session(sess);
 		} else {
 			send_rst(pkt->ip.src_ip, ntohs(pkt->src_prt),
@@ -709,7 +716,8 @@ process_input(void)
 					send_tcp(sess, TH_FIN | TH_ACK);
 					sess->seqno++;
 					sess->state = TCP_FIN_WAIT1;
-					printf("%s\n",
+					printf("%d: %s\n",
+					       sess->id,
 					       state_names[sess->state]);
 				}
 				break;
