@@ -189,7 +189,8 @@ struct ip_pkt {
 
 struct tcp_pkt {
 	struct ip_pkt ip;	/* XXX this is wrong. I'll fix it once I start
-						   testing with servers other than Linux. */
+						   supporting ip options (which means a variable ip
+						   header length due to the options) */
 	uint16_t src_prt;
 	uint16_t dst_prt;
 	uint32_t seqno;
@@ -717,17 +718,52 @@ state_machine(TCB *sess, struct tcp_pkt *pkt)
 }
 
 static void
-process_packet(void)
+process_tcp_packet(u_char *pkt)
 {
-	struct pcap_pkthdr hdr;
-	u_char *pkt;
-
-	struct ip_pkt *ip;
 	struct tcp_pkt *tcp;
 	TCB *sess;
 
 	uint16_t csum;
 	int sum, len;
+
+	tcp = (struct tcp_pkt *)pkt;
+	csum = tcp->csum;
+	tcp->csum = 0;
+	sum = libnet_in_cksum((u_int16_t *)&tcp->ip.src_ip, 8);
+	len = ntohs(tcp->ip.len) - (tcp->ip.ihl << 2);
+	sum += ntohs(IPPROTO_TCP + len);
+	sum += libnet_in_cksum((u_int16_t *)&tcp->src_prt, len);
+	tcp->csum = LIBNET_CKSUM_CARRY(sum);
+	if (csum != tcp->csum) {
+		fprintf(stderr, "checksum mismatch in TCP header!\n");
+		free(pkt);
+		return;
+	}
+
+	/* maybe we should move this check to state_machine. */
+	if (!(sess = find_session(tcp->ip.src_ip, ntohs(tcp->src_prt),
+							  ntohs(tcp->dst_prt)))) {
+		send_rst(tcp->ip.src_ip, ntohs(tcp->src_prt),
+				 ntohs(tcp->dst_prt), ntohl(tcp->ackno),
+				 ntohl(tcp->seqno) + 1, TCP_CLOSE, tcp->control);
+		free(pkt);
+		return;
+	}
+
+	/* this is where the real work is */
+	state_machine(sess, tcp);
+
+}
+
+static void
+process_ip_packet(void)
+{
+	struct pcap_pkthdr hdr;
+	u_char *pkt;
+
+	struct ip_pkt *ip;
+
+	int len;
 
 	/* XXX this section needs to be fixed, it assumes too much */
 	if (read(sp[1], &hdr, sizeof (hdr)) != sizeof (hdr))
@@ -754,52 +790,35 @@ process_packet(void)
 
 	ip = (struct ip_pkt *)pkt;
 
-	/* XXX there are more IP options that we need to deal with. until then
-	 * this program isn't a stack, it's a hack. */
-	csum = ip->hdr_csum;
-	ip->hdr_csum = 0;
-	sum = libnet_in_cksum((u_int16_t *)ip + sizeof (struct enet) / 2,
-						  ip->ihl << 2);
-	ip->hdr_csum = LIBNET_CKSUM_CARRY(sum);
-	if (csum != ip->hdr_csum) {
-		fprintf(stderr, "checksum mismatch in IP header!\n");
+	if (ip->ihl != 5) {
+		/* XXX there are more IP options that we need to deal with. until then
+		 * this program isn't a stack, it's a hack. */
+
+		/* XXX we don't deal with options. even worse, we don't send an icmp
+		 * message saying we don't. worse still, we don't send a RST either, so
+		 * we'll just keep getting this packet over and over. */
+		fprintf(stderr, "ip header length != 5!\n");
 		free(pkt);
 		return;
 	}
 
-	/* we only deal with TCP, because the host screws up ICMP for us */
+	if (ip->flags & 0x1) {
+		/* XXX we don't deal with fragmentation at all (and again, don't tell
+		 * whoever we're talking to that we don't) */
+		fprintf(stderr, "fragmentation being used (%x)\n", ip->flags);
+		free(pkt);
+		return;
+	}
+
+	/* we only deal with TCP, because the host screws up ICMP for us. I wish I
+	 * could remember how the host screws up ICMP. thinking about it now, I
+	 * don't think it should. but whatever. */
 	if (ip->protocol != IPPROTO_TCP) {
 		free(pkt);
 		return;
 	}
 
-	tcp = (struct tcp_pkt *)pkt;
-	csum = tcp->csum;
-	tcp->csum = 0;
-	sum = libnet_in_cksum((u_int16_t *)&ip->src_ip, 8);
-	len = ntohs(ip->len) - (ip->ihl << 2);
-	sum += ntohs(IPPROTO_TCP + len);
-	sum += libnet_in_cksum((u_int16_t *)&tcp->src_prt, len);
-	tcp->csum = LIBNET_CKSUM_CARRY(sum);
-	if (csum != tcp->csum) {
-		fprintf(stderr, "checksum mismatch in TCP header!\n");
-		free(pkt);
-		return;
-	}
-
-	/* maybe we should move this check to state_machine. */
-	if (!(sess = find_session(ip->src_ip, ntohs(tcp->src_prt),
-							  ntohs(tcp->dst_prt)))) {
-		send_rst(ip->src_ip, ntohs(tcp->src_prt),
-				 ntohs(tcp->dst_prt), ntohl(tcp->ackno),
-				 ntohl(tcp->seqno) + 1, TCP_CLOSE, tcp->control);
-		free(pkt);
-		return;
-	}
-
-	/* this is where the real work is */
-	state_machine(sess, tcp);
-
+	process_tcp_packet(pkt);
 	free(pkt);
 }
 
@@ -891,7 +910,9 @@ control_main(void *arg ATTRIBUTE_UNUSED)
 			process_input();
 
 		if (FD_ISSET(sp[1], &set))
-			process_packet();
+			/* we assume everything pcap gives is is IP, because we assume that
+			 * the pcap thread handles everything else itself */
+			process_ip_packet();
 	}
 }
 
@@ -938,14 +959,26 @@ static void
 packet_main(u_char *user ATTRIBUTE_UNUSED,
 			const struct pcap_pkthdr *hdr, const u_char *pkt)
 {
-	/* XXX at some point we should be checking packet size so that e.g. the
-	 * IP header really is at least 5 bytes. some of these checks should be
-	 * here and some of them should be in process_packet and some should be
-	 * in state_machine. (and some of them should be in the host and in
-	 * pcap, so this might not be necessary.)*/
 	struct enet *enet = (struct enet *)pkt;
 	if (ntohs(enet->type) == ETHERTYPE_IP) {
 		struct ip_pkt *ip = (struct ip_pkt *)pkt;
+		uint16_t csum;
+		int sum;
+
+		if (ip->ihl < 5 || ip->ver != 4)
+			return;
+		/* XXX should probably check ip->ihl vs. hdr->len. in fact should
+		 * probably check hdr->len before checking anything. */
+
+		csum = ip->hdr_csum;
+		ip->hdr_csum = 0;
+		sum = libnet_in_cksum((u_int16_t *)ip + sizeof (struct enet) / 2,
+							  ip->ihl << 2);
+		ip->hdr_csum = LIBNET_CKSUM_CARRY(sum);
+		if (csum != ip->hdr_csum) {
+			fprintf(stderr, "checksum mismatch in IP header!\n");
+			return;
+		}
 
 		/* if it's not for us, we ignore it */
 		if (ip->dst_ip != src_ip)
