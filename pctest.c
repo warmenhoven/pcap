@@ -347,6 +347,7 @@ create_session(char *host, uint16_t port)
 
 	pthread_mutex_lock(&snslck);
 	sessions = list_append(sessions, sess);
+	/* this is technically wrong but I doubt next_id will ever wrap */
 	sess->id = next_id;
 	printf("created session %d using port %d\n", next_id++, sess->src_prt);
 	pthread_mutex_unlock(&snslck);
