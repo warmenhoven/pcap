@@ -248,10 +248,11 @@ static void state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 			/* we send both the FIN and the ACK together, and move
 			 * right through CLOSE_WAIT to LAST_ACK */
 			send_tcp(sess, TH_FIN | TH_ACK);
-			/* we should move to LAST_ACK in case the other side
-			 * sends this packet again, but since we don't do
-			 * timers and we don't feel like waiting around until
-			 * the user kills us, we just exit. */
+			/* we should move to LAST_ACK, and either wait for the
+			 * ACK back or retry this packet after a timeout. but
+			 * since we don't do timers and we don't feel like
+			 * waiting around until the user kills us, we just
+			 * assume we will get our ACK back fine and exit. */
 			/* sess->state = LAST_ACK; */
 			exit(0);
 		}
@@ -281,12 +282,13 @@ static void state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 		if (pkt->control & TH_ACK) {
 			/* we've got the ACK, now we're waiting for the FIN */
 			sess->state = FIN_WAIT_2;
+			break;
 		}
 
 		/* we didn't get ACK or FIN, so we RST */
 		send_tcp(sess, TH_RST);
-		fprintf(stderr, "RST'ing (State = SYN_SENT, Control = %02x)\n",
-			pkt->control);
+		fprintf(stderr, "RST'ing (State = FIN_WAIT_1, "
+			"Control = %02x)\n", pkt->control);
 		exit(1);
 
 		break;
@@ -303,8 +305,8 @@ static void state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 
 		/* we're waiting for FIN but didn't get it, so RST */
 		send_tcp(sess, TH_RST);
-		fprintf(stderr, "RST'ing (State = SYN_SENT, Control = %02x)\n",
-			pkt->control);
+		fprintf(stderr, "RST'ing (State = FIN_WAIT_2, "
+			"Control = %02x)\n", pkt->control);
 		exit(1);
 
 		break;
@@ -433,11 +435,9 @@ int main(int argc, char **argv)
 	sig_sess = sess;
 	signal(SIGINT, sighandler);
 
-	/* XXX instead of this we should have our own loop, and while idle,
-	 * check for packets, so that we could have timers and such of our own.
-	 * it would be better if pcap gave us something we could "listen" on, a
-	 * la select(2), so that we could just add an io channel. can you tell
-	 * I've worked with glib before */
+	/* XXX instead of this we should have our own loop, and check for
+	 * packets using pcap_fileno(3) and select(2), so that we could have
+	 * timers and such of our own. */
 	pcap_loop(lph, -1, packet_cb, (void *)sess);
 
 	/* I don't think we'll ever get here, unless things go very wrong */
