@@ -24,28 +24,13 @@
 #include <pcap.h>
 #include <pthread.h>
 
-const char *state_names[] = {
-	"UNKNOWN",
-	"ESTABLISHED",
-	"SYN_SENT",
-	"SYN_RECV",
-	"FIN_WAIT1",
-	"FIN_WAIT2",
-	"TIME_WAIT",
-	"TCP_CLOSE",
-	"CLOSE_WAIT",
-	"LAST_ACK",
-	"LISTEN",
-	"CLOSING",
-};
-
+/* LIST { */
 typedef struct _list {
 	struct _list *next;
 	void *data;
 } list;
 typedef int (*cmpfnc)(const void *, const void *);
 
-/* define all the list functions */
 static list *
 list_new(void *data)
 {
@@ -108,7 +93,9 @@ list_insert_sorted(list *l, void *data, cmpfnc f)
 	s->next = list_new(data);
 	return l;
 }
+/* } */
 
+/* TIMER { */
 struct timer {
 	struct timeval end;
 	void (*func)(void *);
@@ -157,7 +144,7 @@ timer_cancel(struct timer *timer)
 }
 
 static struct timeval *
-timer_get_sleep_time(struct timeval *tv)
+timer_sleep_time(struct timeval *rtv)
 {
 	if (timers) {
 		/* we keep the timers in order sorted by when they're going to
@@ -165,28 +152,15 @@ timer_get_sleep_time(struct timeval *tv)
 		 * always be the first to expire and so we can use it to figure out
 		 * how long to tell select to sleep */
 		struct timer *timer = timers->data;
+		struct timeval tv;
 
-		gettimeofday(tv, NULL);
+		gettimeofday(&tv, NULL);
 
-		if (timer->end.tv_sec > tv->tv_sec) {
-			tv->tv_sec = 0;
-		} else {
-			tv->tv_sec -= timer->end.tv_sec;
-		}
+		timersub(&timer->end, &tv, rtv);
+		if (rtv->tv_sec < 0)
+			timerclear(rtv);
 
-		if (timer->end.tv_usec > tv->tv_usec) {
-			if (tv->tv_sec) {
-				tv->tv_sec--;
-				tv->tv_usec = 1000000 - timer->end.tv_usec;
-			} else {
-				tv->tv_sec = 0;
-				tv->tv_usec = 0;
-			}
-		} else {
-			tv->tv_usec -= timer->end.tv_usec;
-		}
-
-		return tv;
+		return rtv;
 	} else {
 		return NULL;
 	}
@@ -195,29 +169,42 @@ timer_get_sleep_time(struct timeval *tv)
 static void
 timer_process_pending(void)
 {
-	list *cur, *next;
 	struct timeval tv;
 
-	cur = timers;
 	gettimeofday(&tv, NULL);
-	while (cur) {
-		struct timer *timer = cur->data;
-		next = cur->next;
-		/* we get away with this because the timespec is the first element
+	/* timers are sorted by when they expire. the first on the list will always
+	 * be the first that needs to get processed. after processing it, we remove
+	 * it from the list. if we come across one that doesn't need processing, all
+	 * subsequent ones won't need processing, so we can return. */
+	while (timers) {
+		struct timer *timer = timers->data;
+		/* we get away with this because the timeval is the first element
 		 * of the timer */
 		if (timer_cmp(timer, &tv) <= 0) {
 			if (timer->func)
 				timer->func(timer->arg);
 			timer_cancel(timer);
-			cur = next;
 		} else {
-			/* again, since the timers are sorted by when they expire, as
-			 * soon as you come across one that hasn't expired yet, you know
-			 * that all the rest of them won't have expired yet */
-			break;
+			return;
 		}
 	}
 }
+/* } */
+
+static const char *state_names[] = {
+	"UNKNOWN",
+	"ESTABLISHED",
+	"SYN_SENT",
+	"SYN_RECV",
+	"FIN_WAIT1",
+	"FIN_WAIT2",
+	"TIME_WAIT",
+	"TCP_CLOSE",
+	"CLOSE_WAIT",
+	"LAST_ACK",
+	"LISTEN",
+	"CLOSING",
+};
 
 typedef struct tcp_session {
 	uint32_t id;	/* heh. a more appropriate name might be 'fd'. */
@@ -336,48 +323,6 @@ static list *sessions = NULL;
 static list *open_connections = NULL;
 static list *listeners = NULL;
 static int sp[2];
-
-static pcap_t *
-init_pcap(void)
-{
-	char errbuf[PCAP_ERRBUF_SIZE];
-	char *dev;
-	pcap_t *lph;
-
-	bpf_u_int32 net;
-	bpf_u_int32 mask;
-	char *filter_line;
-	struct bpf_program filter;
-
-	if (!(dev = pcap_lookupdev(errbuf))) {
-		fprintf(stderr, "%s\n", errbuf);
-		return NULL;
-	}
-
-	if (!(lph = pcap_open_live(dev, BUFSIZ, 0, 0, errbuf))) {
-		fprintf(stderr, "%s\n", errbuf);
-		return NULL;
-	}
-
-	if (pcap_lookupnet(dev, &net, &mask, errbuf) == -1) {
-		fprintf(stderr, "%s\n", errbuf);
-		return NULL;
-	}
-
-	filter_line = malloc(4 + 5 + (4*4));
-	/* this filter line should give us everything we need (including arp
-	 * requests) */
-	sprintf(filter_line, "dst host %s",
-			libnet_addr2name4(src_ip, LIBNET_DONT_RESOLVE));
-	pcap_compile(lph, &filter, filter_line, 0, net);
-	free(filter_line);
-
-	if (pcap_setfilter(lph, &filter) == -1) {
-		fprintf(stderr, "%s\n", errbuf);
-		return NULL;
-	}
-	return lph;
-}
 
 static int
 send_tcp(TCB *sess, int flags)
@@ -1180,7 +1125,7 @@ control_main(void *arg __attribute__((__unused__)))
 		FD_SET(0, &set);
 		FD_SET(sp[1], &set);
 
-		ptv = timer_get_sleep_time(&tv);
+		ptv = timer_sleep_time(&tv);
 
 		if (select(sp[1] + 1, &set, NULL, NULL, ptv) < 0)
 			exit(1);
@@ -1197,6 +1142,7 @@ control_main(void *arg __attribute__((__unused__)))
 	}
 }
 
+/* PCAP { */
 /* TODO: convince the host we're running on that it can safely ignore us */
 static int
 arp_reply(unsigned char hw[6], uint32_t ip)
@@ -1295,6 +1241,49 @@ packet_main(u_char *user __attribute__((__unused__)),
 			arp_reply(arp->src_hw, arp->src_ip);
 	}
 }
+
+static pcap_t *
+init_pcap(void)
+{
+	char errbuf[PCAP_ERRBUF_SIZE];
+	char *dev;
+	pcap_t *lph;
+
+	bpf_u_int32 net;
+	bpf_u_int32 mask;
+	char *filter_line;
+	struct bpf_program filter;
+
+	if (!(dev = pcap_lookupdev(errbuf))) {
+		fprintf(stderr, "%s\n", errbuf);
+		return NULL;
+	}
+
+	if (!(lph = pcap_open_live(dev, BUFSIZ, 0, 0, errbuf))) {
+		fprintf(stderr, "%s\n", errbuf);
+		return NULL;
+	}
+
+	if (pcap_lookupnet(dev, &net, &mask, errbuf) == -1) {
+		fprintf(stderr, "%s\n", errbuf);
+		return NULL;
+	}
+
+	filter_line = malloc(4 + 5 + (4*4));
+	/* this filter line should give us everything we need (including arp
+	 * requests) */
+	sprintf(filter_line, "dst host %s",
+			libnet_addr2name4(src_ip, LIBNET_DONT_RESOLVE));
+	pcap_compile(lph, &filter, filter_line, 0, net);
+	free(filter_line);
+
+	if (pcap_setfilter(lph, &filter) == -1) {
+		fprintf(stderr, "%s\n", errbuf);
+		return NULL;
+	}
+	return lph;
+}
+/* } */
 
 int
 main(int argc, char **argv)
