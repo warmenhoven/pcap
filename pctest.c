@@ -270,13 +270,13 @@ find_session(uint32_t dst_ip, uint32_t dst_prt, uint32_t src_prt)
 		if (sess->src_prt != src_prt)
 			continue;
 
-		/* XXX we should be able to support listening for specific
-		 * hosts (or specific ports) */
-		if (sess->state == LISTEN && !sess->dst_ip && !sess->dst_prt)
-			return sess;
-
 		if (sess->state != LISTEN &&
 		    sess->dst_ip == dst_ip && sess->dst_prt == dst_prt)
+			return sess;
+
+		/* TODO: we should be able to support listening for specific
+		 * hosts (or specific ports) */
+		if (sess->state == LISTEN && !sess->dst_ip && !sess->dst_prt)
 			return sess;
 	}
 
@@ -597,8 +597,7 @@ process_packet()
 
 	tcp = (struct tcp_pkt *)pkt;
 
-	/* maybe we should move this check to state_machine. we'll see
-	 * once we implement listening ports */
+	/* maybe we should move this check to state_machine. */
 	if (!(sess = find_session(ip->src_ip, ntohs(tcp->src_prt),
 				  ntohs(tcp->dst_prt)))) {
 		send_rst(ip->src_ip, ntohs(tcp->src_prt),
@@ -729,7 +728,8 @@ packet_main(u_char *user, const struct pcap_pkthdr *hdr, const u_char *pkt)
 	/* XXX at some point we should be checking packet size so that e.g. the
 	 * IP header really is at least 5 bytes. some of these checks should be
 	 * here and some of them should be in process_packet and some should be
-	 * in state_machine. */
+	 * in state_machine. (and some of them should be in the host and in
+	 * pcap, so this might not be necessary.)*/
 	struct enet *enet = (struct enet *)pkt;
 	if (ntohs(enet->type) == ETHERTYPE_IP) {
 		struct ip_pkt *ip = (struct ip_pkt *)pkt;
