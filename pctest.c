@@ -418,7 +418,10 @@ int main(int argc, char **argv)
 
 	/* XXX instead of this we should have our own loop, and check for
 	 * packets using pcap_fileno(3) and select(2), so that we could have
-	 * timers and such of our own. */
+	 * timers and such of our own. the problem is pcap_fileno's fd is
+	 * always readable on Linux. so what we really need to do, if we don't
+	 * want to call pcap_dispatch a hundred times a second, is use threads.
+	 * I scare myself. */
 	pcap_loop(lph, -1, packet_cb, (void *)sess);
 
 	/* I don't think we'll ever get here, unless things go very wrong */
