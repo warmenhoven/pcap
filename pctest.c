@@ -230,41 +230,6 @@ send_rst(uint32_t dst_ip, uint16_t dst_prt, uint32_t src_prt,
 	return 1;
 }
 
-/* TODO: convince the host we're running on that it can safely ignore us */
-static int
-arp_reply(unsigned char hw[6], uint32_t ip)
-{
-	/* we probably could make this handle static so that we don't have to
-	 * rebuild it too many times, but hopefully we should only need to
-	 * build it once. */
-	char errbuf[LIBNET_ERRBUF_SIZE];
-	libnet_t *lnh;
-
-	if (!(lnh = libnet_init(LIBNET_LINK, NULL, errbuf))) {
-		fprintf(stderr, "%s\n", errbuf);
-		return 0;
-	}
-
-	if (libnet_build_arp(ARPHRD_ETHER, ETHERTYPE_IP, 6, 4, ARPOP_REPLY,
-			     src_hw, (u_char *)&src_ip, hw, (u_char *)&ip,
-			     NULL, 0, lnh, 0) == -1) {
-		fprintf(stderr, "%s\n", libnet_geterror(lnh));
-		return 0;
-	}
-	if (libnet_autobuild_ethernet(hw, ETHERTYPE_ARP, lnh) == -1) {
-		fprintf(stderr, "%s\n", libnet_geterror(lnh));
-		return 0;
-	}
-
-	if (libnet_write(lnh) == -1) {
-		fprintf(stderr, "%s\n", libnet_geterror(lnh));
-		return 0;
-	}
-
-	libnet_destroy(lnh);
-	return 1;
-}
-
 static struct tcp_session *
 find_session(uint32_t dst_ip, uint32_t dst_prt, uint32_t src_prt)
 {
@@ -494,82 +459,6 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 	return 1;
 }
 
-/* 'main' is a misnomer since it's not really a "main" function, it's a
- * callback. pcap sucks. anyway, it can handle arp by itself but anything in ip
- * needs to be passed to the control thread. */
-static void
-packet_main(u_char *user, const struct pcap_pkthdr *hdr, const u_char *pkt)
-{
-	/* XXX at some point we should be checking packet size so that e.g. the
-	 * IP header really is at least 5 bytes */
-	struct enet *enet = (struct enet *)pkt;
-	if (ntohs(enet->type) == ETHERTYPE_IP) {
-		struct ip_pkt *ip = (struct ip_pkt *)pkt;
-
-		/* if it's not for us, we ignore it */
-		if (ip->dst_ip != src_ip)
-			return;
-
-		write(sp[0], hdr, sizeof (struct pcap_pkthdr));
-		write(sp[0], pkt, hdr->len);
-	} else if (ntohs(enet->type) == ETHERTYPE_ARP) {
-		/* since we're "faking" a client, we need to reply to arp
-		 * requests as that client. the problem is, we're using the MAC
-		 * address of the host, so if we get an arp from the host about
-		 * our client, we need to just ignore it. the host should deal
-		 * with this gracefully. (there has to be a better way.) */
-		struct arp *arp = (struct arp *)pkt;
-		if ((ntohs(arp->hrd) == ARPHRD_ETHER) &&	/* ethernet*/
-		    (ntohs(arp->pro) == ETHERTYPE_IP) &&	/* ipv4 */
-		    (ntohs(arp->op) == ARPOP_REQUEST) &&	/* request */
-		    (arp->dst_ip == src_ip) &&			/* for us */
-		    memcmp(src_hw, arp->src_hw, 6))		/* not host */
-			arp_reply(arp->src_hw, arp->src_ip);
-	}
-}
-
-static void
-process_input()
-{
-	char buf[80];
-	fgets(buf, sizeof(buf), stdin);
-	if (buf[strlen(buf) - 1] == '\n')
-		buf[strlen(buf) - 1] = 0;
-	if (!strncasecmp(buf, "connect ", strlen("connect "))) {
-		char *arg1, *arg2;
-		arg1 = buf + strlen("connect ");
-		arg2 = strchr(arg1, ' ');
-		if (!arg2)
-			return;
-		*arg2++ = 0;
-
-		create_session(arg1, atoi(arg2));
-	} else if (!strncasecmp(buf, "listen ", strlen("listen "))) {
-		printf("ha! not yet.\n");
-	} else if (!strncasecmp(buf, "close ", strlen("close "))) {
-		list *l = sessions;
-		int id = atoi(buf + strlen("close "));
-
-		while (l) {
-			struct tcp_session *sess = l->data;
-
-			if (sess->id == id) {
-				/* XXX we should check the state of the session
-				 * first. this might be the wrong thing to do
-				 * at this point. */
-				send_tcp(sess, TH_FIN | TH_ACK);
-				sess->state = FIN_WAIT_1;
-				printf("FIN_WAIT_1\n");
-				break;
-			}
-
-			l = l->next;
-		}
-		if (!l)
-			printf("couldn't find %d\n", id);
-	}
-}
-
 static void
 process_packet()
 {
@@ -616,6 +505,48 @@ process_packet()
 	free(pkt);
 }
 
+static void
+process_input()
+{
+	char buf[80];
+	fgets(buf, sizeof(buf), stdin);
+	if (buf[strlen(buf) - 1] == '\n')
+		buf[strlen(buf) - 1] = 0;
+	if (!strncasecmp(buf, "connect ", strlen("connect "))) {
+		char *arg1, *arg2;
+		arg1 = buf + strlen("connect ");
+		arg2 = strchr(arg1, ' ');
+		if (!arg2)
+			return;
+		*arg2++ = 0;
+
+		create_session(arg1, atoi(arg2));
+	} else if (!strncasecmp(buf, "listen ", strlen("listen "))) {
+		printf("ha! not yet.\n");
+	} else if (!strncasecmp(buf, "close ", strlen("close "))) {
+		list *l = sessions;
+		int id = atoi(buf + strlen("close "));
+
+		while (l) {
+			struct tcp_session *sess = l->data;
+
+			if (sess->id == id) {
+				/* XXX we should check the state of the session
+				 * first. this might be the wrong thing to do
+				 * at this point. */
+				send_tcp(sess, TH_FIN | TH_ACK);
+				sess->state = FIN_WAIT_1;
+				printf("FIN_WAIT_1\n");
+				break;
+			}
+
+			l = l->next;
+		}
+		if (!l)
+			printf("couldn't find %d\n", id);
+	}
+}
+
 /* this function needs to get rewritten. desperately. */
 static void *
 control_main(void *arg)
@@ -636,6 +567,77 @@ control_main(void *arg)
 
 		if (FD_ISSET(sp[1], &set))
 			process_packet();
+	}
+}
+
+/* TODO: convince the host we're running on that it can safely ignore us */
+static int
+arp_reply(unsigned char hw[6], uint32_t ip)
+{
+	/* we probably could make this handle static so that we don't have to
+	 * rebuild it too many times, but hopefully we should only need to
+	 * build it once. */
+	char errbuf[LIBNET_ERRBUF_SIZE];
+	libnet_t *lnh;
+
+	if (!(lnh = libnet_init(LIBNET_LINK, NULL, errbuf))) {
+		fprintf(stderr, "%s\n", errbuf);
+		return 0;
+	}
+
+	if (libnet_build_arp(ARPHRD_ETHER, ETHERTYPE_IP, 6, 4, ARPOP_REPLY,
+			     src_hw, (u_char *)&src_ip, hw, (u_char *)&ip,
+			     NULL, 0, lnh, 0) == -1) {
+		fprintf(stderr, "%s\n", libnet_geterror(lnh));
+		return 0;
+	}
+	if (libnet_autobuild_ethernet(hw, ETHERTYPE_ARP, lnh) == -1) {
+		fprintf(stderr, "%s\n", libnet_geterror(lnh));
+		return 0;
+	}
+
+	if (libnet_write(lnh) == -1) {
+		fprintf(stderr, "%s\n", libnet_geterror(lnh));
+		return 0;
+	}
+
+	libnet_destroy(lnh);
+	return 1;
+}
+
+/* 'main' is a misnomer since it's not really a "main" function, it's a
+ * callback. pcap sucks. anyway, it can handle arp by itself but anything in ip
+ * needs to be passed to the control thread. */
+static void
+packet_main(u_char *user, const struct pcap_pkthdr *hdr, const u_char *pkt)
+{
+	/* XXX at some point we should be checking packet size so that e.g. the
+	 * IP header really is at least 5 bytes. some of these checks should be
+	 * here and some of them should be in process_packet and some should be
+	 * in state_machine. */
+	struct enet *enet = (struct enet *)pkt;
+	if (ntohs(enet->type) == ETHERTYPE_IP) {
+		struct ip_pkt *ip = (struct ip_pkt *)pkt;
+
+		/* if it's not for us, we ignore it */
+		if (ip->dst_ip != src_ip)
+			return;
+
+		write(sp[0], hdr, sizeof (struct pcap_pkthdr));
+		write(sp[0], pkt, hdr->len);
+	} else if (ntohs(enet->type) == ETHERTYPE_ARP) {
+		/* since we're "faking" a client, we need to reply to arp
+		 * requests as that client. the problem is, we're using the MAC
+		 * address of the host, so if we get an arp from the host about
+		 * our client, we need to just ignore it. the host should deal
+		 * with this gracefully. (there has to be a better way.) */
+		struct arp *arp = (struct arp *)pkt;
+		if ((ntohs(arp->hrd) == ARPHRD_ETHER) &&	/* ethernet*/
+		    (ntohs(arp->pro) == ETHERTYPE_IP) &&	/* ipv4 */
+		    (ntohs(arp->op) == ARPOP_REQUEST) &&	/* request */
+		    (arp->dst_ip == src_ip) &&			/* for us */
+		    memcmp(src_hw, arp->src_hw, 6))		/* not host */
+			arp_reply(arp->src_hw, arp->src_ip);
 	}
 }
 
@@ -685,18 +687,22 @@ main(int argc, char **argv)
 	 * 1. parse packets from pcap_fileno yourself
 	 * 2. rewrite pcap
 	 * 3. call pcap_dispatch occasionally
-	 * 4. use threads
-	 * 5. fork
+	 * 4. fork
+	 * 5. use threads
 	 *
 	 * 1 and 2 are more or less the same thing, and if using pcap is this
 	 * bad, I don't want to think about what hacking pcap is like. 3 isn't
-	 * really an option because it increases the load and you'll miss
+	 * really an option because it increases the load and you may miss
 	 * certain things. there's really no difference between 4 and 5 either,
 	 * as long as the pcap thread (process) isn't processing the packets.
 	 * and since I've never really used threads for anything real before,
-	 * we'll use 3.
+	 * we'll use threads.
 	 *
-	 * I'm evil. */
+	 * I'm evil.
+	 *
+	 * even though this is a threaded program, I don't really consider it
+	 * "using threads" since the threads don't share variables, so there's
+	 * no need for locking. */
 	socketpair(AF_UNIX, SOCK_STREAM, 0, sp);
 	pthread_create(&thread, NULL, control_main, NULL);
 
