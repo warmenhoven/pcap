@@ -76,53 +76,47 @@ struct ip_pkt {
 } __attribute__((packed));
 
 struct tcp_pkt {
-	struct ip_pkt ip;	/* technically this is wrong, but have you
-				   ever seen ip.ihl != 5? */
+	struct ip_pkt ip;	/* XXX this is wrong. I'll fix it once I start
+				   testing with servers other than Linux. */
 	uint16_t src_prt;
 	uint16_t dst_prt;
 	uint32_t seqno;
 	uint32_t ackno;
 	unsigned int offset : 4;
 	unsigned int res : 4;
-	uint8_t control;
+	uint8_t control;	/* the control bits are only the last 6, but
+				   that gave me problems for some reason.
+				   besides, you don't need ECN anyway. */
 	uint16_t window;
 	uint16_t csum;
 	uint16_t urg;
 } __attribute__((packed));
 
-/* these just work better as globals */
-static char *dev;
-static pcap_t *lph;
-
-static int init_pcap()
+static pcap_t *init_pcap(struct tcp_session *sess)
 {
 	char errbuf[PCAP_ERRBUF_SIZE];
+	char *dev;
+	pcap_t *lph;
 
-	if (!(dev = pcap_lookupdev(errbuf))) {
-		fprintf(stderr, "%s\n", errbuf);
-		return 1;
-	}
-
-	lph = pcap_open_live(dev, BUFSIZ, 0, 0, errbuf);
-	if (!lph) {
-		fprintf(stderr, "%s\n", errbuf);
-		return 1;
-	}
-
-	return 0;
-}
-
-static int init_filter(struct tcp_session *sess)
-{
-	char errbuf[PCAP_ERRBUF_SIZE];
 	bpf_u_int32 net;
 	bpf_u_int32 mask;
 	char *filter_line;
 	struct bpf_program filter;
 
+	if (!(dev = pcap_lookupdev(errbuf))) {
+		fprintf(stderr, "%s\n", errbuf);
+		return NULL;
+	}
+
+	lph = pcap_open_live(dev, BUFSIZ, 0, 0, errbuf);
+	if (!lph) {
+		fprintf(stderr, "%s\n", errbuf);
+		return NULL;
+	}
+
 	if (pcap_lookupnet(dev, &net, &mask, errbuf) == -1) {
 		fprintf(stderr, "%s\n", errbuf);
-		return 1;
+		return NULL;
 	}
 
 	filter_line = malloc(4 + 3 + 5 + 6);
@@ -134,9 +128,9 @@ static int init_filter(struct tcp_session *sess)
 
 	if (pcap_setfilter(lph, &filter) == -1) {
 		fprintf(stderr, "%s\n", errbuf);
-		return 1;
+		return NULL;
 	}
-	return 0;
+	return lph;
 }
 
 static int send_tcp(struct tcp_session *sess, int flags)
@@ -232,6 +226,7 @@ static void state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 			sess->ackno = ntohl(pkt->seqno) + 1;
 			send_tcp(sess, TH_ACK);
 			sess->state = ESTABLISHED;
+			printf("ESTABLISHED\n");
 		} else {
 			/* XXX actually if we get SYN but no ACK we're supposed
 			 * to send an ACK, go to SYN_RCVD, and wait for the ACK
@@ -255,6 +250,7 @@ static void state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 			 * waiting around until the user kills us, we just
 			 * assume we will get our ACK back fine and exit. */
 			/* sess->state = LAST_ACK; */
+			printf("LAST_ACK\n");
 			exit(0);
 		}
 		/* XXX there are more cases of things to do here */
@@ -267,6 +263,7 @@ static void state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 			/* just like LAST_ACK, we should move to TIME_WAIT, but
 			 * we just assume everything went well */
 			/* sess->state = TIME_WAIT; */
+			printf("TIME_WAIT\n");
 			exit(0);
 		}
 
@@ -277,12 +274,14 @@ static void state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 			/* just like LAST_ACK, we should move to CLOSING, but
 			 * we just assume everything went well */
 			/* sess->state = CLOSING; */
+			printf("CLOSING\n");
 			exit(0);
 		}
 
 		if (pkt->control & TH_ACK) {
 			/* we've got the ACK, now we're waiting for the FIN */
 			sess->state = FIN_WAIT_2;
+			printf("FIN_WAIT_2\n");
 			break;
 		}
 
@@ -301,6 +300,7 @@ static void state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 			/* just like LAST_ACK, we should move to TIME_WAIT, but
 			 * we just assume everything went well */
 			/* sess->state = TIME_WAIT */
+			printf("TIME_WAIT \n");
 			exit(0);
 		}
 
@@ -388,11 +388,9 @@ static void sighandler(int num)
 int main(int argc, char **argv)
 {
 	char errbuf[LIBNET_ERRBUF_SIZE];
+	pcap_t *lph;
 
 	struct tcp_session *sess = calloc(1, sizeof (struct tcp_session));
-
-	if (init_pcap())
-		return 1;
 
 	if (!(sess->lnh = libnet_init(LIBNET_RAW4, NULL, errbuf))) {
 		fprintf(stderr, "%s\n", errbuf);
@@ -417,7 +415,7 @@ int main(int argc, char **argv)
 	/* I hear I shouldn't use this function for anything real. oh well. */
 	sess->seqno = libnet_get_prand(LIBNET_PRu32);
 
-	if (init_filter(sess))
+	if (!(lph = init_pcap(sess)))
 		return 1;
 
 	/* send the SYN, and we're off! */
@@ -425,6 +423,7 @@ int main(int argc, char **argv)
 		return 1;
 	sess->seqno++;
 	sess->state = SYN_SENT;
+	printf("SYN_SENT\n");
 
 	/* if the user kills this program, try and cleanup. it's only nice. */
 	sig_sess = sess;
