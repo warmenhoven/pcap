@@ -187,6 +187,17 @@ struct ip_pkt {
 	uint32_t dst_ip;
 } __attribute__((packed));
 
+struct icmp_pkt {
+	struct ip_pkt ip;	/* XXX this is wrong. I'll fix it once I start
+						   supporting ip options (which means a variable ip
+						   header length due to the options) */
+	uint8_t type;
+	uint8_t code;
+	uint16_t csum;
+	uint16_t id;		/* XXX this is partly wrong, see netinet/ip_icmp.h */
+	uint16_t seq;
+} __attribute__((packed));
+
 struct tcp_pkt {
 	struct ip_pkt ip;	/* XXX this is wrong. I'll fix it once I start
 						   supporting ip options (which means a variable ip
@@ -271,19 +282,19 @@ send_tcp(TCB *sess, int flags)
 		 libnet_build_tcp(sess->src_prt, sess->dst_prt, sess->seqno,
 						  sess->ackno, flags, 32767, 0, 0, LIBNET_TCP_H,
 						  NULL, 0, sess->lnh, sess->tcp_id)) == -1) {
-		fprintf(stderr, "%s\n", libnet_geterror(sess->lnh));
+		fprintf(stderr, "%s", libnet_geterror(sess->lnh));
 		return 0;
 	}
 	if ((sess->ip_id =
 		 libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_TCP_H, 0, 242, 0, 64,
 						   IPPROTO_TCP, 0, src_ip, sess->dst_ip,
 						   NULL, 0, sess->lnh, sess->ip_id)) == -1) {
-		fprintf(stderr, "%s\n", libnet_geterror(sess->lnh));
+		fprintf(stderr, "%s", libnet_geterror(sess->lnh));
 		return 0;
 	}
 
 	if (libnet_write(sess->lnh) == -1) {
-		fprintf(stderr, "%s\n", libnet_geterror(sess->lnh));
+		fprintf(stderr, "%s", libnet_geterror(sess->lnh));
 		return 0;
 	}
 
@@ -306,20 +317,20 @@ send_rst(uint32_t dst_ip, uint16_t dst_prt, uint32_t src_prt,
 
 	if (libnet_build_tcp(src_prt, dst_prt, seqno, ackno, TH_RST | TH_ACK,
 						 0, 0, 0, LIBNET_TCP_H, NULL, 0, lnh, 0) == -1) {
-		fprintf(stderr, "%s\n", libnet_geterror(lnh));
+		fprintf(stderr, "%s", libnet_geterror(lnh));
 		libnet_destroy(lnh);
 		return 0;
 	}
 	if (libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_TCP_H, 0x10, 0, 0, 64,
 						  IPPROTO_TCP, 0, src_ip, dst_ip, NULL, 0,
 						  lnh, 0) == -1) {
-		fprintf(stderr, "%s\n", libnet_geterror(lnh));
+		fprintf(stderr, "%s", libnet_geterror(lnh));
 		libnet_destroy(lnh);
 		return 0;
 	}
 
 	if (libnet_write(lnh) == -1) {
-		fprintf(stderr, "%s\n", libnet_geterror(lnh));
+		fprintf(stderr, "%s", libnet_geterror(lnh));
 		libnet_destroy(lnh);
 		return 0;
 	}
@@ -443,7 +454,7 @@ create_session(char *host, uint16_t port)
 		sess->dst_ip = libnet_name2addr4(sess->lnh, host,
 						 LIBNET_RESOLVE);
 		if (sess->dst_ip == 0xffffffff) {
-			fprintf(stderr, "%s\n", libnet_geterror(sess->lnh));
+			fprintf(stderr, "%s", libnet_geterror(sess->lnh));
 			free(sess);
 			return NULL;
 		}
@@ -738,13 +749,15 @@ process_tcp_packet(u_char *pkt)
 	sum += libnet_in_cksum((u_int16_t *)&tcp->src_prt, len);
 	tcp->csum = LIBNET_CKSUM_CARRY(sum);
 	if (csum != tcp->csum) {
-		fprintf(stderr, "checksum mismatch in TCP header!\n");
+		fprintf(stderr, "checksum mismatch in TCP header (src %s)!\n",
+				libnet_addr2name4(tcp->ip.src_ip, LIBNET_DONT_RESOLVE));
 		return;
 	}
 
 	if ((unsigned int)(tcp->offset << 2) <
 		sizeof (struct tcp_pkt) - sizeof (struct ip_pkt)) {
-		fprintf(stderr, "invalid TCP header!\n");
+		fprintf(stderr, "invalid TCP header (src %s)!\n",
+				libnet_addr2name4(tcp->ip.src_ip, LIBNET_DONT_RESOLVE));
 		return;
 	}
 
@@ -758,6 +771,71 @@ process_tcp_packet(u_char *pkt)
 
 	/* this is where the real work is */
 	tcp_state_machine(sess, tcp);
+}
+
+static void
+icmp_echo_reply(struct icmp_pkt *icmp)
+{
+	/* we probably could make this handle static so that we don't have to
+	 * rebuild it too many times */
+	char errbuf[LIBNET_ERRBUF_SIZE];
+	libnet_t *lnh;
+	libnet_ptag_t tag;
+	u_char *payload;
+	unsigned int len;
+
+	if (!(lnh = libnet_init(LIBNET_RAW4, NULL, errbuf))) {
+		fprintf(stderr, "%s\n", errbuf);
+		return;
+	}
+
+	len = ntohs(icmp->ip.len) - LIBNET_IPV4_H - LIBNET_ICMPV4_ECHO_H;
+	payload = (u_char *)(icmp + 1);
+
+	if ((tag = libnet_build_icmpv4_echo(ICMP_ECHOREPLY, 0, 0, ntohs(icmp->id),
+										ntohs(icmp->seq), payload, len,
+										lnh, 0)) == -1) {
+		fprintf(stderr, "%s", libnet_geterror(lnh));
+		libnet_destroy(lnh);
+		return;
+	}
+
+	if (libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_ICMPV4_ECHO_H + len, 0, 0x42,
+						  0, 64, IPPROTO_ICMP, 0, src_ip,
+						  icmp->ip.src_ip, NULL, 0, lnh, 0) == -1) {
+		fprintf(stderr, "%s", libnet_geterror(lnh));
+		libnet_destroy(lnh);
+		return;
+	}
+
+	if (libnet_write(lnh) == -1) {
+		fprintf(stderr, "%s", libnet_geterror(lnh));
+	}
+
+	libnet_destroy(lnh);
+	return;
+}
+
+static void
+process_icmp_packet(u_char *pkt)
+{
+	struct icmp_pkt *icmp = (struct icmp_pkt *)pkt;
+
+	switch (icmp->type) {
+	case ICMP_ECHO:
+		printf("being pinged (src %s)\n", libnet_addr2name4(icmp->ip.src_ip,
+															LIBNET_DONT_RESOLVE));
+		icmp_echo_reply(icmp);
+		break;
+	case ICMP_ECHOREPLY:
+		printf("received ping response from %s\n",
+			   libnet_addr2name4(icmp->ip.src_ip, LIBNET_RESOLVE));
+		break;
+	default:
+		fprintf(stderr, "received unhandled icmp type %d (src %s)\n",
+				icmp->type, libnet_addr2name4(icmp->ip.src_ip, LIBNET_RESOLVE));
+		break;
+	}
 }
 
 static void
@@ -802,28 +880,38 @@ process_ip_packet(void)
 		/* XXX we don't deal with options. even worse, we don't send an icmp
 		 * message saying we don't. worse still, we don't send a RST either, so
 		 * we'll just keep getting this packet over and over. */
-		fprintf(stderr, "ip header length != 5!\n");
+		fprintf(stderr, "ip header length != 5 (src %s)!\n",
+				libnet_addr2name4(ip->src_ip, LIBNET_DONT_RESOLVE));
 		free(pkt);
 		return;
 	}
 
 	if (ip->flags & 0x1) {
-		/* XXX we don't deal with fragmentation at all (and again, don't tell
+		/* XXX we don't deal with fragmentation at all (and again, we don't tell
 		 * whoever we're talking to that we don't) */
-		fprintf(stderr, "fragmentation being used (%x)\n", ip->flags);
+		fprintf(stderr, "fragmentation being used (%x, src %s)\n", ip->flags,
+				libnet_addr2name4(ip->src_ip, LIBNET_DONT_RESOLVE));
 		free(pkt);
 		return;
 	}
 
-	/* we only deal with TCP, because the host screws up ICMP for us. I wish I
-	 * could remember how the host screws up ICMP. thinking about it now, I
-	 * don't think it should. but whatever. */
-	if (ip->protocol != IPPROTO_TCP) {
-		free(pkt);
-		return;
+	switch (ip->protocol) {
+	case IPPROTO_TCP:
+		process_tcp_packet(pkt);
+		break;
+	case IPPROTO_ICMP:
+		process_icmp_packet(pkt);
+		break;
+	default:
+		/* that's right, we don't handle udp! when's the last time you used udp.
+		 * honestly. and don't tell me you actually use dns or ntp! or nfs. or
+		 * smb. *shudder* */
+		fprintf(stderr, "received unhandled protocol %d (src %s)\n",
+				ip->protocol, libnet_addr2name4(ip->src_ip,
+												LIBNET_DONT_RESOLVE));
+		break;
 	}
 
-	process_tcp_packet(pkt);
 	free(pkt);
 }
 
@@ -831,12 +919,13 @@ static void
 ping(char *host)
 {
 	/* we probably could make this handle static so that we don't have to
-	 * rebuild it too many times, but hopefully we should only need to
-	 * build it once. */
+	 * rebuild it too many times */
 	char errbuf[LIBNET_ERRBUF_SIZE];
 	libnet_t *lnh;
 	libnet_ptag_t tag;
 	uint32_t dst_ip;
+	u_char payload[64 - LIBNET_ICMPV4_ECHO_H];
+	unsigned int i;
 
 	if (!(lnh = libnet_init(LIBNET_RAW4, NULL, errbuf))) {
 		fprintf(stderr, "%s\n", errbuf);
@@ -845,28 +934,31 @@ ping(char *host)
 
 	dst_ip = libnet_name2addr4(lnh, host, LIBNET_RESOLVE);
 	if (dst_ip == 0xffffffff) {
-		fprintf(stderr, "%s\n", libnet_geterror(lnh));
+		fprintf(stderr, "%s", libnet_geterror(lnh));
 		libnet_destroy(lnh);
 		return;
 	}
 
-	if ((tag = libnet_build_icmpv4_echo(ICMP_ECHO, 0, 0, 0x42, 0x42, NULL, 0,
-										lnh, 0)) == -1) {
-		fprintf(stderr, "%s\n", libnet_geterror(lnh));
+	for (i = 0; i < sizeof (payload); i++)
+		payload[i] = i;
+
+	if ((tag = libnet_build_icmpv4_echo(ICMP_ECHO, 0, 0, 0x42, 0, payload,
+										sizeof (payload), lnh, 0)) == -1) {
+		fprintf(stderr, "%s", libnet_geterror(lnh));
 		libnet_destroy(lnh);
 		return;
 	}
 
-	if (libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_ICMPV4_ECHO_H, 0, 0x42, 0, 64,
-						  IPPROTO_ICMP, 0, src_ip, dst_ip,
+	if (libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_ICMPV4_ECHO_H + 64, 0, 0, 0,
+						  64, IPPROTO_ICMP, 0, src_ip, dst_ip,
 						  NULL, 0, lnh, 0) == -1) {
-		fprintf(stderr, "%s\n", libnet_geterror(lnh));
+		fprintf(stderr, "%s", libnet_geterror(lnh));
 		libnet_destroy(lnh);
 		return;
 	}
 
 	if (libnet_write(lnh) == -1) {
-		fprintf(stderr, "%s\n", libnet_geterror(lnh));
+		fprintf(stderr, "%s", libnet_geterror(lnh));
 	}
 
 	libnet_destroy(lnh);
@@ -989,19 +1081,19 @@ arp_reply(unsigned char hw[6], uint32_t ip)
 	if (libnet_build_arp(ARPHRD_ETHER, ETHERTYPE_IP, 6, 4, ARPOP_REPLY,
 						 src_hw, (u_char *)&src_ip, hw, (u_char *)&ip,
 						 NULL, 0, lnh, 0) == -1) {
-		fprintf(stderr, "%s\n", libnet_geterror(lnh));
+		fprintf(stderr, "%s", libnet_geterror(lnh));
 		libnet_destroy(lnh);
 		return 0;
 	}
 
 	if (libnet_autobuild_ethernet(hw, ETHERTYPE_ARP, lnh) == -1) {
-		fprintf(stderr, "%s\n", libnet_geterror(lnh));
+		fprintf(stderr, "%s", libnet_geterror(lnh));
 		libnet_destroy(lnh);
 		return 0;
 	}
 
 	if (libnet_write(lnh) == -1) {
-		fprintf(stderr, "%s\n", libnet_geterror(lnh));
+		fprintf(stderr, "%s", libnet_geterror(lnh));
 		libnet_destroy(lnh);
 		return 0;
 	}
@@ -1024,10 +1116,13 @@ packet_main(u_char *user ATTRIBUTE_UNUSED,
 		uint16_t csum;
 		int sum;
 
-		if (ip->ihl < 5 || ip->ver != 4)
-			return;
 		/* XXX should probably check ip->ihl vs. hdr->len. in fact should
 		 * probably check hdr->len before checking anything. */
+		if (ip->ihl < 5 || ip->ver != 4) {
+			fprintf(stderr, "bad IP packet, len = %d, ver = %d\n", ip->ihl,
+					ip->ver);
+			return;
+		}
 
 		csum = ip->hdr_csum;
 		ip->hdr_csum = 0;
@@ -1035,11 +1130,13 @@ packet_main(u_char *user ATTRIBUTE_UNUSED,
 							  ip->ihl << 2);
 		ip->hdr_csum = LIBNET_CKSUM_CARRY(sum);
 		if (csum != ip->hdr_csum) {
-			fprintf(stderr, "checksum mismatch in IP header!\n");
+			fprintf(stderr, "checksum mismatch in IP header (src %s)!\n",
+					libnet_addr2name4(ip->src_ip, LIBNET_DONT_RESOLVE));
 			return;
 		}
 
-		/* if it's not for us, we ignore it */
+		/* if it's not for us, we ignore it. that's probably a bad thing since
+		 * it means we ignore broadcast as well. but who the hell cares. */
 		if (ip->dst_ip != src_ip)
 			return;
 
