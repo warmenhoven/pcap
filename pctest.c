@@ -7,24 +7,23 @@
  *
  * right now in the TCP bake off I get 17 points:
  *
- * 1 points for talking to myself
- * 1 points for gracefully ending the conversation
- * 2 points for repeating the above without reinitializing
+ * Featherweight Division:
+ *   1 points for talking to myself
+ *   1 points for gracefully ending the conversation
+ *   2 points for repeating the above without reinitializing
  *
- * 2 points for talking to someone else
- * 2 point for gracefully ending the conversaion
- * 4 points for repeating the above without reinitializing
+ * Middleweight Division:
+ *   2 points for talking to someone else
+ *   2 point for gracefully ending the conversaion
+ *   4 points for repeating the above without reinitializing
  *
- * 5 points for being able to talk to more than one other TCP at the same time
- *   (since I can't actually "talk" to them yet, I'm only giving myself 5
- *   points, for being able to be connected to more than one at a time. once
- *   I'm able to exchange data then I'll get 1 more point in the Lightweight
- *   Division, 2 more points in the Middleweight Division, and the remainder of
- *   the 5 points here)
- *
- * but then, I haven't done any checksum tests, so unless the host itself
- * rejects faulty packets before they're given to pcap, I'm actually at 0
- * points so far....
+ * Heavyweight Division:
+ *   5 points for being able to talk to more than one other TCP at the same time
+ *     (since I can't actually "talk" to them yet, I'm only giving myself 5
+ *     points, for being able to be connected to more than one at a time. once
+ *     I'm able to exchange data then I'll get 1 more point in the Lightweight
+ *     Division, 2 more points in the Middleweight Division, and the remainder
+ *     of the 5 points here)
  */
 
 #include <libnet.h>
@@ -162,6 +161,8 @@ static list *list_new(void *);
 static list *list_prepend(list *, void *);
 static list *list_remove(list *, void *);
 /* we don't use these
+typedef int (*cmpfnc)(const void *, const void *);
+static list *list_insert_sorted(list *, void *, cmpfnc);
 static unsigned int list_length(list *);
 static void *list_nth(list *, int);
 static list *list_append(list *, void *);
@@ -591,19 +592,34 @@ process_packet()
 	struct tcp_pkt *tcp;
 	struct tcp_session *sess;
 
+	uint16_t csum;
+	int sum, len;
+
 	/* XXX this section needs to be fixed, it assumes too much */
 	if (read(sp[1], &hdr, sizeof (hdr)) != sizeof (hdr))
 		return;
-	pkt = malloc(hdr.len);
+	pkt = malloc(hdr.len + (hdr.len % 1));
 	if (read(sp[1], pkt, hdr.len) != hdr.len) {
 		free(pkt);
 		return;
 	}
+	if (hdr.len % 1)
+		pkt[hdr.len] = 0;
 
 	ip = (struct ip_pkt *)pkt;
 
 	/* XXX there are more IP options that we need to deal with. until then
 	 * this program isn't a stack, it's a hack. */
+	csum = ip->hdr_csum;
+	ip->hdr_csum = 0;
+	sum = libnet_in_cksum((u_int16_t *)ip + sizeof (struct enet) / 2,
+			      ip->ihl << 2);
+	ip->hdr_csum = LIBNET_CKSUM_CARRY(sum);
+	if (csum != ip->hdr_csum) {
+		fprintf(stderr, "checksum mismatch in IP header!\n");
+		free(pkt);
+		return;
+	}
 
 	/* we only deal with TCP, because the host screws up ICMP for us */
 	if (ip->protocol != IPPROTO_TCP) {
@@ -612,6 +628,18 @@ process_packet()
 	}
 
 	tcp = (struct tcp_pkt *)pkt;
+	csum = tcp->csum;
+	tcp->csum = 0;
+	sum = libnet_in_cksum((u_int16_t *)&ip->src_ip, 8);
+	len = ntohs(ip->len) - (ip->ihl << 2);
+	sum += ntohs(IPPROTO_TCP + len);
+	sum += libnet_in_cksum((u_int16_t *)&tcp->src_prt, len);
+	tcp->csum = LIBNET_CKSUM_CARRY(sum);
+	if (csum != tcp->csum) {
+		fprintf(stderr, "checksum mismatch in TCP header!\n");
+		free(pkt);
+		return;
+	}
 
 	/* maybe we should move this check to state_machine. */
 	if (!(sess = find_session(ip->src_ip, ntohs(tcp->src_prt),
@@ -897,6 +925,26 @@ list *list_remove(list *l, void *data)
 }
 
 /*
+list *list_insert_sorted(list *l, void *data, cmpfnc f)
+{
+	list *s = l;
+
+	if (!s)
+		return list_prepend(l, data);
+	if (f(s->data, data) >= 0)
+		return list_prepend(l, data);
+
+	while (s->next) {
+		if (f(s->next->data, data) < 0)
+			continue;
+		s->next = list_prepend(s->next, data);
+		return l;
+	}
+
+	s->next = list_new(data);
+	return l;
+}
+
 unsigned int list_length(list *l)
 {
 	unsigned int c = 0;
