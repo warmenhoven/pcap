@@ -1,5 +1,6 @@
 #include <libnet.h>
 #include <pcap.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,6 +20,8 @@ enum tcp_state {
 };
 
 struct tcp_session {
+	pthread_mutex_t lock;
+
 	enum tcp_state state;
 
 	libnet_t *lnh;
@@ -92,7 +95,8 @@ struct tcp_pkt {
 	uint16_t urg;
 } __attribute__((packed));
 
-static pcap_t *init_pcap(struct tcp_session *sess)
+static pcap_t *
+init_pcap(struct tcp_session *sess)
 {
 	char errbuf[PCAP_ERRBUF_SIZE];
 	char *dev;
@@ -133,7 +137,8 @@ static pcap_t *init_pcap(struct tcp_session *sess)
 	return lph;
 }
 
-static int send_tcp(struct tcp_session *sess, int flags)
+static int
+send_tcp(struct tcp_session *sess, int flags)
 {
 	if ((sess->tcp_id =
 	     libnet_build_tcp(sess->src_prt, sess->dst_prt, sess->seqno,
@@ -159,7 +164,8 @@ static int send_tcp(struct tcp_session *sess, int flags)
 }
 
 /* XXX convince the host we're running on that it can safely ignore us */
-static int arp_reply(struct tcp_session *sess, unsigned char hw[6], uint32_t ip)
+static int
+arp_reply(struct tcp_session *sess, unsigned char hw[6], uint32_t ip)
 {
 	/* we don't reuse the sess libnet_t handle because it's a raw socket
 	 * and we want link-level access. we probably could make this handle
@@ -193,9 +199,15 @@ static int arp_reply(struct tcp_session *sess, unsigned char hw[6], uint32_t ip)
 	return 0;
 }
 
-static void state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
+/* this may well become 'main' for a "session" thread, that waits on a
+ * condition triggered by either the pcap thread or the timer thread, instead
+ * of trying to get the pcap and timer threads to play well together with the
+ * session */
+static void
+state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 {
-	/* here we can assume that the pkt is part of the session and for us */
+	/* here we can assume that the pkt is part of the session, we're the
+	 * receiver, and the session is locked. */
 
 	/* XXX none of these things check seqno/ackno. they should. */
 
@@ -330,7 +342,8 @@ static void state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 }
 
 /* main cb function. this needs to get rewritten. desperately. */
-static void packet_cb(u_char *user, const struct pcap_pkthdr *hdr, const u_char *pkt)
+static void
+packet_cb(u_char *user, const struct pcap_pkthdr *hdr, const u_char *pkt)
 {
 	struct tcp_session *sess = (struct tcp_session *)user;
 	struct enet *enet = (struct enet *)pkt;
@@ -338,19 +351,27 @@ static void packet_cb(u_char *user, const struct pcap_pkthdr *hdr, const u_char 
 		struct ip_pkt *ip = (struct ip_pkt *)pkt;
 		struct tcp_pkt *tcp = (struct tcp_pkt *)pkt;
 
-		/* we only deal with TCP */
+		/* XXX we only deal with TCP; we should handle ICMP too */
 		if (ip->protocol != IPPROTO_TCP)
 			return;
+
 		/* if the packet isn't from this session, and we aren't the
 		 * receiver, ignore it */
-		if (ip->src_ip != sess->dst_ip || ip->dst_ip != sess->src_ip)
+		pthread_mutex_lock(&sess->lock);
+		if (ip->src_ip != sess->dst_ip || ip->dst_ip != sess->src_ip) {
+			pthread_mutex_unlock(&sess->lock);
 			return;
+		}
 		if (ntohs(tcp->src_prt) != sess->dst_prt ||
-		    ntohs(tcp->dst_prt) != sess->src_prt)
+		    ntohs(tcp->dst_prt) != sess->src_prt) {
+			pthread_mutex_unlock(&sess->lock);
 			return;
+		}
 
 		/* this is where the real work begins */
 		state_machine(sess, tcp);
+
+		pthread_mutex_unlock(&sess->lock);
 	} else if (ntohs(enet->type) == ETHERTYPE_ARP) {
 		/* since we're "faking" a client, we need to reply to arp
 		 * requests as that client. the problem is, we're using the MAC
@@ -358,47 +379,96 @@ static void packet_cb(u_char *user, const struct pcap_pkthdr *hdr, const u_char 
 		 * our client, we need to just ignore it. the host should deal
 		 * with this gracefully. (there has to be a better way.) */
 		struct arp *arp = (struct arp *)pkt;
+		pthread_mutex_lock(&sess->lock);
 		if ((ntohs(arp->hrd) == ARPHRD_ETHER) &&	/* ethernet*/
 		    (ntohs(arp->pro) == ETHERTYPE_IP) &&	/* ipv4 */
 		    (ntohs(arp->op) == ARPOP_REQUEST) &&	/* request */
 		    (arp->dst_ip == sess->src_ip) &&		/* for us */
 		    memcmp(sess->src_hw, arp->src_hw, 6))	/* not host */
 			arp_reply(sess, arp->src_hw, arp->src_ip);
+		pthread_mutex_unlock(&sess->lock);
 	}
 }
 
-/* yeah baby. this is evil. NEVER USE sig_sess OUTSITE THE SIG HANDLER! */
-struct tcp_session *sig_sess = NULL;
-static void sighandler(int num)
+/* XXX this is evil. when we're using pthreads each thread will get this signal
+ * handler (at least on Linux) so we end up sending RST twice. this isn't
+ * technically a problem but this handler should be fixed/removed anyway */
+static struct tcp_session *sig_sess = NULL;
+static void
+sighandler(int num)
 {
 	send_tcp(sig_sess, TH_RST);
-	exit(0);
+	pthread_exit(NULL);
 }
 
-int main(int argc, char **argv)
+static void *
+timer_main(void *arg)
 {
+	/* XXX if this is going to be the timer thread, but the pcap thread is
+	 * also sending packets on behalf of the session, then we need to put
+	 * in a lot of information about the session into the struct so that
+	 * the two threads can always understand exactly what the state of the
+	 * session is. a better idea might be to also have a session thread,
+	 * waiting on a condition, that either the pcap or the timer thread can
+	 * then wake up. ("now there are two of them! this is getting out of
+	 * hand.") */
+
+	struct tcp_session *sess = arg;
+	/* XXX we need to do something real here. this is just a test. */
+	while (1) {
+		char buf[80];
+		fgets(buf, sizeof(buf), stdin);
+		if (buf[strlen(buf) - 1] == '\n')
+			buf[strlen(buf) - 1] = 0;
+		pthread_mutex_lock(&sess->lock);
+		printf("ha! \"%s\" indeed!\n", buf);
+		pthread_mutex_unlock(&sess->lock);
+	}
+}
+
+int
+main(int argc, char **argv)
+{
+	pthread_t thread;
+
 	char errbuf[LIBNET_ERRBUF_SIZE];
 	pcap_t *lph;
 
+	/* TODO: if we ever support multiple sessions (or listening sockets),
+	 * we should turn this into its own function, down to init_pcap */
 	struct tcp_session *sess = calloc(1, sizeof (struct tcp_session));
 
 	if (!(sess->lnh = libnet_init(LIBNET_RAW4, NULL, errbuf))) {
-		fprintf(stderr, "%s", errbuf);
+		fprintf(stderr, "%s\n", errbuf);
 		return 1;
 	}
 
 	/* initial setup of the tcp session */
+	pthread_mutex_init(&sess->lock, NULL);
 	/* sess->state = CLOSED; */
 	sess->dst_ip = libnet_name2addr4(sess->lnh,
 					 argc > 1 ? argv[1] : "172.20.102.1",
 					 LIBNET_RESOLVE);
-	sess->dst_prt = argc > 2 ? atoi(argv[2]) : 12345;
+	sess->dst_prt = argc > 2 ? atoi(argv[2]) : 4919;
 	memcpy(sess->src_hw, libnet_get_hwaddr(sess->lnh), 6);
+	/* you need to pick this IP address based on three characteristics:
+	 *
+	 * 1. it cannot be the same address as the host's address
+	 * 2. the address cannot already be in use by another computer (i.e.
+	 *    you can't pretend to be some other computer, only an imaginary
+	 *    computer)
+	 * 3. it needs to be on the same routing network (I don't know how else
+	 *    to say that) as the host. in most cases if the address is part of
+	 *    the same subnet as the host you should be fine.
+	 *
+	 * of course, if you remove the ip address from the host and just use
+	 * that address, then you shouldn't have to worry about any of that.
+	 * but then you'll have to modify this client to handle all the routing
+	 * details itself, and that's not fun. */
 	sess->src_ip = libnet_name2addr4(sess->lnh,
 					 argc > 3 ? argv[3] : "172.20.102.9",
 					 LIBNET_RESOLVE);
-	sess->src_prt = argc > 4 ? atoi(argv[4]) : 12345;
-
+	sess->src_prt = argc > 4 ? atoi(argv[4]) : 4919;
 	/* I hear I shouldn't use this function for anything real. oh well. */
 	sess->seqno = libnet_get_prand(LIBNET_PRu32);
 
@@ -412,16 +482,27 @@ int main(int argc, char **argv)
 	sess->state = SYN_SENT;
 	printf("SYN_SENT\n");
 
-	/* if the user kills this program, try and cleanup. it's only nice. */
+	/* XXX we should do something different, probably like SIG_IGN. maybe
+	 * once we have some other way of shutting down the connection. */
 	sig_sess = sess;
 	signal(SIGINT, sighandler);
 
-	/* XXX instead of this we should have our own loop, and check for
-	 * packets using pcap_fileno(3) and select(2), so that we could have
-	 * timers and such of our own. the problem is pcap_fileno's fd is
-	 * always readable on Linux. so what we really need to do, if we don't
-	 * want to call pcap_dispatch a hundred times a second, is use threads.
-	 * I scare myself. */
+	/* there are three (well, four) options if you want to have a main loop
+	 * other than pcap_loop:
+	 *
+	 * 1. call pcap_dispatch occasionally
+	 * 2. parse packets from pcap_fileno yourself
+	 * 3. use threads
+	 * 4. rewrite pcap
+	 *
+	 * 2 and 4 are more or less the same thing, and if using pcap is this
+	 * bad, I don't want to think about what hacking pcap is like. 1 isn't
+	 * really an option because it increases the load and you'll miss
+	 * certain things. so the only option left is 3.
+	 *
+	 * I'm evil. */
+	pthread_create(&thread, NULL, timer_main, sess);
+
 	pcap_loop(lph, -1, packet_cb, (void *)sess);
 
 	/* I don't think we'll ever get here, unless things go very wrong */

@@ -1,5 +1,5 @@
 CFLAGS += -Wall -O2 -g
-LDLIBS += -lpcap -lnet
+LDLIBS += -lpcap -lnet -lpthread
 
 all: tcp jolt2
 
