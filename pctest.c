@@ -319,12 +319,20 @@ create_session(char *host, uint16_t port)
 	if (!(sess->lnh = libnet_init(LIBNET_RAW4, NULL, errbuf))) {
 		fprintf(stderr, "%s\n", errbuf);
 		pthread_mutex_unlock(&sess->lock);
+		pthread_mutex_destroy(&sess->lock);
 		free(sess);
 		return NULL;
 	}
 
 	sess->dst_ip = libnet_name2addr4(sess->lnh, host,
 					 LIBNET_RESOLVE);
+	if (sess->dst_ip == -1) {
+		fprintf(stderr, "%s\n", libnet_geterror(sess->lnh));
+		pthread_mutex_unlock(&sess->lock);
+		pthread_mutex_destroy(&sess->lock);
+		free(sess);
+		return NULL;
+	}
 	sess->dst_prt = port;
 	sess->src_prt = get_port(sess->dst_ip, sess->dst_prt);
 
@@ -564,7 +572,6 @@ control_main(void *arg)
 		if (buf[strlen(buf) - 1] == '\n')
 			buf[strlen(buf) - 1] = 0;
 		if (!strncasecmp(buf, "connect ", strlen("connect "))) {
-			struct tcp_session *sess;
 			char *arg1, *arg2;
 			arg1 = buf + strlen("connect ");
 			arg2 = strchr(arg1, ' ');
@@ -572,7 +579,7 @@ control_main(void *arg)
 				continue;
 			*arg2++ = 0;
 
-			sess = create_session(arg1, atoi(arg2));
+			create_session(arg1, atoi(arg2));
 		} else if (!strncasecmp(buf, "listen ", strlen("listen "))) {
 			printf("ha! not yet.\n");
 		} else if (!strncasecmp(buf, "close ", strlen("close "))) {
