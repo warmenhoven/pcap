@@ -430,6 +430,7 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 				 ntohl(pkt->seqno) + 1);
 			fprintf(stderr, "RST'ing (State = LISTEN, "
 				"Control = %02x)\n", pkt->control);
+			remove_session(sess);
 		}
 		break;
 	case SYN_RCVD:
@@ -443,6 +444,7 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 				 ntohl(pkt->seqno) + 1);
 			fprintf(stderr, "RST'ing (State = SYN_RCVD, "
 				"Control = %02x)\n", pkt->control);
+			remove_session(sess);
 		}
 		break;
 	case SYN_SENT:
@@ -560,6 +562,7 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 				 ntohl(pkt->seqno) + 1);
 			fprintf(stderr, "RST'ing (State = LAST_ACK, "
 				"Control = %02x)\n", pkt->control);
+			remove_session(sess);
 		}
 		break;
 	}
