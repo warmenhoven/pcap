@@ -21,6 +21,10 @@ enum tcp_state {
 struct tcp_session {
 	enum tcp_state state;
 
+	libnet_t *lnh;
+	libnet_ptag_t tcp_id;
+	libnet_ptag_t ip_id;
+
 	unsigned char src_hw[6];
 	uint32_t src_ip;
 	uint16_t src_prt;
@@ -137,39 +141,36 @@ static int init_filter(struct tcp_session *sess)
 
 static int send_tcp(struct tcp_session *sess, int flags)
 {
-	char errbuf[LIBNET_ERRBUF_SIZE];
-	libnet_t *lnh;
-
-	if (!(lnh = libnet_init(LIBNET_RAW4, NULL, errbuf))) {
-		fprintf(stderr, "%s\n", errbuf);
+	if ((sess->tcp_id =
+	     libnet_build_tcp(sess->src_prt, sess->dst_prt, sess->seqno,
+			      sess->ackno, flags, 32767, 0, 0, LIBNET_TCP_H,
+			      NULL, 0, sess->lnh, sess->tcp_id)) == -1) {
+		fprintf(stderr, "%s\n", libnet_geterror(sess->lnh));
+		return 1;
+	}
+	if ((sess->ip_id =
+	     libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_TCP_H, 0, 242, 0, 64,
+			       IPPROTO_TCP, 0, sess->src_ip, sess->dst_ip,
+			       NULL, 0, sess->lnh, sess->ip_id)) == -1) {
+		fprintf(stderr, "%s\n", libnet_geterror(sess->lnh));
 		return 1;
 	}
 
-	if (libnet_build_tcp(sess->src_prt, sess->dst_prt, sess->seqno,
-			     sess->ackno, flags, 32767, 0, 0, LIBNET_TCP_H,
-			     NULL, 0, lnh, 0) == -1) {
-		fprintf(stderr, "%s\n", libnet_geterror(lnh));
-		return 1;
-	}
-	if (libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_TCP_H, 0, 242, 0, 64,
-			      IPPROTO_TCP, 0, sess->src_ip, sess->dst_ip,
-			      NULL, 0, lnh, 0) == -1) {
-		fprintf(stderr, "%s\n", libnet_geterror(lnh));
+	if (libnet_write(sess->lnh) == -1) {
+		fprintf(stderr, "%s\n", libnet_geterror(sess->lnh));
 		return 1;
 	}
 
-	if (libnet_write(lnh) == -1) {
-		fprintf(stderr, "%s\n", libnet_geterror(lnh));
-		return 1;
-	}
-
-	libnet_destroy(lnh);
 	return 0;
 }
 
 /* XXX convince the host we're running on that it can safely ignore us */
 static int arp_reply(struct tcp_session *sess, unsigned char hw[6], uint32_t ip)
 {
+	/* we don't reuse the sess libnet_t handle because it's a raw socket
+	 * and we want link-level access. we probably could make this handle
+	 * static so that we don't have to rebuild it too many times, but
+	 * hopefully we should only need to build it once. */
 	char errbuf[PCAP_ERRBUF_SIZE];
 	libnet_t *lnh;
 
@@ -387,40 +388,34 @@ static void sighandler(int num)
 int main(int argc, char **argv)
 {
 	char errbuf[LIBNET_ERRBUF_SIZE];
-	libnet_t *lnh;
 
 	struct tcp_session *sess = calloc(1, sizeof (struct tcp_session));
 
 	if (init_pcap())
 		return 1;
 
-	/* libnet seems to have problems if you reuse the handles. I'm sure
-	 * it's just me doing something wrong but rather than figure out what
-	 * I'll just use a different handle for everything! */
-	if (!(lnh = libnet_init(LIBNET_RAW4, NULL, errbuf))) {
+	if (!(sess->lnh = libnet_init(LIBNET_RAW4, NULL, errbuf))) {
 		fprintf(stderr, "%s\n", errbuf);
 		return 1;
 	}
 
 	/* initial setup of the tcp session */
 	/* sess->state = CLOSED; */
-	sess->dst_ip = libnet_name2addr4(lnh,
+	sess->dst_ip = libnet_name2addr4(sess->lnh,
 					 argc > 1 ? argv[1] : "172.20.102.1",
 					 LIBNET_RESOLVE);
-	sess->dst_prt = argc > 2 ? atoi(argv[2]) : 80;
+	sess->dst_prt = argc > 2 ? atoi(argv[2]) : 12345;
 	/* there's probably some great easy portable way of getting the MAC
 	 * address of the host we're going to be using. but since I don't know
 	 * what it is we're going to use our super-fun hacky way. */
 	bzero(sess->src_hw, 6);
-	sess->src_ip = libnet_name2addr4(lnh,
+	sess->src_ip = libnet_name2addr4(sess->lnh,
 					 argc > 3 ? argv[3] : "172.20.102.9",
 					 LIBNET_RESOLVE);
 	sess->src_prt = argc > 4 ? atoi(argv[4]) : 12345;
 
 	/* I hear I shouldn't use this function for anything real. oh well. */
 	sess->seqno = libnet_get_prand(LIBNET_PRu32);
-
-	libnet_destroy(lnh);
 
 	if (init_filter(sess))
 		return 1;
