@@ -307,17 +307,20 @@ send_rst(uint32_t dst_ip, uint16_t dst_prt, uint32_t src_prt,
 	if (libnet_build_tcp(src_prt, dst_prt, seqno, ackno, TH_RST | TH_ACK,
 						 0, 0, 0, LIBNET_TCP_H, NULL, 0, lnh, 0) == -1) {
 		fprintf(stderr, "%s\n", libnet_geterror(lnh));
+		libnet_destroy(lnh);
 		return 0;
 	}
 	if (libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_TCP_H, 0x10, 0, 0, 64,
 						  IPPROTO_TCP, 0, src_ip, dst_ip, NULL, 0,
 						  lnh, 0) == -1) {
 		fprintf(stderr, "%s\n", libnet_geterror(lnh));
+		libnet_destroy(lnh);
 		return 0;
 	}
 
 	if (libnet_write(lnh) == -1) {
 		fprintf(stderr, "%s\n", libnet_geterror(lnh));
+		libnet_destroy(lnh);
 		return 0;
 	}
 
@@ -739,7 +742,8 @@ process_tcp_packet(u_char *pkt)
 		return;
 	}
 
-	if (tcp->offset << 2 < sizeof (struct tcp_pkt) - sizeof (struct ip_pkt)) {
+	if ((unsigned int)(tcp->offset << 2) <
+		sizeof (struct tcp_pkt) - sizeof (struct ip_pkt)) {
 		fprintf(stderr, "invalid TCP header!\n");
 		return;
 	}
@@ -824,6 +828,52 @@ process_ip_packet(void)
 }
 
 static void
+ping(char *host)
+{
+	/* we probably could make this handle static so that we don't have to
+	 * rebuild it too many times, but hopefully we should only need to
+	 * build it once. */
+	char errbuf[LIBNET_ERRBUF_SIZE];
+	libnet_t *lnh;
+	libnet_ptag_t tag;
+	uint32_t dst_ip;
+
+	if (!(lnh = libnet_init(LIBNET_RAW4, NULL, errbuf))) {
+		fprintf(stderr, "%s\n", errbuf);
+		return;
+	}
+
+	dst_ip = libnet_name2addr4(lnh, host, LIBNET_RESOLVE);
+	if (dst_ip == 0xffffffff) {
+		fprintf(stderr, "%s\n", libnet_geterror(lnh));
+		libnet_destroy(lnh);
+		return;
+	}
+
+	if ((tag = libnet_build_icmpv4_echo(ICMP_ECHO, 0, 0, 0x42, 0x42, NULL, 0,
+										lnh, 0)) == -1) {
+		fprintf(stderr, "%s\n", libnet_geterror(lnh));
+		libnet_destroy(lnh);
+		return;
+	}
+
+	if (libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_ICMPV4_ECHO_H, 0, 0x42, 0, 64,
+						  IPPROTO_ICMP, 0, src_ip, dst_ip,
+						  NULL, 0, lnh, 0) == -1) {
+		fprintf(stderr, "%s\n", libnet_geterror(lnh));
+		libnet_destroy(lnh);
+		return;
+	}
+
+	if (libnet_write(lnh) == -1) {
+		fprintf(stderr, "%s\n", libnet_geterror(lnh));
+	}
+
+	libnet_destroy(lnh);
+	return;
+}
+
+static void
 process_input(void)
 {
 	char buf[80];
@@ -841,6 +891,10 @@ process_input(void)
 		create_session(arg1, atoi(arg2));
 	} else if (!strncasecmp(buf, "listen ", strlen("listen "))) {
 		create_session(NULL, atoi(buf + strlen("listen ")));
+	} else if (!strncasecmp(buf, "ping ", strlen("ping "))) {
+		char *arg1;
+		arg1 = buf + strlen("ping ");
+		ping(arg1);
 	} else if (!strncasecmp(buf, "close ", strlen("close "))) {
 		list *l = sessions;
 		unsigned int id = atoi(buf + strlen("close "));
@@ -936,15 +990,19 @@ arp_reply(unsigned char hw[6], uint32_t ip)
 						 src_hw, (u_char *)&src_ip, hw, (u_char *)&ip,
 						 NULL, 0, lnh, 0) == -1) {
 		fprintf(stderr, "%s\n", libnet_geterror(lnh));
+		libnet_destroy(lnh);
 		return 0;
 	}
+
 	if (libnet_autobuild_ethernet(hw, ETHERTYPE_ARP, lnh) == -1) {
 		fprintf(stderr, "%s\n", libnet_geterror(lnh));
+		libnet_destroy(lnh);
 		return 0;
 	}
 
 	if (libnet_write(lnh) == -1) {
 		fprintf(stderr, "%s\n", libnet_geterror(lnh));
+		libnet_destroy(lnh);
 		return 0;
 	}
 
