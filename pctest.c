@@ -88,14 +88,6 @@ struct tcp_session {
 	 * attention to */
 };
 
-/* these are our global variables */
-unsigned char src_hw[6];
-uint32_t src_ip;
-list *sessions;
-list *timers;
-uint32_t next_id = 0;
-int sp[2];
-
 /* I'm sure I didn't need to do this */
 struct enet {
 	unsigned char dst_hw[6];
@@ -145,7 +137,7 @@ struct ip_pkt {
 
 struct tcp_pkt {
 	struct ip_pkt ip;	/* XXX this is wrong. I'll fix it once I start
-				   testing with servers other than Linux. */
+						   testing with servers other than Linux. */
 	uint16_t src_prt;
 	uint16_t dst_prt;
 	uint32_t seqno;
@@ -170,14 +162,22 @@ struct tcp_pkt {
 static list *list_new(void *);
 static list *list_prepend(list *, void *);
 static list *list_remove(list *, void *);
-/* we don't use these
 typedef int (*cmpfnc)(const void *, const void *);
 static list *list_insert_sorted(list *, void *, cmpfnc);
+/* we don't use these
 static unsigned int list_length(list *);
 static void *list_nth(list *, int);
 static list *list_append(list *, void *);
 static void list_free(list *);
 */
+
+/* these are our global variables */
+static unsigned char src_hw[6];
+static uint32_t src_ip;
+static list *sessions = NULL;
+static list *open_connections = NULL;
+static list *listeners = NULL;
+static int sp[2];
 
 static pcap_t *
 init_pcap(void)
@@ -228,16 +228,16 @@ static int
 send_tcp(struct tcp_session *sess, int flags)
 {
 	if ((sess->tcp_id =
-	     libnet_build_tcp(sess->src_prt, sess->dst_prt, sess->seqno,
-			      sess->ackno, flags, 32767, 0, 0, LIBNET_TCP_H,
-			      NULL, 0, sess->lnh, sess->tcp_id)) == -1) {
+		 libnet_build_tcp(sess->src_prt, sess->dst_prt, sess->seqno,
+						  sess->ackno, flags, 32767, 0, 0, LIBNET_TCP_H,
+						  NULL, 0, sess->lnh, sess->tcp_id)) == -1) {
 		fprintf(stderr, "%s\n", libnet_geterror(sess->lnh));
 		return 0;
 	}
 	if ((sess->ip_id =
-	     libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_TCP_H, 0, 242, 0, 64,
-			       IPPROTO_TCP, 0, src_ip, sess->dst_ip,
-			       NULL, 0, sess->lnh, sess->ip_id)) == -1) {
+		 libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_TCP_H, 0, 242, 0, 64,
+						   IPPROTO_TCP, 0, src_ip, sess->dst_ip,
+						   NULL, 0, sess->lnh, sess->ip_id)) == -1) {
 		fprintf(stderr, "%s\n", libnet_geterror(sess->lnh));
 		return 0;
 	}
@@ -254,7 +254,7 @@ send_tcp(struct tcp_session *sess, int flags)
  * just copying it. but eh. it probably isn't an issue. at least not often. */
 static int
 send_rst(uint32_t dst_ip, uint16_t dst_prt, uint32_t src_prt,
-	 uint32_t seqno, uint32_t ackno, int state, int control)
+		 uint32_t seqno, uint32_t ackno, int state, int control)
 {
 	char errbuf[LIBNET_ERRBUF_SIZE];
 	libnet_t *lnh;
@@ -265,13 +265,13 @@ send_rst(uint32_t dst_ip, uint16_t dst_prt, uint32_t src_prt,
 	}
 
 	if (libnet_build_tcp(src_prt, dst_prt, seqno, ackno, TH_RST | TH_ACK,
-			     0, 0, 0, LIBNET_TCP_H, NULL, 0, lnh, 0) == -1) {
+						 0, 0, 0, LIBNET_TCP_H, NULL, 0, lnh, 0) == -1) {
 		fprintf(stderr, "%s\n", libnet_geterror(lnh));
 		return 0;
 	}
 	if (libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_TCP_H, 0x10, 0, 0, 64,
-			       IPPROTO_TCP, 0, src_ip, dst_ip, NULL, 0,
-			       lnh, 0) == -1) {
+						  IPPROTO_TCP, 0, src_ip, dst_ip, NULL, 0,
+						  lnh, 0) == -1) {
 		fprintf(stderr, "%s\n", libnet_geterror(lnh));
 		return 0;
 	}
@@ -282,7 +282,7 @@ send_rst(uint32_t dst_ip, uint16_t dst_prt, uint32_t src_prt,
 	}
 
 	fprintf(stderr, "RST'ing (State = %s, Control = %02x)\n",
-		state_names[state], control);
+			state_names[state], control);
 	libnet_destroy(lnh);
 	return 1;
 }
@@ -290,7 +290,7 @@ send_rst(uint32_t dst_ip, uint16_t dst_prt, uint32_t src_prt,
 static struct tcp_session *
 find_session(uint32_t dst_ip, uint32_t dst_prt, uint32_t src_prt)
 {
-	list *l = sessions;
+	list *l = open_connections;
 
 	while (l) {
 		struct tcp_session *sess = l->data;
@@ -299,14 +299,22 @@ find_session(uint32_t dst_ip, uint32_t dst_prt, uint32_t src_prt)
 		if (sess->src_prt != src_prt)
 			continue;
 
-		if (sess->state != TCP_LISTEN &&
-		    sess->dst_ip == dst_ip && sess->dst_prt == dst_prt)
+		if (sess->dst_ip == dst_ip && sess->dst_prt == dst_prt)
 			return sess;
+	}
+
+	l = listeners;
+
+	while (l) {
+		struct tcp_session *sess = l->data;
+		l = l->next;
+
+		if (sess->src_prt != src_prt)
+			continue;
 
 		/* TODO: we should be able to support listening for specific
 		 * hosts (or specific ports) */
-		if (sess->state == TCP_LISTEN &&
-		    !sess->dst_ip && !sess->dst_prt)
+		if (!sess->dst_ip && !sess->dst_prt)
 			return sess;
 	}
 
@@ -327,6 +335,28 @@ get_port(uint32_t dst_ip, uint16_t dst_prt)
 	return src_prt;
 }
 
+static int
+get_next_sess_id(void)
+{
+	list *l = sessions;
+	unsigned int i = 0;
+	while (l) {
+		struct tcp_session *s = l->data;
+		l = l->next;
+		if (s->id != i)
+			return i;
+		i++;
+	}
+	return i;
+}
+
+static int
+sess_cmp(const void *x, const void *y)
+{
+	const struct tcp_session *a = x, *b = y;
+	return a->id - b->id;
+}
+
 static struct tcp_session *
 session_setup(void)
 {
@@ -344,15 +374,8 @@ session_setup(void)
 	/* I hear I shouldn't use this function for anything real. oh well. */
 	sess->seqno = libnet_get_prand(LIBNET_PRu32);
 
-	/* prepend instead of append so that (implicitly) accept()'ed sockets
-	 * are found before the associated listen()'ing sockets when walking
-	 * the list of sessions. really listening sockets should be put at the
-	 * end of the list so as not to clobber previous connections. maybe
-	 * I'll fix it later */
-	sessions = list_prepend(sessions, sess);
-	/* this is technically wrong but I doubt next_id will ever wrap (unless
-	 * if you're doing mean things to this poor little program) */
-	sess->id = next_id++;
+	sess->id = get_next_sess_id();
+	sessions = list_insert_sorted(sessions, sess, sess_cmp);
 	printf("creating socket %d\n", sess->id);
 
 	return sess;
@@ -382,22 +405,24 @@ create_session(char *host, uint16_t port)
 		}
 		sess->dst_prt = port;
 		sess->src_prt = get_port(sess->dst_ip, sess->dst_prt);
-	} else {
-		/* listening socket */
-		sess->dst_ip = 0;
-		sess->dst_prt = 0;
-		sess->src_prt = port;
-	}
 
-	if (host) {
 		/* send the SYN, and we're off! */
 		send_tcp(sess, TH_SYN);
 		sess->seqno++;
 		sess->state = TCP_SYN_SENT;
-		printf("%d: %s\n", sess->id, state_names[sess->state]);
+		printf("%u: %s\n", sess->id, state_names[sess->state]);
+		open_connections = list_prepend(open_connections, sess);
 	} else {
+		/* listening socket */
+		/* XXX we should make sure that the port isn't already in use (unless
+		 * the user specifies SO_REUSEADDR (ha!)) */
+		sess->dst_ip = 0;
+		sess->dst_prt = 0;
+		sess->src_prt = port;
+
 		sess->state = TCP_LISTEN;
-		printf("%d: %s\n", sess->id, state_names[sess->state]);
+		printf("%u: %s\n", sess->id, state_names[sess->state]);
+		listeners = list_prepend(listeners, sess);
 	}
 
 	return sess;
@@ -420,7 +445,9 @@ accept_session(struct tcp_session *listener, struct tcp_pkt *pkt)
 	send_tcp(sess, TH_SYN | TH_ACK);
 	sess->seqno++;
 	sess->state = TCP_SYN_RECV;
-	printf("%d: %s\n", sess->id, state_names[sess->state]);
+	printf("%u: %s\n", sess->id, state_names[sess->state]);
+
+	open_connections = list_prepend(open_connections, sess);
 
 	return sess;
 }
@@ -429,6 +456,11 @@ accept_session(struct tcp_session *listener, struct tcp_pkt *pkt)
 static void
 remove_session(struct tcp_session *sess)
 {
+	if (sess->state == TCP_LISTEN) {
+		listeners = list_remove(listeners, sess);
+	} else {
+		open_connections = list_remove(open_connections, sess);
+	}
 	sessions = list_remove(sessions, sess);
 	libnet_destroy(sess->lnh);
 	free(sess);
@@ -457,9 +489,9 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 			accept_session(sess, pkt);
 		} else {
 			send_rst(pkt->ip.src_ip, ntohs(pkt->src_prt),
-				 ntohs(pkt->dst_prt), ntohl(pkt->ackno),
-				 ntohl(pkt->seqno) + 1,
-				 sess->state, pkt->control);
+					 ntohs(pkt->dst_prt), ntohl(pkt->ackno),
+					 ntohl(pkt->seqno) + 1,
+					 sess->state, pkt->control);
 			/* don't remove_sess because we're still listening */
 		}
 		break;
@@ -467,12 +499,12 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 		if (pkt->control & TH_ACK) {
 			sess->ackno = ntohl(pkt->seqno) + 1;
 			sess->state = TCP_ESTABLISHED;
-			printf("%d: %s\n", sess->id, state_names[sess->state]);
+			printf("%u: %s\n", sess->id, state_names[sess->state]);
 		} else {
 			send_rst(pkt->ip.src_ip, ntohs(pkt->src_prt),
-				 ntohs(pkt->dst_prt), ntohl(pkt->ackno),
-				 ntohl(pkt->seqno) + 1,
-				 sess->state, pkt->control);
+					 ntohs(pkt->dst_prt), ntohl(pkt->ackno),
+					 ntohl(pkt->seqno) + 1,
+					 sess->state, pkt->control);
 			remove_session(sess);
 		}
 		break;
@@ -481,26 +513,26 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 			if (ntohl(pkt->ackno) != sess->seqno) {
 				fprintf(stderr, "Invalid ackno\n");
 				send_rst(pkt->ip.src_ip, ntohs(pkt->src_prt),
-					 ntohs(pkt->dst_prt), ntohl(pkt->ackno),
-					 ntohl(pkt->seqno) + 1,
-					 sess->state, pkt->control);
+						 ntohs(pkt->dst_prt), ntohl(pkt->ackno),
+						 ntohl(pkt->seqno) + 1,
+						 sess->state, pkt->control);
 				remove_session(sess);
 				return;
 			}
 			sess->ackno = ntohl(pkt->seqno) + 1;
 			send_tcp(sess, TH_ACK);
 			sess->state = TCP_ESTABLISHED;
-			printf("%d: %s\n", sess->id, state_names[sess->state]);
+			printf("%u: %s\n", sess->id, state_names[sess->state]);
 		} else if (pkt->control & TH_SYN) {
 			sess->ackno = ntohl(pkt->seqno) + 1;
 			send_tcp(sess, TH_ACK);
 			sess->state = TCP_SYN_RECV;
-			printf("%d: %s\n", sess->id, state_names[sess->state]);
+			printf("%u: %s\n", sess->id, state_names[sess->state]);
 		} else {
 			send_rst(pkt->ip.src_ip, ntohs(pkt->src_prt),
-				 ntohs(pkt->dst_prt), ntohl(pkt->ackno),
-				 ntohl(pkt->seqno) + 1,
-				 sess->state, pkt->control);
+					 ntohs(pkt->dst_prt), ntohl(pkt->ackno),
+					 ntohl(pkt->seqno) + 1,
+					 sess->state, pkt->control);
 			remove_session(sess);
 		}
 		break;
@@ -513,7 +545,7 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 			send_tcp(sess, TH_FIN | TH_ACK);
 			sess->seqno++;
 			sess->state = TCP_LAST_ACK;
-			printf("%d: %s\n", sess->id, state_names[sess->state]);
+			printf("%u: %s\n", sess->id, state_names[sess->state]);
 		}
 		/* XXX there are more cases of things to do here */
 		break;
@@ -523,7 +555,7 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 			sess->ackno = ntohl(pkt->seqno) + 1;
 			send_tcp(sess, TH_ACK);
 			sess->state = TCP_TIME_WAIT;
-			printf("%d: %s\n", sess->id, state_names[sess->state]);
+			printf("%u: %s\n", sess->id, state_names[sess->state]);
 			/* we should move to TIME_WAIT in case if the other
 			 * side doesn't receive our ACK, but we just assume
 			 * everything went well */
@@ -536,7 +568,7 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 			sess->ackno = ntohl(pkt->seqno) + 1;
 			send_tcp(sess, TH_ACK);
 			sess->state = TCP_CLOSING;
-			printf("%d: %s\n", sess->id, state_names[sess->state]);
+			printf("%u: %s\n", sess->id, state_names[sess->state]);
 			/* just like TIME_WAIT, we should move to CLOSING, but
 			 * we just assume everything went well */
 			remove_session(sess);
@@ -546,14 +578,14 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 		if (pkt->control & TH_ACK) {
 			/* we've got the ACK, now we're waiting for the FIN */
 			sess->state = TCP_FIN_WAIT2;
-			printf("%d: %s\n", sess->id, state_names[sess->state]);
+			printf("%u: %s\n", sess->id, state_names[sess->state]);
 			break;
 		}
 
 		/* we didn't get ACK or FIN, so we RST */
 		send_rst(pkt->ip.src_ip, ntohs(pkt->src_prt),
-			 ntohs(pkt->dst_prt), ntohl(pkt->ackno),
-			 ntohl(pkt->seqno) + 1, sess->state, pkt->control);
+				 ntohs(pkt->dst_prt), ntohl(pkt->ackno),
+				 ntohl(pkt->seqno) + 1, sess->state, pkt->control);
 		remove_session(sess);
 		break;
 	case TCP_FIN_WAIT2:
@@ -562,7 +594,7 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 			sess->ackno = ntohl(pkt->seqno) + 1;
 			send_tcp(sess, TH_ACK);
 			sess->state = TCP_TIME_WAIT;
-			printf("%d: %s\n", sess->id, state_names[sess->state]);
+			printf("%u: %s\n", sess->id, state_names[sess->state]);
 			/* just like above, we should move to TIME_WAIT, but
 			 * we just assume everything went well */
 			remove_session(sess);
@@ -571,8 +603,8 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 
 		/* we're waiting for FIN but didn't get it, so RST */
 		send_rst(pkt->ip.src_ip, ntohs(pkt->src_prt),
-			 ntohs(pkt->dst_prt), ntohl(pkt->ackno),
-			 ntohl(pkt->seqno) + 1, sess->state, pkt->control);
+				 ntohs(pkt->dst_prt), ntohl(pkt->ackno),
+				 ntohl(pkt->seqno) + 1, sess->state, pkt->control);
 		remove_session(sess);
 		break;
 	case TCP_CLOSING:
@@ -590,13 +622,13 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 		if (pkt->control & TH_ACK) {
 			/* now we can remove the session */
 			sess->state = TCP_CLOSE;
-			printf("%d: %s\n", sess->id, state_names[sess->state]);
+			printf("%u: %s\n", sess->id, state_names[sess->state]);
 			remove_session(sess);
 		} else {
 			send_rst(pkt->ip.src_ip, ntohs(pkt->src_prt),
-				 ntohs(pkt->dst_prt), ntohl(pkt->ackno),
-				 ntohl(pkt->seqno) + 1,
-				 sess->state, pkt->control);
+					 ntohs(pkt->dst_prt), ntohl(pkt->ackno),
+					 ntohl(pkt->seqno) + 1,
+					 sess->state, pkt->control);
 			remove_session(sess);
 		}
 		break;
@@ -638,7 +670,7 @@ process_packet(void)
 	csum = ip->hdr_csum;
 	ip->hdr_csum = 0;
 	sum = libnet_in_cksum((u_int16_t *)ip + sizeof (struct enet) / 2,
-			      ip->ihl << 2);
+						  ip->ihl << 2);
 	ip->hdr_csum = LIBNET_CKSUM_CARRY(sum);
 	if (csum != ip->hdr_csum) {
 		fprintf(stderr, "checksum mismatch in IP header!\n");
@@ -668,10 +700,10 @@ process_packet(void)
 
 	/* maybe we should move this check to state_machine. */
 	if (!(sess = find_session(ip->src_ip, ntohs(tcp->src_prt),
-				  ntohs(tcp->dst_prt)))) {
+							  ntohs(tcp->dst_prt)))) {
 		send_rst(ip->src_ip, ntohs(tcp->src_prt),
-			 ntohs(tcp->dst_prt), ntohl(tcp->ackno),
-			 ntohl(tcp->seqno) + 1, TCP_CLOSE, tcp->control);
+				 ntohs(tcp->dst_prt), ntohl(tcp->ackno),
+				 ntohl(tcp->seqno) + 1, TCP_CLOSE, tcp->control);
 		free(pkt);
 		return;
 	}
@@ -699,8 +731,6 @@ process_input(void)
 
 		create_session(arg1, atoi(arg2));
 	} else if (!strncasecmp(buf, "listen ", strlen("listen "))) {
-		/* we should make sure that the port isn't already in use
-		 * (unless the user specifies SO_REUSEADDR) */
 		create_session(NULL, atoi(buf + strlen("listen ")));
 	} else if (!strncasecmp(buf, "close ", strlen("close "))) {
 		list *l = sessions;
@@ -709,24 +739,31 @@ process_input(void)
 		while (l) {
 			struct tcp_session *sess = l->data;
 
-			if (sess->id == id) {
-				if (sess->state == TCP_LISTEN) {
-					remove_session(sess);
-				} else {
-					send_tcp(sess, TH_FIN | TH_ACK);
-					sess->seqno++;
-					sess->state = TCP_FIN_WAIT1;
-					printf("%d: %s\n",
-					       sess->id,
-					       state_names[sess->state]);
-				}
+			if (sess->id > id) {
+				l = NULL;
 				break;
 			}
 
-			l = l->next;
+			if (sess->id < id) {
+				l = l->next;
+				continue;
+			}
+
+			if (sess->state == TCP_LISTEN ||
+				sess->state == TCP_SYN_SENT || sess->state == TCP_SYN_RECV) {
+				remove_session(sess);
+			} else if (sess->state == TCP_ESTABLISHED) {
+				send_tcp(sess, TH_FIN | TH_ACK);
+				sess->seqno++;
+				sess->state = TCP_FIN_WAIT1;
+				printf("%u: %s\n",
+					   sess->id,
+					   state_names[sess->state]);
+			}
+			break;
 		}
 		if (!l)
-			printf("couldn't find %d\n", id);
+			printf("couldn't find %u\n", id);
 	} else if (!strcasecmp(buf, "netstat")) {
 		list *l = sessions;
 
@@ -734,9 +771,10 @@ process_input(void)
 			struct tcp_session *sess = l->data;
 			l = l->next;
 
-			printf("port %d with %x:%d id %d\n",
-			       sess->src_prt, ntohl(sess->dst_prt),
-			       sess->dst_prt, sess->id);
+			printf("id %d: port %d with %s:%d\n",
+				   sess->id, sess->src_prt,
+				   libnet_addr2name4(sess->dst_ip, LIBNET_DONT_RESOLVE),
+				   sess->dst_prt);
 		}
 	} else if (!strcasecmp(buf, "quit")) {
 		/* XXX should send RST to all the sessions */
@@ -783,8 +821,8 @@ arp_reply(unsigned char hw[6], uint32_t ip)
 	}
 
 	if (libnet_build_arp(ARPHRD_ETHER, ETHERTYPE_IP, 6, 4, ARPOP_REPLY,
-			     src_hw, (u_char *)&src_ip, hw, (u_char *)&ip,
-			     NULL, 0, lnh, 0) == -1) {
+						 src_hw, (u_char *)&src_ip, hw, (u_char *)&ip,
+						 NULL, 0, lnh, 0) == -1) {
 		fprintf(stderr, "%s\n", libnet_geterror(lnh));
 		return 0;
 	}
@@ -832,10 +870,10 @@ packet_main(u_char *user, const struct pcap_pkthdr *hdr, const u_char *pkt)
 		 * with this gracefully. (there has to be a better way.) */
 		struct arp *arp = (struct arp *)pkt;
 		if ((ntohs(arp->hrd) == ARPHRD_ETHER) &&	/* ethernet*/
-		    (ntohs(arp->pro) == ETHERTYPE_IP) &&	/* ipv4 */
-		    (ntohs(arp->op) == ARPOP_REQUEST) &&	/* request */
-		    (arp->dst_ip == src_ip) &&			/* for us */
-		    memcmp(src_hw, arp->src_hw, 6))		/* not host */
+			(ntohs(arp->pro) == ETHERTYPE_IP) &&	/* ipv4 */
+			(ntohs(arp->op) == ARPOP_REQUEST) &&	/* request */
+			(arp->dst_ip == src_ip) &&			/* for us */
+			memcmp(src_hw, arp->src_hw, 6))		/* not host */
 			arp_reply(arp->src_hw, arp->src_ip);
 	}
 }
@@ -874,8 +912,8 @@ main(int argc, char **argv)
 	 * but then you'll have to modify this client to handle all the routing
 	 * details itself, and that's not fun. */
 	src_ip = libnet_name2addr4(lnh,
-				   (argc > 1 ? argv[1] : "172.20.102.9"),
-				   LIBNET_RESOLVE);
+							   (argc > 1 ? argv[1] : "172.20.102.9"),
+							   LIBNET_RESOLVE);
 	libnet_destroy(lnh);
 
 	if (!(lph = init_pcap()))
@@ -913,7 +951,8 @@ main(int argc, char **argv)
 }
 
 /* define all the list functions */
-list *list_new(void *data)
+list *
+list_new(void *data)
 {
 	list *l = malloc(sizeof(list));
 	l->next = NULL;
@@ -921,14 +960,16 @@ list *list_new(void *data)
 	return l;
 }
 
-list *list_prepend(list *l, void *data)
+list *
+list_prepend(list *l, void *data)
 {
 	list *s = list_new(data);
 	s->next = l;
 	return s;
 }
 
-list *list_remove(list *l, void *data)
+list *
+list_remove(list *l, void *data)
 {
 	list *s = l, *p = NULL;
 
@@ -950,8 +991,8 @@ list *list_remove(list *l, void *data)
 	return l;
 }
 
-/*
-list *list_insert_sorted(list *l, void *data, cmpfnc f)
+list *
+list_insert_sorted(list *l, void *data, cmpfnc f)
 {
 	list *s = l;
 
@@ -971,7 +1012,9 @@ list *list_insert_sorted(list *l, void *data, cmpfnc f)
 	return l;
 }
 
-unsigned int list_length(list *l)
+/*
+unsigned int
+list_length(list *l)
 {
 	unsigned int c = 0;
 
@@ -983,7 +1026,8 @@ unsigned int list_length(list *l)
 	return c;
 }
 
-void *list_nth(list *l, int n)
+void *
+list_nth(list *l, int n)
 {
 	while (l && n) {
 		l = l->next;
@@ -993,7 +1037,8 @@ void *list_nth(list *l, int n)
 	return NULL;
 }
 
-list *list_append(list *l, void *data)
+list *
+list_append(list *l, void *data)
 {
 	list *s = l;
 
@@ -1005,7 +1050,8 @@ list *list_append(list *l, void *data)
 	return l;
 }
 
-void list_free(list *l)
+void
+list_free(list *l)
 {
 	while (l) {
 		list *s = l;
@@ -1014,3 +1060,5 @@ void list_free(list *l)
 	}
 }
 */
+
+/* vim:set ts=4 sw=4 noet ai tw=80: */
