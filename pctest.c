@@ -690,18 +690,19 @@ main(int argc, char **argv)
 	if (!(lph = init_pcap()))
 		return 1;
 
-	/* there are three (well, four) options if you want to have a main loop
+	/* there are four (well, five) options if you want to have a main loop
 	 * other than pcap_loop:
 	 *
 	 * 1. call pcap_dispatch occasionally
 	 * 2. parse packets from pcap_fileno yourself
 	 * 3. use threads
-	 * 4. rewrite pcap
+	 * 4. fork
+	 * 5. rewrite pcap
 	 *
-	 * 2 and 4 are more or less the same thing, and if using pcap is this
+	 * 2 and 5 are more or less the same thing, and if using pcap is this
 	 * bad, I don't want to think about what hacking pcap is like. 1 isn't
 	 * really an option because it increases the load and you'll miss
-	 * certain things. so the only option left is 3.
+	 * certain things. 4 might be a good option, but I've already chosen 3.
 	 *
 	 * I'm evil. */
 	pthread_create(&thread, NULL, timer_main, NULL);
