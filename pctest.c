@@ -736,7 +736,12 @@ process_tcp_packet(u_char *pkt)
 	tcp->csum = LIBNET_CKSUM_CARRY(sum);
 	if (csum != tcp->csum) {
 		fprintf(stderr, "checksum mismatch in TCP header!\n");
-		free(pkt);
+		return;
+	}
+
+	if (tcp->offset << 2 != sizeof (struct tcp_pkt) - sizeof (struct ip_pkt)) {
+		/* XXX we don't do tcp options */
+		fprintf(stderr, "unsupported TCP options\n");
 		return;
 	}
 
@@ -746,7 +751,6 @@ process_tcp_packet(u_char *pkt)
 		send_rst(tcp->ip.src_ip, ntohs(tcp->src_prt),
 				 ntohs(tcp->dst_prt), ntohl(tcp->ackno),
 				 ntohl(tcp->seqno) + 1, TCP_CLOSE, tcp->control);
-		free(pkt);
 		return;
 	}
 
