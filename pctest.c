@@ -5,12 +5,24 @@
  *
  * I'm sure there's more but those are all I knew off the top of my head
  *
- * right now in the TCP bake off I get 8 points:
+ * right now in the TCP bake off I get 13 points:
+ *
+ * 0 from the Featherweight Division since I can't talk to myself yet (no
+ *   listening sockets)
  *
  * 2 points for talking to someone else
  * 2 point for gracefully ending the conversaion
  * 4 points for repeating the above without reinitializing
  *
+ * 5 points for being able to talk to more than one other TCP at the same time
+ *   (since I can't actually "talk" to them yet, I'm only giving myself 5
+ *   points, for being able to be connected to more than one at a time. once
+ *   I'm able to exchange data then I'll get 2 more points in the Middleweight
+ *   Division and the remainder of the 5 points here)
+ *
+ * but then, I haven't done any checksum tests, so unless the host itself
+ * rejects faulty packets before they're given to pcap, I'm actually at 0
+ * points so far....
  */
 
 #include "list.h"
