@@ -1136,7 +1136,11 @@ packet_main(u_char *user ATTRIBUTE_UNUSED,
 		}
 
 		/* if it's not for us, we ignore it. that's probably a bad thing since
-		 * it means we ignore broadcast as well. but who the hell cares. */
+		 * it means we ignore broadcast as well. but who the hell cares. if we
+		 * ever want to support broadcast then we'll also have to change
+		 * init_pcap so that it gives us broadcast packets. if we ever want to
+		 * be really evil and do horrible things to other people's connections
+		 * then we'll have to modify this and init_pcap. */
 		if (ip->dst_ip != src_ip)
 			return;
 
