@@ -93,19 +93,37 @@ struct arp {
 
 struct ip_pkt {
 	struct enet enet;
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+	unsigned int ihl : 4;
+	unsigned int ver : 4;
+#else
 	unsigned int ver : 4;
 	unsigned int ihl : 4;
+#endif
 	uint8_t tos;
 	uint16_t len;
 	uint16_t id;
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+	unsigned int frag : 13;
+	unsigned int flags : 3;
+#else
 	unsigned int flags : 3;
 	unsigned int frag : 13;
+#endif
 	uint8_t ttl;
 	uint8_t protocol;
 	uint16_t hdr_csum;
 	uint32_t src_ip;
 	uint32_t dst_ip;
 } __attribute__((packed));
+
+struct icmp_pkt {
+	struct ip_pkt ip;	/* XXX this is wrong. I'll fix it once I start
+				   testing with servers other than Linux. */
+	uint8_t type;
+	uint8_t code;
+	uint16_t csum;
+};
 
 struct tcp_pkt {
 	struct ip_pkt ip;	/* XXX this is wrong. I'll fix it once I start
@@ -114,11 +132,17 @@ struct tcp_pkt {
 	uint16_t dst_prt;
 	uint32_t seqno;
 	uint32_t ackno;
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+	unsigned int res : 4;
+	unsigned int offset : 4;
+	unsigned int control : 6;
+	unsigned int ecn : 2;
+#else
 	unsigned int offset : 4;
 	unsigned int res : 4;
-	uint8_t control;	/* the control bits are only the last 6, but
-				   that gave me problems for some reason.
-				   besides, you don't need ECN anyway. */
+	unsigned int ecn : 2;
+	unsigned int control : 6;
+#endif
 	uint16_t window;
 	uint16_t csum;
 	uint16_t urg;
