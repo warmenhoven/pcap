@@ -23,8 +23,6 @@
 #include <libnet.h>
 #include <pcap.h>
 #include <pthread.h>
-#include <stdio.h>
-#include <time.h>
 
 const char *state_names[] = {
 	"UNKNOWN",
