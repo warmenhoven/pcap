@@ -1,10 +1,4 @@
-/* valuable rfc's:
- *
- * 793, TCP
- * 1025, TCP bake off
- *
- * I'm sure there's more but those are all I knew off the top of my head
- *
+/*
  * right now in the TCP bake off I get 17 points:
  *
  * Featherweight Division:
@@ -52,8 +46,73 @@ typedef struct _list {
 	struct _list *next;
 	void *data;
 } list;
+typedef int (*cmpfnc)(const void *, const void *);
 
-struct tcp_session {
+/* define all the list functions */
+static list *
+list_new(void *data)
+{
+	list *l = malloc(sizeof(list));
+	l->next = NULL;
+	l->data = data;
+	return l;
+}
+
+static list *
+list_prepend(list *l, void *data)
+{
+	list *s = list_new(data);
+	s->next = l;
+	return s;
+}
+
+static list *
+list_remove(list *l, void *data)
+{
+	list *s = l, *p = NULL;
+
+	if (!s) return NULL;
+	if (s->data == data) {
+		p = s->next;
+		free(s);
+		return p;
+	}
+	while (s->next) {
+		p = s;
+		s = s->next;
+		if (s->data == data) {
+			p->next = s->next;
+			free(s);
+			return l;
+		}
+	}
+	return l;
+}
+
+static list *
+list_insert_sorted(list *l, void *data, cmpfnc f)
+{
+	list *s = l;
+
+	if (!s)
+		return list_prepend(l, data);
+	if (f(s->data, data) >= 0)
+		return list_prepend(l, data);
+
+	while (s->next) {
+		if (f(s->next->data, data) < 0) {
+			s = s->next;
+			continue;
+		}
+		s->next = list_prepend(s->next, data);
+		return l;
+	}
+
+	s->next = list_new(data);
+	return l;
+}
+
+typedef struct tcp_session {
 	uint32_t id;	/* heh. a more appropriate name might be 'fd'. */
 
 	uint32_t state;
@@ -79,7 +138,7 @@ struct tcp_session {
 
 	/* there's really a bunch of other stuff that I should be paying
 	 * attention to */
-};
+} TCB;
 
 /* I'm sure I didn't need to do this */
 struct enet {
@@ -151,19 +210,6 @@ struct tcp_pkt {
 	uint16_t urg;
 } __attribute__((packed));
 
-/* declare all the list functions */
-static list *list_new(void *);
-static list *list_prepend(list *, void *);
-static list *list_remove(list *, void *);
-typedef int (*cmpfnc)(const void *, const void *);
-static list *list_insert_sorted(list *, void *, cmpfnc);
-/* we don't use these
-static unsigned int list_length(list *);
-static void *list_nth(list *, int);
-static list *list_append(list *, void *);
-static void list_free(list *);
-*/
-
 /* these are our global variables */
 static unsigned char src_hw[6];
 static uint32_t src_ip;
@@ -218,7 +264,7 @@ init_pcap(void)
 }
 
 static int
-send_tcp(struct tcp_session *sess, int flags)
+send_tcp(TCB *sess, int flags)
 {
 	if ((sess->tcp_id =
 		 libnet_build_tcp(sess->src_prt, sess->dst_prt, sess->seqno,
@@ -280,13 +326,13 @@ send_rst(uint32_t dst_ip, uint16_t dst_prt, uint32_t src_prt,
 	return 1;
 }
 
-static struct tcp_session *
+static TCB *
 find_session(uint32_t dst_ip, uint32_t dst_prt, uint32_t src_prt)
 {
 	list *l = open_connections;
 
 	while (l && dst_ip && dst_prt) {
-		struct tcp_session *sess = l->data;
+		TCB *sess = l->data;
 		l = l->next;
 
 		if (sess->src_prt != src_prt)
@@ -301,7 +347,7 @@ find_session(uint32_t dst_ip, uint32_t dst_prt, uint32_t src_prt)
 	/* TODO: we should be able to support listening for specific
 	 * hosts (or specific ports) */
 	while (l) {
-		struct tcp_session *sess = l->data;
+		TCB *sess = l->data;
 		l = l->next;
 
 		if (sess->src_prt == src_prt)
@@ -331,7 +377,7 @@ get_next_sess_id(void)
 	list *l = sessions;
 	unsigned int i = 0;
 	while (l) {
-		struct tcp_session *s = l->data;
+		TCB *s = l->data;
 		l = l->next;
 		if (s->id != i)
 			return i;
@@ -343,14 +389,14 @@ get_next_sess_id(void)
 static int
 sess_cmp(const void *x, const void *y)
 {
-	const struct tcp_session *a = x, *b = y;
+	const TCB *a = x, *b = y;
 	return a->id - b->id;
 }
 
-static struct tcp_session *
+static TCB *
 session_setup(void)
 {
-	struct tcp_session *sess = calloc(1, sizeof (struct tcp_session));
+	TCB *sess = calloc(1, sizeof (TCB));
 	char errbuf[LIBNET_ERRBUF_SIZE];
 
 	/* sess->state = TCP_CLOSE; */
@@ -361,6 +407,10 @@ session_setup(void)
 		return NULL;
 	}
 
+	/* XXX this isn't actually supposed to be random; it's supposed to be
+	 * somewhat internal-clock-based so that if we happen to be using the same
+	 * src_prt/dst_ip/dst_prt tuple that was used in a previous session, the
+	 * remote stack knows that it's for a new session. but I don't care. */
 	/* I hear I shouldn't use this function for anything real. oh well. */
 	sess->seqno = libnet_get_prand(LIBNET_PRu32);
 
@@ -373,10 +423,10 @@ session_setup(void)
 
 /* maybe eventually there will be a third argument, so you can specify the port
  * to connect from */
-static struct tcp_session *
+static TCB *
 create_session(char *host, uint16_t port)
 {
-	struct tcp_session *sess;
+	TCB *sess;
 
 	if (host) {
 		if ((sess = session_setup()) == NULL)
@@ -400,7 +450,8 @@ create_session(char *host, uint16_t port)
 		send_tcp(sess, TH_SYN);
 		sess->seqno++;
 		sess->state = TCP_SYN_SENT;
-		printf("%u: %s\n", sess->id, state_names[sess->state]);
+		printf("%u: %s (port %u)\n", sess->id, state_names[sess->state],
+			   sess->src_prt);
 		open_connections = list_prepend(open_connections, sess);
 	} else {
 		/* listening socket */
@@ -424,10 +475,10 @@ create_session(char *host, uint16_t port)
 	return sess;
 }
 
-static struct tcp_session *
-accept_session(struct tcp_session *listener, struct tcp_pkt *pkt)
+static TCB *
+accept_session(TCB *listener, struct tcp_pkt *pkt)
 {
-	struct tcp_session *sess = session_setup();
+	TCB *sess = session_setup();
 
 	if (!sess)
 		return NULL;
@@ -450,7 +501,7 @@ accept_session(struct tcp_session *listener, struct tcp_pkt *pkt)
 
 /* after this function, sess is no longer valid (obviously) */
 static void
-remove_session(struct tcp_session *sess)
+remove_session(TCB *sess)
 {
 	if (sess->state == TCP_LISTEN) {
 		listeners = list_remove(listeners, sess);
@@ -463,7 +514,7 @@ remove_session(struct tcp_session *sess)
 }
 
 static void
-state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
+state_machine(TCB *sess, struct tcp_pkt *pkt)
 {
 	/* here we can assume that the pkt is part of the session and for us */
 
@@ -493,6 +544,15 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 		break;
 	case TCP_SYN_RECV:
 		if (pkt->control & TH_ACK) {
+			if (ntohl(pkt->ackno) != sess->seqno) {
+				fprintf(stderr, "Invalid ackno\n");
+				send_rst(pkt->ip.src_ip, ntohs(pkt->src_prt),
+						 ntohs(pkt->dst_prt), ntohl(pkt->ackno),
+						 ntohl(pkt->seqno) + 1,
+						 sess->state, pkt->control);
+				remove_session(sess);
+				return;
+			}
 			sess->ackno = ntohl(pkt->seqno) + 1;
 			sess->state = TCP_ESTABLISHED;
 			printf("%u: %s\n", sess->id, state_names[sess->state]);
@@ -544,6 +604,31 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 			printf("%u: %s\n", sess->id, state_names[sess->state]);
 		}
 		/* XXX there are more cases of things to do here */
+		{
+			unsigned int len = ntohs(pkt->ip.len) -
+				(pkt->ip.ihl << 2) -
+				(pkt->offset << 2);
+			unsigned char *ptr = ((unsigned char *)&pkt->src_prt) +
+				(pkt->offset << 2);
+			unsigned int i;
+
+			printf("read %u: %u bytes\n", sess->id, len);
+
+			for (i = 0; i < len; i++) {
+				printf("%02x ", ptr[i]);
+				if (i && (i + 1) % 16 == 0)
+					printf("\n");
+			}
+			printf("\n");
+			for (i = 0; i < len; i++) {
+				printf("%c ", ptr[i]);
+				if (i && (i + 1) % 16 == 0)
+					printf("\n");
+			}
+			printf("\n");
+			sess->ackno += len;
+			send_tcp(sess, TH_ACK);
+		}
 		break;
 	case TCP_FIN_WAIT1:
 		/* we sent the initial FIN */
@@ -639,7 +724,7 @@ process_packet(void)
 
 	struct ip_pkt *ip;
 	struct tcp_pkt *tcp;
-	struct tcp_session *sess;
+	TCB *sess;
 
 	uint16_t csum;
 	int sum, len;
@@ -658,6 +743,16 @@ process_packet(void)
 	}
 	if (hdr.len % 1)
 		pkt[hdr.len] = 0;
+
+#if 0
+	printf("\nPACKET:\n");
+	for (i = 0; i < hdr.len; i++) {
+		printf("%02x ", pkt[i]);
+		if (i && (i + 1) % 16 == 0)
+			printf("\n");
+	}
+	printf("\n\n");
+#endif
 
 	ip = (struct ip_pkt *)pkt;
 
@@ -733,7 +828,7 @@ process_input(void)
 		unsigned int id = atoi(buf + strlen("close "));
 
 		while (l) {
-			struct tcp_session *sess = l->data;
+			TCB *sess = l->data;
 
 			if (sess->id > id) {
 				l = NULL;
@@ -746,9 +841,10 @@ process_input(void)
 			}
 
 			if (sess->state == TCP_LISTEN ||
-				sess->state == TCP_SYN_SENT || sess->state == TCP_SYN_RECV) {
+				sess->state == TCP_SYN_SENT) {
 				remove_session(sess);
-			} else if (sess->state == TCP_ESTABLISHED) {
+			} else if (sess->state == TCP_ESTABLISHED ||
+					   sess->state == TCP_SYN_RECV) {
 				send_tcp(sess, TH_FIN | TH_ACK);
 				sess->seqno++;
 				sess->state = TCP_FIN_WAIT1;
@@ -764,7 +860,7 @@ process_input(void)
 		list *l = sessions;
 
 		while (l) {
-			struct tcp_session *sess = l->data;
+			TCB *sess = l->data;
 			l = l->next;
 
 			printf("id %d: port %d with %s:%d\n",
@@ -789,7 +885,7 @@ control_main(void *arg ATTRIBUTE_UNUSED)
 		FD_SET(0, &set);
 		FD_SET(sp[1], &set);
 
-		/* XXX for now we don't do timers */
+		/* XXX for now we don't do timers; therefore no retransmission, etc. */
 		if (select(sp[1] + 1, &set, NULL, NULL, NULL) < 0)
 			exit(1);
 
@@ -949,118 +1045,5 @@ main(int argc, char **argv)
 	/* I don't think we'll ever get here, unless things go very wrong */
 	return 1;
 }
-
-/* define all the list functions */
-list *
-list_new(void *data)
-{
-	list *l = malloc(sizeof(list));
-	l->next = NULL;
-	l->data = data;
-	return l;
-}
-
-list *
-list_prepend(list *l, void *data)
-{
-	list *s = list_new(data);
-	s->next = l;
-	return s;
-}
-
-list *
-list_remove(list *l, void *data)
-{
-	list *s = l, *p = NULL;
-
-	if (!s) return NULL;
-	if (s->data == data) {
-		p = s->next;
-		free(s);
-		return p;
-	}
-	while (s->next) {
-		p = s;
-		s = s->next;
-		if (s->data == data) {
-			p->next = s->next;
-			free(s);
-			return l;
-		}
-	}
-	return l;
-}
-
-list *
-list_insert_sorted(list *l, void *data, cmpfnc f)
-{
-	list *s = l;
-
-	if (!s)
-		return list_prepend(l, data);
-	if (f(s->data, data) >= 0)
-		return list_prepend(l, data);
-
-	while (s->next) {
-		if (f(s->next->data, data) < 0) {
-			s = s->next;
-			continue;
-		}
-		s->next = list_prepend(s->next, data);
-		return l;
-	}
-
-	s->next = list_new(data);
-	return l;
-}
-
-/*
-unsigned int
-list_length(list *l)
-{
-	unsigned int c = 0;
-
-	while (l) {
-		l = l->next;
-		c++;
-	}
-
-	return c;
-}
-
-void *
-list_nth(list *l, int n)
-{
-	while (l && n) {
-		l = l->next;
-		n--;
-	}
-	if (l) return l->data;
-	return NULL;
-}
-
-list *
-list_append(list *l, void *data)
-{
-	list *s = l;
-
-	if (!s) return list_new(data);
-
-	while (s->next) s = s->next;
-	s->next = list_new(data);
-
-	return l;
-}
-
-void
-list_free(list *l)
-{
-	while (l) {
-		list *s = l;
-		l = l->next;
-		free(s);
-	}
-}
-*/
 
 /* vim:set ts=4 sw=4 noet ai tw=80: */
