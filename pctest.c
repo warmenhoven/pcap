@@ -320,8 +320,8 @@ send_rst(uint32_t dst_ip, uint16_t dst_prt, uint32_t src_prt,
 		return 0;
 	}
 
-	fprintf(stderr, "RST'ing (State = %s, Control = %02x)\n",
-			state_names[state], control);
+	fprintf(stderr, "RST'ing (Port = %d, State = %s, Control = %02x)\n",
+			src_prt, state_names[state], control);
 	libnet_destroy(lnh);
 	return 1;
 }
