@@ -232,7 +232,9 @@ static void state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 			send_tcp(sess, TH_ACK);
 			sess->state = ESTABLISHED;
 		} else {
-			/* we didn't get SYN_ACK, or RST... so we RST! */
+			/* XXX actually if we get SYN but no ACK we're supposed
+			 * to send an ACK, go to SYN_RCVD, and wait for the ACK
+			 * to our SYN. but I don't care about that. */
 			send_tcp(sess, TH_RST);
 			fprintf(stderr, "RST'ing (State = SYN_SENT, "
 				"Control = %02x)\n", pkt->control);
