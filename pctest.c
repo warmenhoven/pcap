@@ -138,7 +138,7 @@ static int init_filter(struct tcp_session *sess)
 static int send_tcp(struct tcp_session *sess, int flags)
 {
 	char errbuf[LIBNET_ERRBUF_SIZE];
-	static libnet_t *lnh;
+	libnet_t *lnh;
 
 	if (!(lnh = libnet_init(LIBNET_RAW4, NULL, errbuf))) {
 		fprintf(stderr, "%s\n", errbuf);
@@ -387,7 +387,7 @@ static void sighandler(int num)
 int main(int argc, char **argv)
 {
 	char errbuf[LIBNET_ERRBUF_SIZE];
-	static libnet_t *lnh;
+	libnet_t *lnh;
 
 	struct tcp_session *sess = calloc(1, sizeof (struct tcp_session));
 
