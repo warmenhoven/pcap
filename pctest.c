@@ -30,6 +30,9 @@ struct tcp_session {
 
 	uint32_t seqno;
 	uint32_t ackno;
+
+	/* there's really a bunch of other stuff that I should be paying
+	 * attention to */
 };
 
 /* I'm sure I didn't need to do this */
@@ -83,7 +86,7 @@ struct tcp_pkt {
 	uint16_t urg;
 } __attribute__((packed));
 
-/* this just work better as globals */
+/* these just work better as globals */
 static char *dev;
 static pcap_t *lph;
 
