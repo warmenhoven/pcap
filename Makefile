@@ -7,3 +7,6 @@ all: $(TARGET)
 
 clean:
 	rm -f $(TARGET)
+
+test: $(TARGET)
+	./tcp
