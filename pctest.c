@@ -48,6 +48,20 @@ enum tcp_state {
 	LAST_ACK
 };
 
+char *state_names[] = {
+	"CLOSED",
+	"LISTEN",
+	"SYN_RCVD",
+	"SYN_SENT",
+	"ESTABLISHED",
+	"FIN_WAIT_1",
+	"FIN_WAIT_2",
+	"CLOSING",
+	"TIME_WAIT",
+	"CLOSE_WAIT",
+	"LAST_ACK",
+};
+
 struct tcp_session {
 	uint32_t id;	/* heh. a more appropriate name might be 'fd'. */
 
@@ -97,6 +111,7 @@ struct arp {
 	uint8_t hln;
 	uint8_t pln;
 	uint16_t op;
+	/* everything from here down is IPv4 but that's all we need */
 	unsigned char src_hw[6];
 	uint32_t src_ip;
 	unsigned char dst_hw[6];
@@ -227,7 +242,7 @@ send_tcp(struct tcp_session *sess, int flags)
  * just copying it. but eh. it probably isn't an issue. at least not often. */
 static int
 send_rst(uint32_t dst_ip, uint16_t dst_prt, uint32_t src_prt,
-	 uint32_t seqno, uint32_t ackno)
+	 uint32_t seqno, uint32_t ackno, enum tcp_state state, int control)
 {
 	char errbuf[LIBNET_ERRBUF_SIZE];
 	libnet_t *lnh;
@@ -254,6 +269,8 @@ send_rst(uint32_t dst_ip, uint16_t dst_prt, uint32_t src_prt,
 		return 0;
 	}
 
+	fprintf(stderr, "RST'ing (State = %s, Control = %02x)\n",
+		state_names[state], control);
 	libnet_destroy(lnh);
 	return 1;
 }
@@ -314,7 +331,12 @@ session_setup()
 	/* I hear I shouldn't use this function for anything real. oh well. */
 	sess->seqno = libnet_get_prand(LIBNET_PRu32);
 
-	sessions = list_append(sessions, sess);
+	/* prepend instead of append so that (implicitly) accept()'ed sockets
+	 * are found before the associated listen()'ing sockets when walking
+	 * the list of sessions. really listening sockets should be put at the
+	 * end of the list so as not to clobber previous connections. maybe
+	 * I'll fix it later */
+	sessions = list_prepend(sessions, sess);
 	/* this is technically wrong but I doubt next_id will ever wrap (unless
 	 * if you're doing mean things to this poor little program) */
 	sess->id = next_id++;
@@ -427,10 +449,9 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 		} else {
 			send_rst(pkt->ip.src_ip, ntohs(pkt->src_prt),
 				 ntohs(pkt->dst_prt), ntohl(pkt->ackno),
-				 ntohl(pkt->seqno) + 1);
-			fprintf(stderr, "RST'ing (State = LISTEN, "
-				"Control = %02x)\n", pkt->control);
-			remove_session(sess);
+				 ntohl(pkt->seqno) + 1,
+				 sess->state, pkt->control);
+			/* don't remove_sess because we're still listening */
 		}
 		break;
 	case SYN_RCVD:
@@ -441,9 +462,8 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 		} else {
 			send_rst(pkt->ip.src_ip, ntohs(pkt->src_prt),
 				 ntohs(pkt->dst_prt), ntohl(pkt->ackno),
-				 ntohl(pkt->seqno) + 1);
-			fprintf(stderr, "RST'ing (State = SYN_RCVD, "
-				"Control = %02x)\n", pkt->control);
+				 ntohl(pkt->seqno) + 1,
+				 sess->state, pkt->control);
 			remove_session(sess);
 		}
 		break;
@@ -459,9 +479,8 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 			 * to our SYN. but I don't care about that. */
 			send_rst(pkt->ip.src_ip, ntohs(pkt->src_prt),
 				 ntohs(pkt->dst_prt), ntohl(pkt->ackno),
-				 ntohl(pkt->seqno) + 1);
-			fprintf(stderr, "RST'ing (State = SYN_SENT, "
-				"Control = %02x)\n", pkt->control);
+				 ntohl(pkt->seqno) + 1,
+				 sess->state, pkt->control);
 			remove_session(sess);
 		}
 		break;
@@ -514,9 +533,7 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 		/* we didn't get ACK or FIN, so we RST */
 		send_rst(pkt->ip.src_ip, ntohs(pkt->src_prt),
 			 ntohs(pkt->dst_prt), ntohl(pkt->ackno),
-			 ntohl(pkt->seqno) + 1);
-		fprintf(stderr, "RST'ing (State = FIN_WAIT_1, "
-			"Control = %02x)\n", pkt->control);
+			 ntohl(pkt->seqno) + 1, sess->state, pkt->control);
 		remove_session(sess);
 		break;
 	case FIN_WAIT_2:
@@ -535,9 +552,7 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 		/* we're waiting for FIN but didn't get it, so RST */
 		send_rst(pkt->ip.src_ip, ntohs(pkt->src_prt),
 			 ntohs(pkt->dst_prt), ntohl(pkt->ackno),
-			 ntohl(pkt->seqno) + 1);
-		fprintf(stderr, "RST'ing (State = FIN_WAIT_2, "
-			"Control = %02x)\n", pkt->control);
+			 ntohl(pkt->seqno) + 1, sess->state, pkt->control);
 		remove_session(sess);
 		break;
 	case CLOSING:
@@ -559,9 +574,8 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 		} else {
 			send_rst(pkt->ip.src_ip, ntohs(pkt->src_prt),
 				 ntohs(pkt->dst_prt), ntohl(pkt->ackno),
-				 ntohl(pkt->seqno) + 1);
-			fprintf(stderr, "RST'ing (State = LAST_ACK, "
-				"Control = %02x)\n", pkt->control);
+				 ntohl(pkt->seqno) + 1,
+				 sess->state, pkt->control);
 			remove_session(sess);
 		}
 		break;
@@ -605,8 +619,7 @@ process_packet()
 				  ntohs(tcp->dst_prt)))) {
 		send_rst(ip->src_ip, ntohs(tcp->src_prt),
 			 ntohs(tcp->dst_prt), ntohl(tcp->ackno),
-			 ntohl(tcp->seqno) + 1);
-		fprintf(stderr, "Couldn't find session, RST'ing\n");
+			 ntohl(tcp->seqno) + 1, CLOSED, tcp->control);
 		free(pkt);
 		return;
 	}
@@ -634,6 +647,8 @@ process_input()
 
 		create_session(arg1, atoi(arg2));
 	} else if (!strncasecmp(buf, "listen ", strlen("listen "))) {
+		/* we should make sure that the port isn't already in use
+		 * (unless the user specifies SO_REUSEADDR) */
 		create_session(NULL, atoi(buf + strlen("listen ")));
 	} else if (!strncasecmp(buf, "close ", strlen("close "))) {
 		list *l = sessions;
