@@ -593,7 +593,9 @@ tcp_state_machine(TCB *sess, struct tcp_pkt *pkt)
 	 * probably isn't a big problem. */
 	switch (sess->state) {
 	case TCP_LISTEN:
-		if (pkt->control & TH_SYN) {
+		if (pkt->control & TH_RST) {
+			/* we're in a listening state, just drop it */
+		} else if (pkt->control & TH_SYN) {
 			accept_session(sess, pkt);
 		} else {
 			send_rst(pkt->ip.src_ip, ntohs(pkt->src_prt),
@@ -780,13 +782,12 @@ tcp_state_machine(TCB *sess, struct tcp_pkt *pkt)
 static void
 process_tcp_packet(u_char *pkt)
 {
-	struct tcp_pkt *tcp;
+	struct tcp_pkt *tcp = (struct tcp_pkt *)pkt;
 	TCB *sess;
 
 	uint16_t csum;
 	int sum, len;
 
-	tcp = (struct tcp_pkt *)pkt;
 	csum = tcp->csum;
 	tcp->csum = 0;
 	sum = libnet_in_cksum((u_int16_t *)&tcp->ip.src_ip, 8);
@@ -809,9 +810,13 @@ process_tcp_packet(u_char *pkt)
 
 	if (!(sess = find_session(tcp->ip.src_ip, ntohs(tcp->src_prt),
 							  ntohs(tcp->dst_prt)))) {
-		send_rst(tcp->ip.src_ip, ntohs(tcp->src_prt),
-				 ntohs(tcp->dst_prt), ntohl(tcp->ackno),
-				 ntohl(tcp->seqno) + 1, TCP_CLOSE, tcp->control);
+		if (!(tcp->control & TH_RST)) {
+			/* if they're sending us a RST then we don't need to send RST back,
+			 * we can safely drop it. */
+			send_rst(tcp->ip.src_ip, ntohs(tcp->src_prt),
+					 ntohs(tcp->dst_prt), ntohl(tcp->ackno),
+					 ntohl(tcp->seqno) + 1, TCP_CLOSE, tcp->control);
+		}
 		return;
 	}
 
@@ -887,12 +892,10 @@ process_icmp_packet(u_char *pkt)
 static void
 process_ip_packet(u_char *pkt)
 {
-	struct ip_pkt *ip;
+	struct ip_pkt *ip = (struct ip_pkt *)pkt;
 
 	uint16_t csum;
 	int sum;
-
-	ip = (struct ip_pkt *)pkt;
 
 	if (ip->ihl < 5 || ip->ver != 4) {
 		fprintf(stderr, "bad IP packet, len = %d, ver = %d\n", ip->ihl,
@@ -906,8 +909,7 @@ process_ip_packet(u_char *pkt)
 						  ip->ihl << 2);
 	ip->hdr_csum = LIBNET_CKSUM_CARRY(sum);
 	if (csum != ip->hdr_csum) {
-		fprintf(stderr, "checksum mismatch in IP header (src %s)!\n",
-				libnet_addr2name4(ip->src_ip, LIBNET_DONT_RESOLVE));
+		fprintf(stderr, "checksum mismatch in IP header!\n");
 		return;
 	}
 
