@@ -885,12 +885,87 @@ process_icmp_packet(u_char *pkt)
 }
 
 static void
-process_ip_packet(void)
+process_ip_packet(u_char *pkt)
+{
+	struct ip_pkt *ip;
+
+	uint16_t csum;
+	int sum;
+
+	ip = (struct ip_pkt *)pkt;
+
+	if (ip->ihl < 5 || ip->ver != 4) {
+		fprintf(stderr, "bad IP packet, len = %d, ver = %d\n", ip->ihl,
+				ip->ver);
+		return;
+	}
+
+	csum = ip->hdr_csum;
+	ip->hdr_csum = 0;
+	sum = libnet_in_cksum((u_int16_t *)ip + sizeof (struct enet) / 2,
+						  ip->ihl << 2);
+	ip->hdr_csum = LIBNET_CKSUM_CARRY(sum);
+	if (csum != ip->hdr_csum) {
+		fprintf(stderr, "checksum mismatch in IP header (src %s)!\n",
+				libnet_addr2name4(ip->src_ip, LIBNET_DONT_RESOLVE));
+		return;
+	}
+
+	/* if it's not for us, we ignore it. that's probably a bad thing since
+	 * it means we ignore broadcast as well. but who the hell cares. if we
+	 * ever want to support broadcast then we'll also have to change
+	 * init_pcap so that it gives us broadcast packets. if we ever want to
+	 * be really evil and do horrible things to other people's connections
+	 * then we'll have to modify this and init_pcap. */
+	if (ip->dst_ip != src_ip) {
+		return;
+	}
+
+	if (ip->ihl != 5) {
+		/* XXX there are more IP options that we need to deal with. until then
+		 * this program isn't a stack, it's a hack. */
+
+		/* XXX we don't deal with options. even worse, we don't send an icmp
+		 * message saying we don't. worse still, we don't send a RST either, so
+		 * we'll just keep getting this packet over and over. */
+		fprintf(stderr, "ip header length != 5 (src %s)!\n",
+				libnet_addr2name4(ip->src_ip, LIBNET_DONT_RESOLVE));
+		return;
+	}
+
+	if (ip->flags & 0x1) {
+		/* XXX we don't deal with fragmentation at all (and again, we don't tell
+		 * whoever we're talking to that we don't) */
+		fprintf(stderr, "fragmentation being used (%x, src %s)\n", ip->flags,
+				libnet_addr2name4(ip->src_ip, LIBNET_DONT_RESOLVE));
+		return;
+	}
+
+	switch (ip->protocol) {
+	case IPPROTO_TCP:
+		process_tcp_packet(pkt);
+		break;
+	case IPPROTO_ICMP:
+		process_icmp_packet(pkt);
+		break;
+	default:
+		/* that's right, we don't handle udp! when's the last time you used udp.
+		 * honestly. and don't tell me you actually use dns or ntp! or nfs. or
+		 * smb. *shudder* */
+		fprintf(stderr, "received unhandled protocol %d (src %s)\n",
+				ip->protocol, libnet_addr2name4(ip->src_ip,
+												LIBNET_DONT_RESOLVE));
+		break;
+	}
+}
+
+static void
+process_packet(void)
 {
 	struct pcap_pkthdr hdr;
 	u_char *pkt;
 
-	struct ip_pkt *ip;
+	struct enet *enet;
 
 	int len;
 
@@ -917,44 +992,15 @@ process_ip_packet(void)
 	printf("\n\n");
 #endif
 
-	ip = (struct ip_pkt *)pkt;
+	enet = (struct enet *)pkt;
 
-	if (ip->ihl != 5) {
-		/* XXX there are more IP options that we need to deal with. until then
-		 * this program isn't a stack, it's a hack. */
-
-		/* XXX we don't deal with options. even worse, we don't send an icmp
-		 * message saying we don't. worse still, we don't send a RST either, so
-		 * we'll just keep getting this packet over and over. */
-		fprintf(stderr, "ip header length != 5 (src %s)!\n",
-				libnet_addr2name4(ip->src_ip, LIBNET_DONT_RESOLVE));
-		free(pkt);
-		return;
-	}
-
-	if (ip->flags & 0x1) {
-		/* XXX we don't deal with fragmentation at all (and again, we don't tell
-		 * whoever we're talking to that we don't) */
-		fprintf(stderr, "fragmentation being used (%x, src %s)\n", ip->flags,
-				libnet_addr2name4(ip->src_ip, LIBNET_DONT_RESOLVE));
-		free(pkt);
-		return;
-	}
-
-	switch (ip->protocol) {
-	case IPPROTO_TCP:
-		process_tcp_packet(pkt);
-		break;
-	case IPPROTO_ICMP:
-		process_icmp_packet(pkt);
+	switch (ntohs(enet->type)) {
+	case ETHERTYPE_IP:
+		process_ip_packet(pkt);
 		break;
 	default:
-		/* that's right, we don't handle udp! when's the last time you used udp.
-		 * honestly. and don't tell me you actually use dns or ntp! or nfs. or
-		 * smb. *shudder* */
-		fprintf(stderr, "received unhandled protocol %d (src %s)\n",
-				ip->protocol, libnet_addr2name4(ip->src_ip,
-												LIBNET_DONT_RESOLVE));
+		fprintf(stderr, "received unhandled ethernet type %d\n",
+				ntohs(enet->type));
 		break;
 	}
 
@@ -1133,7 +1179,7 @@ control_main(void *arg __attribute__((__unused__)))
 		if (FD_ISSET(sp[1], &set))
 			/* we assume everything pcap gives is is IP, because we assume that
 			 * the pcap thread handles everything else itself */
-			process_ip_packet();
+			process_packet();
 
 		timer_process_pending();
 	}
@@ -1191,46 +1237,7 @@ packet_main(u_char *user __attribute__((__unused__)),
 			const struct pcap_pkthdr *hdr, const u_char *pkt)
 {
 	const struct enet *enet = (const struct enet *)pkt;
-	if (ntohs(enet->type) == ETHERTYPE_IP) {
-		const struct ip_pkt *ip = (const struct ip_pkt *)pkt;
-		uint16_t csum;
-		int sum;
-		u_int16_t *ptr;
-
-		/* XXX should probably check ip->ihl vs. hdr->len. in fact should
-		 * probably check hdr->len before checking anything. */
-		if (ip->ihl < 5 || ip->ver != 4) {
-			fprintf(stderr, "bad IP packet, len = %d, ver = %d\n", ip->ihl,
-					ip->ver);
-			return;
-		}
-
-		ptr = malloc(ip->ihl << 2);
-		memcpy(ptr, (const u_int16_t *)ip + sizeof (struct enet) / 2,
-			   ip->ihl << 2);
-		ptr[5] = 0;
-
-		sum = libnet_in_cksum(ptr, ip->ihl << 2);
-		free(ptr);
-		csum = LIBNET_CKSUM_CARRY(sum);
-		if (csum != ip->hdr_csum) {
-			fprintf(stderr, "checksum mismatch in IP header (src %s)!\n",
-					libnet_addr2name4(ip->src_ip, LIBNET_DONT_RESOLVE));
-			return;
-		}
-
-		/* if it's not for us, we ignore it. that's probably a bad thing since
-		 * it means we ignore broadcast as well. but who the hell cares. if we
-		 * ever want to support broadcast then we'll also have to change
-		 * init_pcap so that it gives us broadcast packets. if we ever want to
-		 * be really evil and do horrible things to other people's connections
-		 * then we'll have to modify this and init_pcap. */
-		if (ip->dst_ip != src_ip)
-			return;
-
-		write(sp[0], hdr, sizeof (struct pcap_pkthdr));
-		write(sp[0], pkt, hdr->len);
-	} else if (ntohs(enet->type) == ETHERTYPE_ARP) {
+	if (ntohs(enet->type) == ETHERTYPE_ARP) {
 		/* since we're "faking" a client, we need to reply to arp
 		 * requests as that client. the problem is, we're using the MAC
 		 * address of the host, so if we get an arp from the host about
@@ -1243,6 +1250,11 @@ packet_main(u_char *user __attribute__((__unused__)),
 			(arp->dst_ip == src_ip) &&			/* for us */
 			memcmp(src_hw, arp->src_hw, 6))		/* not host */
 			arp_reply(arp->src_hw, arp->src_ip);
+	} else {
+		/* XXX should probably do some sort of sanity check before sending it
+		 * off. do you trust pcap? */
+		write(sp[0], hdr, sizeof (struct pcap_pkthdr));
+		write(sp[0], pkt, hdr->len);
 	}
 }
 
