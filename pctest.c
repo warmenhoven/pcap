@@ -861,10 +861,10 @@ process_input(void)
 			TCB *sess = l->data;
 			l = l->next;
 
-			printf("id %d: port %d with %s:%d\n",
+			printf("id %d: port %d with %s:%d state %s\n",
 				   sess->id, sess->src_prt,
 				   libnet_addr2name4(sess->dst_ip, LIBNET_DONT_RESOLVE),
-				   sess->dst_prt);
+				   sess->dst_prt, state_names[sess->state]);
 		}
 	} else if (!strcasecmp(buf, "quit")) {
 		/* XXX should send RST to all the sessions */
