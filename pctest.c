@@ -87,7 +87,7 @@ struct tcp_pkt {
 static char *dev;
 static pcap_t *lph;
 
-int init_pcap()
+static int init_pcap()
 {
 	char errbuf[PCAP_ERRBUF_SIZE];
 
@@ -105,7 +105,7 @@ int init_pcap()
 	return 0;
 }
 
-int init_filter(struct tcp_session *sess)
+static int init_filter(struct tcp_session *sess)
 {
 	char errbuf[PCAP_ERRBUF_SIZE];
 	bpf_u_int32 net;
@@ -132,7 +132,7 @@ int init_filter(struct tcp_session *sess)
 	return 0;
 }
 
-int send_tcp(struct tcp_session *sess, int flags)
+static int send_tcp(struct tcp_session *sess, int flags)
 {
 	char errbuf[LIBNET_ERRBUF_SIZE];
 	static libnet_t *lnh;
@@ -165,7 +165,7 @@ int send_tcp(struct tcp_session *sess, int flags)
 }
 
 /* XXX convince the host we're running on that it can safely ignore us */
-int arp_reply(struct tcp_session *sess, unsigned char hw[6], uint32_t ip)
+static int arp_reply(struct tcp_session *sess, unsigned char hw[6], uint32_t ip)
 {
 	char errbuf[PCAP_ERRBUF_SIZE];
 	libnet_t *lnh;
@@ -195,8 +195,133 @@ int arp_reply(struct tcp_session *sess, unsigned char hw[6], uint32_t ip)
 	return 0;
 }
 
+static void state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
+{
+	/* here we can assume that the pkt is part of the session and for us */
+
+	if (pkt->control & TH_RST) {
+		/* TODO: since we're only single-session right now, we just
+		 * exit when we receive a RST. if we ever handle multiple
+		 * sessions, we should handle this differently */
+		fprintf(stderr, "Remote host sent RST, exiting\n");
+		exit(1);
+	}
+
+	/* XXX none of these things check seqno/ackno. they should. */
+	/* XXX none of these things check to see that only the flags they're
+	 * expecting are set. if we're in FIN_WAIT_1 and we get SYN/FIN/ACK
+	 * then we'll just exit instead of send RST. this probably isn't a big
+	 * problem. */
+	switch (sess->state) {
+	case CLOSED:
+		/* we should never get here because we exit if we're closed */
+		break;
+	case LISTEN:
+		/* TODO: we don't deal with listening ports yet */
+		break;
+	case SYN_RCVD:
+		/* TODO: we don't deal with listening ports yet */
+		break;
+	case SYN_SENT:
+		if ((pkt->control & TH_SYN) && (pkt->control & TH_ACK)) {
+			sess->ackno = ntohl(pkt->seqno) + 1;
+			send_tcp(sess, TH_ACK);
+			sess->state = ESTABLISHED;
+		} else {
+			/* we didn't get SYN_ACK, or RST... so we RST! */
+			send_tcp(sess, TH_RST);
+			fprintf(stderr, "RST'ing (State = SYN_SENT, "
+				"Control = %02x)\n", pkt->control);
+			exit(1);
+		}
+		break;
+	case ESTABLISHED:
+		if (pkt->control & TH_FIN) {
+			/* the other side wants to shut down the connection */
+			sess->ackno = ntohl(pkt->seqno) + 1;
+			/* we send both the FIN and the ACK together, and move
+			 * right through CLOSE_WAIT to LAST_ACK */
+			send_tcp(sess, TH_FIN | TH_ACK);
+			/* we should move to LAST_ACK in case the other side
+			 * sends this packet again, but since we don't do
+			 * timers and we don't feel like waiting around until
+			 * the user kills us, we just exit. */
+			/* sess->state = LAST_ACK; */
+			exit(0);
+		}
+		/* XXX there are more cases of things to do here */
+		break;
+	case FIN_WAIT_1:
+		/* we sent the initial FIN */
+		if ((pkt->control & TH_ACK) && (pkt->control & TH_FIN)) {
+			sess->ackno = ntohl(pkt->seqno) + 1;
+			send_tcp(sess, TH_ACK);
+			/* just like LAST_ACK, we should move to TIME_WAIT, but
+			 * we just assume everything went well */
+			/* sess->state = TIME_WAIT; */
+			exit(0);
+		}
+
+		if (pkt->control & TH_FIN) {
+			/* ACK the FIN, wait for our ACK */
+			sess->ackno = ntohl(pkt->seqno) + 1;
+			send_tcp(sess, TH_ACK);
+			/* just like LAST_ACK, we should move to CLOSING, but
+			 * we just assume everything went well */
+			/* sess->state = CLOSING; */
+			exit(0);
+		}
+
+		if (pkt->control & TH_ACK) {
+			/* we've got the ACK, now we're waiting for the FIN */
+			sess->state = FIN_WAIT_2;
+		}
+
+		/* we didn't get ACK or FIN, so we RST */
+		send_tcp(sess, TH_RST);
+		fprintf(stderr, "RST'ing (State = SYN_SENT, Control = %02x)\n",
+			pkt->control);
+		exit(1);
+
+		break;
+	case FIN_WAIT_2:
+		if (pkt->control & TH_FIN) {
+			/* we've got the FIN, send the ACK and we're done */
+			sess->ackno = ntohl(pkt->seqno) + 1;
+			send_tcp(sess, TH_ACK);
+			/* just like LAST_ACK, we should move to TIME_WAIT, but
+			 * we just assume everything went well */
+			/* sess->state = TIME_WAIT */
+			exit(0);
+		}
+
+		/* we're waiting for FIN but didn't get it, so RST */
+		send_tcp(sess, TH_RST);
+		fprintf(stderr, "RST'ing (State = SYN_SENT, Control = %02x)\n",
+			pkt->control);
+		exit(1);
+
+		break;
+	case CLOSING:
+		/* we never get here because we just assume everything went
+		 * fine, and we exit before waiting for our ACK */
+		break;
+	case TIME_WAIT:
+		/* we never get here because we just assume everything went
+		 * fine, and we exit before waiting for our ACK */
+		break;
+	case CLOSE_WAIT:
+		/* we never get here because we send the FIN with the ACK */
+		break;
+	case LAST_ACK:
+		/* we never get here because we just assume everything went
+		 * fine, and we exit before waiting for our ACK */
+		break;
+	}
+}
+
 /* main cb function. this needs to get rewritten. desperately. */
-void packet_cb(u_char *user, const struct pcap_pkthdr *hdr, const u_char *pkt)
+static void packet_cb(u_char *user, const struct pcap_pkthdr *hdr, const u_char *pkt)
 {
 	struct tcp_session *sess = (struct tcp_session *)user;
 	struct enet *enet = (struct enet *)pkt;
@@ -226,13 +351,7 @@ void packet_cb(u_char *user, const struct pcap_pkthdr *hdr, const u_char *pkt)
 			return;
 
 		/* this is where the real work begins */
-		/* XXX XXX this is just temporary! this needs to be fixed! */
-		if ((sess->state == SYN_SENT) &&
-		    (tcp->control & TH_SYN) && (tcp->control & TH_ACK)) {
-			sess->ackno = ntohl(tcp->seqno) + 1;
-			send_tcp(sess, TH_ACK);
-			sess->state = ESTABLISHED;
-		}
+		state_machine(sess, tcp);
 	} else if (ntohs(enet->type) == ETHERTYPE_ARP) {
 		/* since we're "faking" a client, we need to reply to arp
 		 * requests as that client. the problem is, we're using the MAC
