@@ -761,7 +761,7 @@ control_main(void *arg)
 
 /* TODO: convince the host we're running on that it can safely ignore us */
 static int
-arp_reply(const unsigned char hw[6], uint32_t ip)
+arp_reply(unsigned char hw[6], uint32_t ip)
 {
 	/* we probably could make this handle static so that we don't have to
 	 * rebuild it too many times, but hopefully we should only need to
@@ -806,9 +806,9 @@ packet_main(u_char *user, const struct pcap_pkthdr *hdr, const u_char *pkt)
 	 * here and some of them should be in process_packet and some should be
 	 * in state_machine. (and some of them should be in the host and in
 	 * pcap, so this might not be necessary.)*/
-	const struct enet *enet = (const struct enet *)pkt;
+	struct enet *enet = (struct enet *)pkt;
 	if (ntohs(enet->type) == ETHERTYPE_IP) {
-		const struct ip_pkt *ip = (const struct ip_pkt *)pkt;
+		struct ip_pkt *ip = (struct ip_pkt *)pkt;
 
 		/* if it's not for us, we ignore it */
 		if (ip->dst_ip != src_ip)
@@ -822,7 +822,7 @@ packet_main(u_char *user, const struct pcap_pkthdr *hdr, const u_char *pkt)
 		 * address of the host, so if we get an arp from the host about
 		 * our client, we need to just ignore it. the host should deal
 		 * with this gracefully. (there has to be a better way.) */
-		const struct arp *arp = (const struct arp *)pkt;
+		struct arp *arp = (struct arp *)pkt;
 		if ((ntohs(arp->hrd) == ARPHRD_ETHER) &&	/* ethernet*/
 		    (ntohs(arp->pro) == ETHERTYPE_IP) &&	/* ipv4 */
 		    (ntohs(arp->op) == ARPOP_REQUEST) &&	/* request */
