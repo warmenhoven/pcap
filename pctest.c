@@ -748,7 +748,7 @@ process_packet(void)
 	printf("\nPACKET:\n");
 	for (i = 0; i < hdr.len; i++) {
 		printf("%02x ", pkt[i]);
-		if (i && (i + 1) % 16 == 0)
+		if ((i + 1) % 16 == 0)
 			printf("\n");
 	}
 	printf("\n\n");
