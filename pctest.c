@@ -20,7 +20,6 @@
  *     of the 5 points here)
  */
 
-#include <ansidecl.h>
 #include <libnet.h>
 #include <pcap.h>
 #include <pthread.h>
@@ -145,7 +144,7 @@ struct enet {
 	unsigned char dst_hw[6];
 	unsigned char src_hw[6];
 	uint16_t type;
-} __attribute__((packed));
+} __attribute__((__packed__));
 
 struct arp {
 	struct enet enet;
@@ -159,7 +158,7 @@ struct arp {
 	uint32_t src_ip;
 	unsigned char dst_hw[6];
 	uint32_t dst_ip;
-} __attribute__((packed));
+} __attribute__((__packed__));
 
 struct ip_pkt {
 	struct enet enet;
@@ -185,7 +184,7 @@ struct ip_pkt {
 	uint16_t hdr_csum;
 	uint32_t src_ip;
 	uint32_t dst_ip;
-} __attribute__((packed));
+} __attribute__((__packed__));
 
 struct icmp_pkt {
 	struct ip_pkt ip;	/* XXX this is wrong. I'll fix it once I start
@@ -196,7 +195,7 @@ struct icmp_pkt {
 	uint16_t csum;
 	uint16_t id;		/* XXX this is partly wrong, see netinet/ip_icmp.h */
 	uint16_t seq;
-} __attribute__((packed));
+} __attribute__((__packed__));
 
 struct tcp_pkt {
 	struct ip_pkt ip;	/* XXX this is wrong. I'll fix it once I start
@@ -220,7 +219,7 @@ struct tcp_pkt {
 	uint16_t window;
 	uint16_t csum;
 	uint16_t urg;
-} __attribute__((packed));
+} __attribute__((__packed__));
 
 /* these are our global variables */
 static unsigned char src_hw[6];
@@ -241,7 +240,6 @@ init_pcap(void)
 	bpf_u_int32 mask;
 	char *filter_line;
 	struct bpf_program filter;
-	struct in_addr sa;
 
 	if (!(dev = pcap_lookupdev(errbuf))) {
 		fprintf(stderr, "%s\n", errbuf);
@@ -259,12 +257,10 @@ init_pcap(void)
 	}
 
 	filter_line = malloc(4 + 5 + (4*4));
-	/* libnet_name2addr4 puts src_ip in network byte order, so we don't
-	 * need to do any of that here */
-	sa.s_addr = src_ip;
 	/* this filter line should give us everything we need (including arp
 	 * requests) */
-	sprintf(filter_line, "dst host %s", inet_ntoa(sa));
+	sprintf(filter_line, "dst host %s",
+			libnet_addr2name4(src_ip, LIBNET_DONT_RESOLVE));
 	pcap_compile(lph, &filter, filter_line, 0, net);
 	free(filter_line);
 
@@ -1039,8 +1035,8 @@ process_input(void)
 }
 
 /* this function needs to get rewritten. desperately. */
-static void * ATTRIBUTE_NORETURN
-control_main(void *arg ATTRIBUTE_UNUSED)
+static void * __attribute__((__noreturn__))
+control_main(void *arg __attribute__((__unused__)))
 {
 	fd_set set;
 
@@ -1107,7 +1103,7 @@ arp_reply(unsigned char hw[6], uint32_t ip)
  * anything that needs an understanding of state needs to be passed to the
  * control thread. */
 static void
-packet_main(u_char *user ATTRIBUTE_UNUSED,
+packet_main(u_char *user __attribute__((__unused__)),
 			const struct pcap_pkthdr *hdr, const u_char *pkt)
 {
 	struct enet *enet = (struct enet *)pkt;
