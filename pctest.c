@@ -199,6 +199,8 @@ static void state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 {
 	/* here we can assume that the pkt is part of the session and for us */
 
+	/* XXX none of these things check seqno/ackno. they should. */
+
 	if (pkt->control & TH_RST) {
 		/* TODO: since we're only single-session right now, we just
 		 * exit when we receive a RST. if we ever handle multiple
@@ -207,11 +209,10 @@ static void state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 		exit(1);
 	}
 
-	/* XXX none of these things check seqno/ackno. they should. */
 	/* XXX none of these things check to see that only the flags they're
 	 * expecting are set. if we're in FIN_WAIT_1 and we get SYN/FIN/ACK
-	 * then we'll just exit instead of send RST. this probably isn't a big
-	 * problem. */
+	 * then we'll just exit instead of sending RST. this probably isn't a
+	 * big problem. */
 	switch (sess->state) {
 	case CLOSED:
 		/* we should never get here because we exit if we're closed */
