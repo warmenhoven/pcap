@@ -732,7 +732,7 @@ process_packet(void)
 	/* XXX this section needs to be fixed, it assumes too much */
 	if (read(sp[1], &hdr, sizeof (hdr)) != sizeof (hdr))
 		return;
-	pkt = malloc(hdr.len + (hdr.len % 1));
+	pkt = malloc(hdr.len);
 	if ((len = read(sp[1], pkt, hdr.len)) < 0) {
 		free(pkt);
 		return;
@@ -741,8 +741,6 @@ process_packet(void)
 		free(pkt);
 		return;
 	}
-	if (hdr.len % 1)
-		pkt[hdr.len] = 0;
 
 #if 0
 	printf("\nPACKET:\n");
