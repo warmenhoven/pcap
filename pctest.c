@@ -43,15 +43,23 @@ struct tcp_session {
 
 	enum tcp_state state;
 
+	/* quite honestly each session doesn't need its own socket but it does
+	 * make things simpler (especially since the session's lock then locks
+	 * the socket, so it doesn't need its own lock) */
 	libnet_t *lnh;
 	libnet_ptag_t tcp_id;
 	libnet_ptag_t ip_id;
 
+	/* these describe the session. the src_ip is global. libnet_name2addr4
+	 * puts ip addresses in network byte order, so those will always be
+	 * that way. however, ports stored in the session will always be host
+	 * byte order, so when comparing against what comes off the wire, make
+	 * sure to do a proper translation */
 	uint16_t src_prt;
-
 	uint32_t dst_ip;
 	uint16_t dst_prt;
 
+	/* these are stored in host byte order mostly by default */
 	uint32_t seqno;
 	uint32_t ackno;
 
@@ -59,13 +67,14 @@ struct tcp_session {
 	 * attention to */
 };
 
-/* these are global */
+/* these are our global variables */
 /* we only emulate one ip address at a time */
 unsigned char src_hw[6];
 uint32_t src_ip;
 /* snslck should be held for as short as possible because every incoming tcp
  * packet needs to be checked against the sessions list. this really should be
- * a read-write lock. */
+ * a read-write lock, since you only change sessions when you add or remove a
+ * connection, but you look up sessions on every packet bound for the host. */
 pthread_mutex_t snslck;
 list *sessions;
 uint32_t next_id = 0;
@@ -141,8 +150,7 @@ init_pcap()
 		return NULL;
 	}
 
-	lph = pcap_open_live(dev, BUFSIZ, 0, 0, errbuf);
-	if (!lph) {
+	if (!(lph = pcap_open_live(dev, BUFSIZ, 0, 0, errbuf))) {
 		fprintf(stderr, "%s\n", errbuf);
 		return NULL;
 	}
@@ -153,11 +161,12 @@ init_pcap()
 	}
 
 	filter_line = malloc(4 + 3 + 5 + (4*4));
+	/* libnet_name2addr4 puts src_ip in network byte order, so we don't
+	 * need to do any of that here */
 	sa.s_addr = src_ip;
 	/* we need arp because we're faking a client. otherwise we only need
 	 * the packets for the host we're faking. */
 	sprintf(filter_line, "arp or host %s", inet_ntoa(sa));
-	printf("filter line: %s\n", filter_line);
 	pcap_compile(lph, &filter, filter_line, 0, net);
 	free(filter_line);
 
@@ -229,7 +238,7 @@ send_rst(uint32_t dst_ip, uint16_t dst_prt, uint32_t src_prt,
 	return 1;
 }
 
-/* XXX convince the host we're running on that it can safely ignore us */
+/* TODO: convince the host we're running on that it can safely ignore us */
 static int
 arp_reply(unsigned char hw[6], uint32_t ip)
 {
@@ -324,6 +333,9 @@ create_session(char *host, uint16_t port)
 		return NULL;
 	}
 
+	/* XXX we should have some check to see if sess->dst_ip == src_ip, so
+	 * that we can detect when we're trying to send packets to ourselves,
+	 * because we won't be able to put those packets out over the wire */
 	sess->dst_ip = libnet_name2addr4(sess->lnh, host,
 					 LIBNET_RESOLVE);
 	if (sess->dst_ip == -1) {
@@ -517,9 +529,10 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 	return 1;
 }
 
-/* main cb function. this needs to get rewritten. desperately. */
+/* 'main' is a misnomer since it's not really a "main" function, it's a
+ * callback. pcap sucks. this function needs to get rewritten. desperately. */
 static void
-packet_cb(u_char *user, const struct pcap_pkthdr *hdr, const u_char *pkt)
+packet_main(u_char *user, const struct pcap_pkthdr *hdr, const u_char *pkt)
 {
 	struct enet *enet = (struct enet *)pkt;
 	if (ntohs(enet->type) == ETHERTYPE_IP) {
@@ -527,13 +540,16 @@ packet_cb(u_char *user, const struct pcap_pkthdr *hdr, const u_char *pkt)
 		struct tcp_pkt *tcp = (struct tcp_pkt *)pkt;
 		struct tcp_session *sess;
 
+		/* if it's not for us, we ignore it */
+		if (ip->dst_ip != src_ip)
+			return;
+
 		/* XXX we only deal with TCP; we should handle ICMP too */
 		if (ip->protocol != IPPROTO_TCP)
 			return;
 
-		/* if it's not for us, we ignore it */
-		if (ip->dst_ip != src_ip)
-			return;
+		/* XXX there are more IP options that we need to deal with.
+		 * until then this program isn't a stack, it's a hack. */
 
 		if (!(sess = find_session(ip->src_ip, ntohs(tcp->src_prt),
 					  ntohs(tcp->dst_prt), 1))) {
@@ -543,7 +559,8 @@ packet_cb(u_char *user, const struct pcap_pkthdr *hdr, const u_char *pkt)
 			return;
 		}
 
-		/* find_session locks sess for us, to avoid race conditions */
+		/* find_session locks sess for us, to avoid race conditions
+		 * (which don't exist yet, but might, once we do timers) */
 
 		/* this is where the real work is. we don't have to unlock it
 		 * if there's a problem, it'll do that for us. */
@@ -624,8 +641,7 @@ timer_main(void *arg)
 	 * the two threads can always understand exactly what the state of the
 	 * session is. a better idea might be to also have a session thread,
 	 * waiting on a condition, that either the pcap or the timer thread can
-	 * then wake up. ("now there are two of them! this is getting out of
-	 * hand.") */
+	 * then wake up. */
 	while (1) {
 		/* XXX for now we don't do timers */
 		sleep(0xffffffff);
@@ -691,7 +707,7 @@ main(int argc, char **argv)
 	pthread_create(&thread, NULL, timer_main, NULL);
 	pthread_create(&thread, NULL, control_main, NULL);
 
-	pcap_loop(lph, -1, packet_cb, NULL);
+	pcap_loop(lph, -1, packet_main, NULL);
 
 	/* I don't think we'll ever get here, unless things go very wrong */
 	return 1;
