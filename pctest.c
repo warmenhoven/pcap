@@ -1142,28 +1142,31 @@ control_main(void *arg __attribute__((__unused__)))
 /* PCAP { */
 /* TODO: convince the host we're running on that it can safely ignore us */
 static int
-arp_reply(unsigned char hw[6], uint32_t ip)
+arp_reply(const unsigned char hw[6], uint32_t ip)
 {
 	/* we probably could make this handle static so that we don't have to
 	 * rebuild it too many times, but hopefully we should only need to
 	 * build it once. */
 	char errbuf[LIBNET_ERRBUF_SIZE];
 	libnet_t *lnh;
+	unsigned char hwa[6];
 
 	if (!(lnh = libnet_init(LIBNET_LINK, NULL, errbuf))) {
 		fprintf(stderr, "%s\n", errbuf);
 		return 0;
 	}
 
+	memcpy(hwa, hw, 6);
+
 	if (libnet_build_arp(ARPHRD_ETHER, ETHERTYPE_IP, 6, 4, ARPOP_REPLY,
-						 src_hw, (u_char *)&src_ip, hw, (u_char *)&ip,
+						 src_hw, (u_char *)&src_ip, hwa, (u_char *)&ip,
 						 NULL, 0, lnh, 0) == -1) {
 		fprintf(stderr, "%s", libnet_geterror(lnh));
 		libnet_destroy(lnh);
 		return 0;
 	}
 
-	if (libnet_autobuild_ethernet(hw, ETHERTYPE_ARP, lnh) == -1) {
+	if (libnet_autobuild_ethernet(hwa, ETHERTYPE_ARP, lnh) == -1) {
 		fprintf(stderr, "%s", libnet_geterror(lnh));
 		libnet_destroy(lnh);
 		return 0;
@@ -1187,11 +1190,12 @@ static void
 packet_main(u_char *user __attribute__((__unused__)),
 			const struct pcap_pkthdr *hdr, const u_char *pkt)
 {
-	struct enet *enet = (struct enet *)pkt;
+	const struct enet *enet = (const struct enet *)pkt;
 	if (ntohs(enet->type) == ETHERTYPE_IP) {
-		struct ip_pkt *ip = (struct ip_pkt *)pkt;
+		const struct ip_pkt *ip = (const struct ip_pkt *)pkt;
 		uint16_t csum;
 		int sum;
+		u_int16_t *ptr;
 
 		/* XXX should probably check ip->ihl vs. hdr->len. in fact should
 		 * probably check hdr->len before checking anything. */
@@ -1201,11 +1205,14 @@ packet_main(u_char *user __attribute__((__unused__)),
 			return;
 		}
 
-		csum = ip->hdr_csum;
-		ip->hdr_csum = 0;
-		sum = libnet_in_cksum((u_int16_t *)ip + sizeof (struct enet) / 2,
-							  ip->ihl << 2);
-		ip->hdr_csum = LIBNET_CKSUM_CARRY(sum);
+		ptr = malloc(ip->ihl << 2);
+		memcpy(ptr, (const u_int16_t *)ip + sizeof (struct enet) / 2,
+			   ip->ihl << 2);
+		ptr[5] = 0;
+
+		sum = libnet_in_cksum(ptr, ip->ihl << 2);
+		free(ptr);
+		csum = LIBNET_CKSUM_CARRY(sum);
 		if (csum != ip->hdr_csum) {
 			fprintf(stderr, "checksum mismatch in IP header (src %s)!\n",
 					libnet_addr2name4(ip->src_ip, LIBNET_DONT_RESOLVE));
@@ -1229,7 +1236,7 @@ packet_main(u_char *user __attribute__((__unused__)),
 		 * address of the host, so if we get an arp from the host about
 		 * our client, we need to just ignore it. the host should deal
 		 * with this gracefully. (there has to be a better way.) */
-		struct arp *arp = (struct arp *)pkt;
+		const struct arp *arp = (const struct arp *)pkt;
 		if ((ntohs(arp->hrd) == ARPHRD_ETHER) &&	/* ethernet*/
 			(ntohs(arp->pro) == ETHERTYPE_IP) &&	/* ipv4 */
 			(ntohs(arp->op) == ARPOP_REQUEST) &&	/* request */
