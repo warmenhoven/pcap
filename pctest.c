@@ -270,12 +270,15 @@ get_port(uint32_t dst_ip, uint16_t dst_prt)
 	uint16_t src_prt;
 
 	do {
+		/* privileged ports, my ass */
 		src_prt = libnet_get_prand(LIBNET_PRu16);
 	} while (find_session(dst_ip, dst_prt, src_prt));
 
 	return src_prt;
 }
 
+/* maybe eventually there will be a third argument, so you can specify the port
+ * to connect from */
 static struct tcp_session *
 create_session(char *host, uint16_t port)
 {
@@ -293,8 +296,7 @@ create_session(char *host, uint16_t port)
 	/* XXX we should have some check to see if sess->dst_ip == src_ip, so
 	 * that we can detect when we're trying to send packets to ourselves,
 	 * because we won't be able to put those packets out over the wire */
-	sess->dst_ip = libnet_name2addr4(sess->lnh, host,
-					 LIBNET_RESOLVE);
+	sess->dst_ip = libnet_name2addr4(sess->lnh, host, LIBNET_RESOLVE);
 	if (sess->dst_ip == -1) {
 		fprintf(stderr, "%s\n", libnet_geterror(sess->lnh));
 		free(sess);
@@ -321,7 +323,7 @@ create_session(char *host, uint16_t port)
 	return sess;
 }
 
-/* after this function, sess is no longer valid */
+/* after this function, sess is no longer valid (obviously) */
 static void
 remove_session(struct tcp_session *sess)
 {
@@ -330,10 +332,6 @@ remove_session(struct tcp_session *sess)
 	free(sess);
 }
 
-/* this may well become 'main' for a "session" thread, that waits on a
- * condition triggered by either the pcap thread or the timer thread, instead
- * of trying to get the pcap and timer threads to play well together with the
- * session */
 static int
 state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 {
