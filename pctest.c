@@ -31,8 +31,6 @@
 #include <pcap.h>
 #include <pthread.h>
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 
 enum tcp_state {
 	CLOSED,
