@@ -5,10 +5,11 @@
  *
  * I'm sure there's more but those are all I knew off the top of my head
  *
- * right now in the TCP bake off I get 13 points:
+ * right now in the TCP bake off I get 17 points:
  *
- * 0 from the Featherweight Division since I can't talk to myself yet (no
- *   listening sockets)
+ * 1 points for talking to myself
+ * 1 points for gracefully ending the conversation
+ * 2 points for repeating the abov without reinitializing
  *
  * 2 points for talking to someone else
  * 2 point for gracefully ending the conversaion
@@ -17,8 +18,9 @@
  * 5 points for being able to talk to more than one other TCP at the same time
  *   (since I can't actually "talk" to them yet, I'm only giving myself 5
  *   points, for being able to be connected to more than one at a time. once
- *   I'm able to exchange data then I'll get 2 more points in the Middleweight
- *   Division and the remainder of the 5 points here)
+ *   I'm able to exchange data then I'll get 1 more point in the Lightweight
+ *   Division, 2 more points in the Middleweight Division, and the remainder of
+ *   the 5 points here)
  *
  * but then, I haven't done any checksum tests, so unless the host itself
  * rejects faulty packets before they're given to pcap, I'm actually at 0
@@ -178,13 +180,13 @@ init_pcap()
 		return NULL;
 	}
 
-	filter_line = malloc(5 + (4*4));
+	filter_line = malloc(4 + 5 + (4*4));
 	/* libnet_name2addr4 puts src_ip in network byte order, so we don't
 	 * need to do any of that here */
 	sa.s_addr = src_ip;
 	/* this filter line should give us everything we need (including arp
 	 * requests) */
-	sprintf(filter_line, "host %s", inet_ntoa(sa));
+	sprintf(filter_line, "dst host %s", inet_ntoa(sa));
 	pcap_compile(lph, &filter, filter_line, 0, net);
 	free(filter_line);
 
@@ -263,11 +265,19 @@ find_session(uint32_t dst_ip, uint32_t dst_prt, uint32_t src_prt)
 
 	while (l) {
 		struct tcp_session *sess = l->data;
-		if (sess->dst_ip == dst_ip &&
-		    sess->dst_prt == dst_prt &&
-		    sess->src_prt == src_prt)
-			return sess;
 		l = l->next;
+
+		if (sess->src_prt != src_prt)
+			continue;
+
+		/* XXX we should be able to support listening for specific
+		 * hosts (or specific ports) */
+		if (sess->state == LISTEN && !sess->dst_ip && !sess->dst_prt)
+			return sess;
+
+		if (sess->state != LISTEN &&
+		    sess->dst_ip == dst_ip && sess->dst_prt == dst_prt)
+			return sess;
 	}
 
 	return NULL;
@@ -287,10 +297,8 @@ get_port(uint32_t dst_ip, uint16_t dst_prt)
 	return src_prt;
 }
 
-/* maybe eventually there will be a third argument, so you can specify the port
- * to connect from */
 static struct tcp_session *
-create_session(char *host, uint16_t port)
+session_setup()
 {
 	struct tcp_session *sess = calloc(1, sizeof (struct tcp_session));
 	char errbuf[LIBNET_ERRBUF_SIZE];
@@ -303,32 +311,81 @@ create_session(char *host, uint16_t port)
 		return NULL;
 	}
 
-	/* XXX we should have some check to see if sess->dst_ip == src_ip, so
-	 * that we can detect when we're trying to send packets to ourselves,
-	 * because we won't be able to put those packets out over the wire */
-	sess->dst_ip = libnet_name2addr4(sess->lnh, host, LIBNET_RESOLVE);
-	if (sess->dst_ip == -1) {
-		fprintf(stderr, "%s\n", libnet_geterror(sess->lnh));
-		free(sess);
-		return NULL;
-	}
-	sess->dst_prt = port;
-	sess->src_prt = get_port(sess->dst_ip, sess->dst_prt);
-
 	/* I hear I shouldn't use this function for anything real. oh well. */
 	sess->seqno = libnet_get_prand(LIBNET_PRu32);
 
-	/* send the SYN, and we're off! */
-	send_tcp(sess, TH_SYN);
-	sess->seqno++;
-	sess->state = SYN_SENT;
-	printf("SYN_SENT\n");
-
-	sessions = list_append(sessions, sess);
+	sessions = list_prepend(sessions, sess);
 	/* this is technically wrong but I doubt next_id will ever wrap (unless
 	 * if you're doing mean things to this poor little program) */
-	sess->id = next_id;
-	printf("created session %d using port %d\n", next_id++, sess->src_prt);
+	sess->id = next_id++;
+	printf("creating socket %d\n", sess->id);
+
+	return sess;
+}
+
+/* maybe eventually there will be a third argument, so you can specify the port
+ * to connect from */
+static struct tcp_session *
+create_session(char *host, uint16_t port)
+{
+	struct tcp_session *sess = session_setup();
+
+	if (!sess)
+		return NULL;
+
+	if (host) {
+		/* XXX we should have some check to see if sess->dst_ip ==
+		 * src_ip, so that we can detect when we're trying to send
+		 * packets to ourselves, because we won't be able to put those
+		 * packets out over the wire */
+		sess->dst_ip = libnet_name2addr4(sess->lnh, host,
+						 LIBNET_RESOLVE);
+		if (sess->dst_ip == -1) {
+			fprintf(stderr, "%s\n", libnet_geterror(sess->lnh));
+			free(sess);
+			return NULL;
+		}
+		sess->dst_prt = port;
+		sess->src_prt = get_port(sess->dst_ip, sess->dst_prt);
+	} else {
+		/* listening socket */
+		sess->dst_ip = 0;
+		sess->dst_prt = 0;
+		sess->src_prt = port;
+	}
+
+	if (host) {
+		/* send the SYN, and we're off! */
+		send_tcp(sess, TH_SYN);
+		sess->seqno++;
+		sess->state = SYN_SENT;
+		printf("SYN_SENT\n");
+	} else {
+		sess->state = LISTEN;
+		printf("LISTEN\n");
+	}
+
+	return sess;
+}
+
+static struct tcp_session *
+accept_session(struct tcp_session *listener, struct tcp_pkt *pkt)
+{
+	struct tcp_session *sess = session_setup();
+
+	if (!sess)
+		return NULL;
+
+	sess->dst_ip = pkt->ip.src_ip;
+	sess->dst_prt = ntohs(pkt->src_prt);
+	sess->src_prt = listener->src_prt;
+
+	sess->ackno = ntohl(pkt->seqno) + 1;
+
+	send_tcp(sess, TH_SYN | TH_ACK);
+	sess->seqno++;
+	sess->state = SYN_RCVD;
+	printf("SYN_RCVD\n");
 
 	return sess;
 }
@@ -342,17 +399,17 @@ remove_session(struct tcp_session *sess)
 	free(sess);
 }
 
-static int
+static void
 state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 {
 	/* here we can assume that the pkt is part of the session and for us */
 
 	/* XXX none of these things check seqno/ackno. they should. */
 
-	if (pkt->control & TH_RST) {
+	if ((sess->state != LISTEN) && (pkt->control & TH_RST)) {
 		fprintf(stderr, "Remote host sent RST\n");
 		remove_session(sess);
-		return 0;
+		return;
 	}
 
 	/* XXX none of these things check to see that only the flags they're
@@ -365,10 +422,28 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 		 * if it's closed */
 		break;
 	case LISTEN:
-		/* TODO: we don't deal with listening ports yet */
+		if (pkt->control & TH_SYN) {
+			accept_session(sess, pkt);
+		} else {
+			send_rst(pkt->ip.src_ip, ntohs(pkt->src_prt),
+				 ntohs(pkt->dst_prt), ntohl(pkt->ackno),
+				 ntohl(pkt->seqno) + 1);
+			fprintf(stderr, "RST'ing (State = LISTEN, "
+				"Control = %02x)\n", pkt->control);
+		}
 		break;
 	case SYN_RCVD:
-		/* TODO: we don't deal with listening ports yet */
+		if (pkt->control & TH_ACK) {
+			sess->ackno = ntohl(pkt->seqno) + 1;
+			sess->state = ESTABLISHED;
+			printf("ESTABLISHED\n");
+		} else {
+			send_rst(pkt->ip.src_ip, ntohs(pkt->src_prt),
+				 ntohs(pkt->dst_prt), ntohl(pkt->ackno),
+				 ntohl(pkt->seqno) + 1);
+			fprintf(stderr, "RST'ing (State = SYN_RCVD, "
+				"Control = %02x)\n", pkt->control);
+		}
 		break;
 	case SYN_SENT:
 		if ((pkt->control & TH_SYN) && (pkt->control & TH_ACK)) {
@@ -380,11 +455,12 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 			/* XXX actually if we get SYN but no ACK we're supposed
 			 * to send an ACK, go to SYN_RCVD, and wait for the ACK
 			 * to our SYN. but I don't care about that. */
-			send_tcp(sess, TH_RST);
+			send_rst(pkt->ip.src_ip, ntohs(pkt->src_prt),
+				 ntohs(pkt->dst_prt), ntohl(pkt->ackno),
+				 ntohl(pkt->seqno) + 1);
 			fprintf(stderr, "RST'ing (State = SYN_SENT, "
 				"Control = %02x)\n", pkt->control);
 			remove_session(sess);
-			return 0;
 		}
 		break;
 	case ESTABLISHED:
@@ -394,15 +470,9 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 			/* we send both the FIN and the ACK together, and move
 			 * right through CLOSE_WAIT to LAST_ACK */
 			send_tcp(sess, TH_FIN | TH_ACK);
-			/* we should move to LAST_ACK, and either wait for the
-			 * ACK back or retry this packet after a timeout. but
-			 * since we don't do timers and we don't feel like
-			 * waiting around until the user kills us, we just
-			 * assume we will get our ACK back fine. */
-			/* sess->state = LAST_ACK; */
+			sess->seqno++;
+			sess->state = LAST_ACK;
 			printf("LAST_ACK\n");
-			remove_session(sess);
-			return 0;
 		}
 		/* XXX there are more cases of things to do here */
 		break;
@@ -411,24 +481,25 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 		if ((pkt->control & TH_ACK) && (pkt->control & TH_FIN)) {
 			sess->ackno = ntohl(pkt->seqno) + 1;
 			send_tcp(sess, TH_ACK);
-			/* just like LAST_ACK, we should move to TIME_WAIT, but
-			 * we just assume everything went well */
+			/* we should move to TIME_WAIT in case if the other
+			 * side doesn't receive our ACK, but we just assume
+			 * everything went well */
 			/* sess->state = TIME_WAIT; */
 			printf("TIME_WAIT\n");
 			remove_session(sess);
-			return 0;
+			break;
 		}
 
 		if (pkt->control & TH_FIN) {
 			/* ACK the FIN, wait for our ACK */
 			sess->ackno = ntohl(pkt->seqno) + 1;
 			send_tcp(sess, TH_ACK);
-			/* just like LAST_ACK, we should move to CLOSING, but
+			/* just like TIME_WAIT, we should move to CLOSING, but
 			 * we just assume everything went well */
 			/* sess->state = CLOSING; */
 			printf("CLOSING\n");
 			remove_session(sess);
-			return 0;
+			break;
 		}
 
 		if (pkt->control & TH_ACK) {
@@ -439,30 +510,34 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 		}
 
 		/* we didn't get ACK or FIN, so we RST */
-		send_tcp(sess, TH_RST);
+		send_rst(pkt->ip.src_ip, ntohs(pkt->src_prt),
+			 ntohs(pkt->dst_prt), ntohl(pkt->ackno),
+			 ntohl(pkt->seqno) + 1);
 		fprintf(stderr, "RST'ing (State = FIN_WAIT_1, "
 			"Control = %02x)\n", pkt->control);
 		remove_session(sess);
-		return 0;
+		break;
 	case FIN_WAIT_2:
 		if (pkt->control & TH_FIN) {
 			/* we've got the FIN, send the ACK and we're done */
 			sess->ackno = ntohl(pkt->seqno) + 1;
 			send_tcp(sess, TH_ACK);
-			/* just like LAST_ACK, we should move to TIME_WAIT, but
+			/* just like above, we should move to TIME_WAIT, but
 			 * we just assume everything went well */
 			/* sess->state = TIME_WAIT */
 			printf("TIME_WAIT \n");
 			remove_session(sess);
-			return 0;
+			break;
 		}
 
 		/* we're waiting for FIN but didn't get it, so RST */
-		send_tcp(sess, TH_RST);
+		send_rst(pkt->ip.src_ip, ntohs(pkt->src_prt),
+			 ntohs(pkt->dst_prt), ntohl(pkt->ackno),
+			 ntohl(pkt->seqno) + 1);
 		fprintf(stderr, "RST'ing (State = FIN_WAIT_2, "
 			"Control = %02x)\n", pkt->control);
 		remove_session(sess);
-		return 0;
+		break;
 	case CLOSING:
 		/* we never get here because we just assume everything went
 		 * fine, and remove the sess before waiting for our ACK */
@@ -475,12 +550,19 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 		/* we never get here because we send the FIN with the ACK */
 		break;
 	case LAST_ACK:
-		/* we never get here because we just assume everything went
-		 * fine, and remove the sess before waiting for our ACK */
+		if (pkt->control & TH_ACK) {
+			/* now we can remove the session */
+			printf("CLOSED\n");
+			remove_session(sess);
+		} else {
+			send_rst(pkt->ip.src_ip, ntohs(pkt->src_prt),
+				 ntohs(pkt->dst_prt), ntohl(pkt->ackno),
+				 ntohl(pkt->seqno) + 1);
+			fprintf(stderr, "RST'ing (State = LAST_ACK, "
+				"Control = %02x)\n", pkt->control);
+		}
 		break;
 	}
-
-	return 1;
 }
 
 static void
@@ -522,6 +604,7 @@ process_packet()
 		send_rst(ip->src_ip, ntohs(tcp->src_prt),
 			 ntohs(tcp->dst_prt), ntohl(tcp->ackno),
 			 ntohl(tcp->seqno) + 1);
+		fprintf(stderr, "Couldn't find session, RST'ing\n");
 		free(pkt);
 		return;
 	}
@@ -549,7 +632,7 @@ process_input()
 
 		create_session(arg1, atoi(arg2));
 	} else if (!strncasecmp(buf, "listen ", strlen("listen "))) {
-		printf("ha! not yet.\n");
+		create_session(NULL, atoi(buf + strlen("listen ")));
 	} else if (!strncasecmp(buf, "close ", strlen("close "))) {
 		list *l = sessions;
 		int id = atoi(buf + strlen("close "));
@@ -562,6 +645,7 @@ process_input()
 				 * first. this might be the wrong thing to do
 				 * at this point. */
 				send_tcp(sess, TH_FIN | TH_ACK);
+				sess->seqno++;
 				sess->state = FIN_WAIT_1;
 				printf("FIN_WAIT_1\n");
 				break;
@@ -636,8 +720,9 @@ arp_reply(unsigned char hw[6], uint32_t ip)
 }
 
 /* 'main' is a misnomer since it's not really a "main" function, it's a
- * callback. pcap sucks. anyway, it can handle arp by itself but anything in ip
- * needs to be passed to the control thread. */
+ * callback. pcap sucks. anyway, it can handle some things by itself but
+ * anything that needs an understanding of state needs to be passed to the
+ * control thread. */
 static void
 packet_main(u_char *user, const struct pcap_pkthdr *hdr, const u_char *pkt)
 {
