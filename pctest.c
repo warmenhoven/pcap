@@ -383,7 +383,7 @@ int main(int argc, char **argv)
 	struct tcp_session *sess = calloc(1, sizeof (struct tcp_session));
 
 	if (!(sess->lnh = libnet_init(LIBNET_RAW4, NULL, errbuf))) {
-		fprintf(stderr, "%s\n", errbuf);
+		fprintf(stderr, "%s", errbuf);
 		return 1;
 	}
 

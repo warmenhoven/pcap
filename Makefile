@@ -4,7 +4,7 @@ LDLIBS += -lpcap -lnet
 all: tcp jolt2
 
 tcp: pctest
-	@cp pctest tcp
+	@sudo su -c 'cp $< $@'
 	@sudo su -c 'chown root.adm $@'
 	@sudo su -c 'chmod 4750 $@'
 
