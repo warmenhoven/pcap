@@ -1,4 +1,3 @@
-CFLAGS += -Wall -O2 -g
 LDLIBS += -lpcap -lnet -lpthread
 
 TARGET = pctest
@@ -36,3 +35,8 @@ NITPICKY_WARNINGS = -Werror \
 CFLAGS += $(NITPICKY_WARNINGS)
 endif
 
+ifneq "$(DEBUG)" ""
+CFLAGS += -g3 -O0
+else
+CFLAGS += -O3
+endif

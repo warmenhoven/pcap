@@ -285,7 +285,7 @@ find_session(uint32_t dst_ip, uint32_t dst_prt, uint32_t src_prt)
 {
 	list *l = open_connections;
 
-	while (l) {
+	while (l && dst_ip && dst_prt) {
 		struct tcp_session *sess = l->data;
 		l = l->next;
 
@@ -298,16 +298,13 @@ find_session(uint32_t dst_ip, uint32_t dst_prt, uint32_t src_prt)
 
 	l = listeners;
 
-	while (l) {
+	/* TODO: we should be able to support listening for specific
+	 * hosts (or specific ports) */
+	while (l && !dst_ip && !dst_prt) {
 		struct tcp_session *sess = l->data;
 		l = l->next;
 
-		if (sess->src_prt != src_prt)
-			continue;
-
-		/* TODO: we should be able to support listening for specific
-		 * hosts (or specific ports) */
-		if (!sess->dst_ip && !sess->dst_prt)
+		if (sess->src_prt == src_prt)
 			return sess;
 	}
 
@@ -379,12 +376,12 @@ session_setup(void)
 static struct tcp_session *
 create_session(char *host, uint16_t port)
 {
-	struct tcp_session *sess = session_setup();
-
-	if (!sess)
-		return NULL;
+	struct tcp_session *sess;
 
 	if (host) {
+		if ((sess = session_setup()) == NULL)
+			return NULL;
+
 		/* XXX we should have some check to see if sess->dst_ip ==
 		 * src_ip, so that we can detect when we're trying to send
 		 * packets to ourselves, because we won't be able to put those
@@ -407,8 +404,14 @@ create_session(char *host, uint16_t port)
 		open_connections = list_prepend(open_connections, sess);
 	} else {
 		/* listening socket */
-		/* XXX we should make sure that the port isn't already in use (unless
-		 * the user specifies SO_REUSEADDR (ha!)) */
+		if ((sess = find_session(0, 0, port)) != NULL) {
+			fprintf(stderr, "id %d already listening on port %d\n",
+					sess->id, port);
+			return sess;
+		}
+		if ((sess = session_setup()) == NULL)
+			return NULL;
+
 		sess->dst_ip = 0;
 		sess->dst_prt = 0;
 		sess->src_prt = port;
@@ -999,8 +1002,10 @@ list_insert_sorted(list *l, void *data, cmpfnc f)
 		return list_prepend(l, data);
 
 	while (s->next) {
-		if (f(s->next->data, data) < 0)
+		if (f(s->next->data, data) < 0) {
+			s = s->next;
 			continue;
+		}
 		s->next = list_prepend(s->next, data);
 		return l;
 	}
