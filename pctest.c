@@ -1,3 +1,18 @@
+/* valuable rfc's:
+ *
+ * 793, TCP
+ * 1025, TCP bake off
+ *
+ * I'm sure there's more but those are all I knew off the top of my head
+ *
+ * right now in the TCP bake off I get 3 points:
+ *
+ * 2 points for talking to someone else
+ * 1 point for gracefully ending the conversaion (since I send RST and not FIN
+ *   and go through the whole process, I'm only giving myself 1 point instead
+ *   of the full 2)
+ */
+
 #include <libnet.h>
 #include <pcap.h>
 #include <pthread.h>
@@ -106,6 +121,7 @@ init_pcap(struct tcp_session *sess)
 	bpf_u_int32 mask;
 	char *filter_line;
 	struct bpf_program filter;
+	struct in_addr sa;
 
 	if (!(dev = pcap_lookupdev(errbuf))) {
 		fprintf(stderr, "%s\n", errbuf);
@@ -123,10 +139,12 @@ init_pcap(struct tcp_session *sess)
 		return NULL;
 	}
 
-	filter_line = malloc(4 + 3 + 5 + 6);
-	/* we need arp because we're faking a client. we only filter on port
-	 * because 1) I'm lazy and 2) it should be good enough */
-	sprintf(filter_line, "arp or port %d", sess->src_prt);
+	filter_line = malloc(4 + 3 + 5 + (4*4));
+	sa.s_addr = sess->src_ip;
+	/* we need arp because we're faking a client. otherwise we only need
+	 * the packets for the host we're faking. */
+	sprintf(filter_line, "arp or host %s", inet_ntoa(sa));
+	printf("filter line: %s\n", filter_line);
 	pcap_compile(lph, &filter, filter_line, 0, net);
 	free(filter_line);
 
@@ -163,6 +181,42 @@ send_tcp(struct tcp_session *sess, int flags)
 	return 0;
 }
 
+/* yeah, I probably should figure out some way of reuing send_tcp instead of
+ * just copying it. but eh. it probably isn't an issue. at least not often. */
+static int
+send_rst(uint32_t dst_ip, uint16_t dst_prt,
+	 uint32_t src_ip, uint32_t src_prt,
+	 uint32_t ackno)
+{
+	char errbuf[LIBNET_ERRBUF_SIZE];
+	libnet_t *lnh;
+
+	if (!(lnh = libnet_init(LIBNET_RAW4, NULL, errbuf))) {
+		fprintf(stderr, "%s\n", errbuf);
+		return 1;
+	}
+
+	if (libnet_build_tcp(src_prt, dst_prt, 0, ackno, TH_RST | TH_ACK, 0,
+			     0, 0, LIBNET_TCP_H, NULL, 0, lnh, 0) == -1) {
+		fprintf(stderr, "%s\n", libnet_geterror(lnh));
+		return 1;
+	}
+	if (libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_TCP_H, 0x10, 0, 0, 64,
+			       IPPROTO_TCP, 0, src_ip, dst_ip, NULL, 0,
+			       lnh, 0) == -1) {
+		fprintf(stderr, "%s\n", libnet_geterror(lnh));
+		return 1;
+	}
+
+	if (libnet_write(lnh) == -1) {
+		fprintf(stderr, "%s\n", libnet_geterror(lnh));
+		return 1;
+	}
+
+	libnet_destroy(lnh);
+	return 0;
+}
+
 /* XXX convince the host we're running on that it can safely ignore us */
 static int
 arp_reply(struct tcp_session *sess, unsigned char hw[6], uint32_t ip)
@@ -171,7 +225,7 @@ arp_reply(struct tcp_session *sess, unsigned char hw[6], uint32_t ip)
 	 * and we want link-level access. we probably could make this handle
 	 * static so that we don't have to rebuild it too many times, but
 	 * hopefully we should only need to build it once. */
-	char errbuf[PCAP_ERRBUF_SIZE];
+	char errbuf[LIBNET_ERRBUF_SIZE];
 	libnet_t *lnh;
 
 	if (!(lnh = libnet_init(LIBNET_LINK, NULL, errbuf))) {
@@ -355,16 +409,20 @@ packet_cb(u_char *user, const struct pcap_pkthdr *hdr, const u_char *pkt)
 		if (ip->protocol != IPPROTO_TCP)
 			return;
 
-		/* if the packet isn't from this session, and we aren't the
-		 * receiver, ignore it */
 		pthread_mutex_lock(&sess->lock);
-		if (ip->src_ip != sess->dst_ip || ip->dst_ip != sess->src_ip) {
+		/* if it's not for us, we ignore it */
+		if (ip->dst_ip != sess->src_ip) {
 			pthread_mutex_unlock(&sess->lock);
 			return;
 		}
-		if (ntohs(tcp->src_prt) != sess->dst_prt ||
+		/* if it's not part of any session, send a RST */
+		if (ip->src_ip != sess->dst_ip ||
+		    ntohs(tcp->src_prt) != sess->dst_prt ||
 		    ntohs(tcp->dst_prt) != sess->src_prt) {
 			pthread_mutex_unlock(&sess->lock);
+			send_rst(ip->src_ip, ntohs(tcp->src_prt),
+				 ip->dst_ip, ntohs(tcp->dst_prt),
+				 ntohl(tcp->seqno) + 1);
 			return;
 		}
 
@@ -449,7 +507,7 @@ main(int argc, char **argv)
 	sess->dst_ip = libnet_name2addr4(sess->lnh,
 					 argc > 1 ? argv[1] : "172.20.102.1",
 					 LIBNET_RESOLVE);
-	sess->dst_prt = argc > 2 ? atoi(argv[2]) : 4919;
+	sess->dst_prt = argc > 2 ? atoi(argv[2]) : 12345;
 	memcpy(sess->src_hw, libnet_get_hwaddr(sess->lnh), 6);
 	/* you need to pick this IP address based on three characteristics:
 	 *
@@ -468,7 +526,7 @@ main(int argc, char **argv)
 	sess->src_ip = libnet_name2addr4(sess->lnh,
 					 argc > 3 ? argv[3] : "172.20.102.9",
 					 LIBNET_RESOLVE);
-	sess->src_prt = argc > 4 ? atoi(argv[4]) : 4919;
+	sess->src_prt = argc > 4 ? atoi(argv[4]) : 12345;
 	/* I hear I shouldn't use this function for anything real. oh well. */
 	sess->seqno = libnet_get_prand(LIBNET_PRu32);
 
