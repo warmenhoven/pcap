@@ -39,7 +39,7 @@ enum tcp_state {
 struct tcp_session {
 	pthread_mutex_t lock;
 
-	uint32_t id;
+	uint32_t id;	/* heh. a more appropriate name might be 'fd'. */
 
 	enum tcp_state state;
 
@@ -347,7 +347,8 @@ create_session(char *host, uint16_t port)
 
 	pthread_mutex_lock(&snslck);
 	sessions = list_append(sessions, sess);
-	/* this is technically wrong but I doubt next_id will ever wrap */
+	/* this is technically wrong but I doubt next_id will ever wrap (unless
+	 * if you're doing mean things to this poor little program) */
 	sess->id = next_id;
 	printf("created session %d using port %d\n", next_id++, sess->src_prt);
 	pthread_mutex_unlock(&snslck);
