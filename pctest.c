@@ -589,9 +589,9 @@ control_main(void *arg)
 					/* XXX we should check the state of the
 					 * session first. this might be the
 					 * wrong thing to do at this point. */
-					printf("CLOSING %d\n", id);
 					send_tcp(sess, TH_FIN | TH_ACK);
 					sess->state = FIN_WAIT_1;
+					printf("FIN_WAIT_1\n");
 					pthread_mutex_unlock(&sess->lock);
 					break;
 				}
