@@ -137,6 +137,12 @@ typedef struct tcp_session {
 	 * attention to */
 } TCB;
 
+struct timer {
+	struct timeval end;
+	void (*func)(void *);
+	void *arg;
+};
+
 /* I'm sure I didn't need to do this */
 struct enet {
 	unsigned char dst_hw[6];
@@ -225,7 +231,55 @@ static uint32_t src_ip;
 static list *sessions = NULL;
 static list *open_connections = NULL;
 static list *listeners = NULL;
+static list *timers = NULL;
 static int sp[2];
+
+static int
+timer_cmp(const void *x, const void *y)
+{
+	const struct timer *a = x, *b = y;
+	if (a->end.tv_sec == b->end.tv_sec)
+		return a->end.tv_usec - b->end.tv_usec;
+	else
+		return a->end.tv_sec - b->end.tv_sec;
+}
+
+static struct timer *
+timer_start(int ms, void (*func)(void *), void *arg)
+{
+	struct timer *timer;
+	struct timeval tp;
+
+	timer = malloc(sizeof (struct timer));
+	if (!timer)
+		return NULL;
+
+	gettimeofday(&tp, NULL);
+
+	timer->func = func;
+	timer->arg = arg;
+	timer->end.tv_sec = tp.tv_sec + (ms / 1000);
+	timer->end.tv_usec = tp.tv_usec + ((ms % 1000) * 1000);
+
+	timers = list_insert_sorted(timers, timer, timer_cmp);
+
+	return timer;
+}
+
+static void
+timer_cancel(struct timer *timer)
+{
+	timers = list_remove(timers, timer);
+	free(timer);
+}
+
+static void
+timer_process(struct timer *timer)
+{
+	if (timer->func)
+		timer->func(timer->arg);
+	timer_cancel(timer);
+}
 
 static pcap_t *
 init_pcap(void)
@@ -960,6 +1014,14 @@ ping(char *host)
 }
 
 static void
+fake_timeout(void *arg __attribute__((__unused__)))
+{
+	struct timeval tv;
+	gettimeofday(&tv, NULL);
+	printf("processing timer at %ld.%06ld\n", tv.tv_sec, tv.tv_usec);
+}
+
+static void
 process_input(void)
 {
 	char buf[80];
@@ -1026,6 +1088,24 @@ process_input(void)
 				   libnet_addr2name4(sess->dst_ip, LIBNET_DONT_RESOLVE),
 				   sess->dst_prt, state_names[sess->state]);
 		}
+	} else if (!strncasecmp(buf, "timer ", strlen("timer "))) {
+		struct timeval tv;
+		char *arg1;
+		arg1 = buf + strlen("timer ");
+		gettimeofday(&tv, NULL);
+		printf("starting timer at %ld.%06ld\n", tv.tv_sec, tv.tv_usec);
+		timer_start(atoi(arg1), fake_timeout, NULL);
+	} else if (!strcasecmp(buf, "timerlist")) {
+		list *l = timers;
+		struct timeval tv;
+		gettimeofday(&tv, NULL);
+		printf("Current time: %ld.%06ld\n", tv.tv_sec, tv.tv_usec);
+		while (l) {
+			struct timer *t = l->data;
+			l = l->next;
+			printf("timer to expire at %ld.%06ld\n", t->end.tv_sec,
+				   t->end.tv_usec);
+		}
 	} else if (!strcasecmp(buf, "quit")) {
 		/* XXX should send RST to all the sessions */
 		exit(0);
@@ -1037,14 +1117,47 @@ static void * __attribute__((__noreturn__))
 control_main(void *arg __attribute__((__unused__)))
 {
 	fd_set set;
+	struct timeval tp, *ptp;
+	struct timer *timer;
+	list *cur, *next;
 
 	while (1) {
 		FD_ZERO(&set);
 		FD_SET(0, &set);
 		FD_SET(sp[1], &set);
 
-		/* XXX for now we don't do timers; therefore no retransmission, etc. */
-		if (select(sp[1] + 1, &set, NULL, NULL, NULL) < 0)
+		if (timers) {
+			gettimeofday(&tp, NULL);
+
+			ptp = &tp;
+			/* we keep the timers in order sorted by when they're going to
+			 * expire (first to last), so taking the first on the list should
+			 * always be the first to expire and so we can use it to figure out
+			 * how long to tell select to sleep */
+			timer = timers->data;
+
+			if (timer->end.tv_sec > tp.tv_sec) {
+				tp.tv_sec = 0;
+			} else {
+				tp.tv_sec -= timer->end.tv_sec;
+			}
+
+			if (timer->end.tv_usec > tp.tv_usec) {
+				if (tp.tv_sec) {
+					tp.tv_sec--;
+					tp.tv_usec = 1000000 - timer->end.tv_usec;
+				} else {
+					tp.tv_sec = 0;
+					tp.tv_usec = 0;
+				}
+			} else {
+				tp.tv_usec -= timer->end.tv_usec;
+			}
+		} else {
+			ptp = NULL;
+		}
+
+		if (select(sp[1] + 1, &set, NULL, NULL, ptp) < 0)
 			exit(1);
 
 		if (FD_ISSET(0, &set))
@@ -1054,6 +1167,25 @@ control_main(void *arg __attribute__((__unused__)))
 			/* we assume everything pcap gives is is IP, because we assume that
 			 * the pcap thread handles everything else itself */
 			process_ip_packet();
+
+		cur = timers;
+		gettimeofday(&tp, NULL);
+		while (cur) {
+			next = cur->next;
+			timer = cur->data;
+			/* we get away with this because the timespec is the first element
+			 * of the timer */
+			if (timer_cmp(timer, &tp) <= 0) {
+				timer_process(timer);
+				timers = list_remove(timers, timer);
+				cur = next;
+			} else {
+				/* again, since the timers are sorted by when they expire, as
+				 * soon as you come across one that hasn't expired yet, you know
+				 * that all the rest of them won't have expired yet */
+				break;
+			}
+		}
 	}
 }
 
