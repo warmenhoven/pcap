@@ -392,9 +392,9 @@ int main(int argc, char **argv)
 	if (init_pcap())
 		return 1;
 
-	/* libnet seems to have problems if you reuse the handlers. I'm sure
+	/* libnet seems to have problems if you reuse the handles. I'm sure
 	 * it's just me doing something wrong but rather than figure out what
-	 * I'll just use a different handler for everything! */
+	 * I'll just use a different handle for everything! */
 	if (!(lnh = libnet_init(LIBNET_RAW4, NULL, errbuf))) {
 		fprintf(stderr, "%s\n", errbuf);
 		return 1;
