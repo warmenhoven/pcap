@@ -8,7 +8,9 @@ tcp: pctest
 	@sudo su -c 'chown root.adm $@'
 	@sudo su -c 'chmod 4750 $@'
 
-pctest: pctest.o
+pctest: list.o pctest.o
+
+list.o pctest.o: list.h
 
 clean:
 	rm -f pctest pctest.o tcp jolt2
