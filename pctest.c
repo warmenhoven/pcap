@@ -26,6 +26,7 @@
  *     of the 5 points here)
  */
 
+#include <ansidecl.h>
 #include <libnet.h>
 #include <pcap.h>
 #include <pthread.h>
@@ -51,14 +52,6 @@ typedef struct _list {
 	struct _list *next;
 	void *data;
 } list;
-
-typedef void (*tmr_cbf)(void *);
-
-typedef struct _timer {
-	time_t exp;
-	tmr_cbf f;
-	void *data;
-} timer;
 
 struct tcp_session {
 	uint32_t id;	/* heh. a more appropriate name might be 'fd'. */
@@ -783,8 +776,8 @@ process_input(void)
 }
 
 /* this function needs to get rewritten. desperately. */
-static void *
-control_main(void *arg)
+static void * ATTRIBUTE_NORETURN
+control_main(void *arg ATTRIBUTE_UNUSED)
 {
 	fd_set set;
 
@@ -845,7 +838,8 @@ arp_reply(unsigned char hw[6], uint32_t ip)
  * anything that needs an understanding of state needs to be passed to the
  * control thread. */
 static void
-packet_main(u_char *user, const struct pcap_pkthdr *hdr, const u_char *pkt)
+packet_main(u_char *user ATTRIBUTE_UNUSED,
+			const struct pcap_pkthdr *hdr, const u_char *pkt)
 {
 	/* XXX at some point we should be checking packet size so that e.g. the
 	 * IP header really is at least 5 bytes. some of these checks should be
@@ -888,6 +882,11 @@ main(int argc, char **argv)
 
 	libnet_t *lnh;
 
+	if (argc < 2) {
+		printf("Usage: %s <ip>\n", argv[0]);
+		return 1;
+	}
+
 	if (!(lnh = libnet_init(LIBNET_RAW4, NULL, errbuf))) {
 		fprintf(stderr, "%s\n", errbuf);
 		return 1;
@@ -911,9 +910,7 @@ main(int argc, char **argv)
 	 * that address, then you shouldn't have to worry about any of that.
 	 * but then you'll have to modify this client to handle all the routing
 	 * details itself, and that's not fun. */
-	src_ip = libnet_name2addr4(lnh,
-							   (argc > 1 ? argv[1] : "172.20.102.9"),
-							   LIBNET_RESOLVE);
+	src_ip = libnet_name2addr4(lnh, argv[1], LIBNET_RESOLVE);
 	libnet_destroy(lnh);
 
 	if (!(lph = init_pcap()))

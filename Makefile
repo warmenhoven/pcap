@@ -14,11 +14,13 @@ test: $(TARGET)
 ifneq "$(PICKY)" ""
 NITPICKY_WARNINGS = -Werror \
 		    -Wall \
+		    -W \
 		    -Wundef \
 		    -Wendif-labels \
 		    -Wshadow \
 		    -Wpointer-arith \
 		    -Wcast-align \
+		    -Wwrite-strings \
 		    -Wsign-compare \
 		    -Waggregate-return \
 		    -Wstrict-prototypes \
