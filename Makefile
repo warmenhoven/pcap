@@ -1,4 +1,4 @@
-CFLAGS += -Wall -O2 -g -ansi -pedantic
+CFLAGS += -Wall -O2 -g
 LDLIBS += -lpcap -lnet -lpthread
 
 TARGET = pctest
