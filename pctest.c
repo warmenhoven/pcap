@@ -9,7 +9,7 @@
  *
  * 1 points for talking to myself
  * 1 points for gracefully ending the conversation
- * 2 points for repeating the abov without reinitializing
+ * 2 points for repeating the above without reinitializing
  *
  * 2 points for talking to someone else
  * 2 point for gracefully ending the conversaion
@@ -27,45 +27,35 @@
  * points so far....
  */
 
-#include "list.h"
-
 #include <libnet.h>
 #include <pcap.h>
 #include <pthread.h>
 #include <stdio.h>
 
-enum tcp_state {
-	CLOSED,
-	LISTEN,
-	SYN_RCVD,
-	SYN_SENT,
-	ESTABLISHED,
-	FIN_WAIT_1,
-	FIN_WAIT_2,
-	CLOSING,
-	TIME_WAIT,
-	CLOSE_WAIT,
-	LAST_ACK
-};
-
 char *state_names[] = {
-	"CLOSED",
-	"LISTEN",
-	"SYN_RCVD",
-	"SYN_SENT",
+	"UNKNOWN",
 	"ESTABLISHED",
-	"FIN_WAIT_1",
-	"FIN_WAIT_2",
-	"CLOSING",
+	"SYN_SENT",
+	"SYN_RECV",
+	"FIN_WAIT1",
+	"FIN_WAIT2",
 	"TIME_WAIT",
+	"TCP_CLOSE",
 	"CLOSE_WAIT",
 	"LAST_ACK",
+	"LISTEN",
+	"CLOSING",
 };
+
+typedef struct _list {
+	struct _list *next;
+	void *data;
+} list;
 
 struct tcp_session {
 	uint32_t id;	/* heh. a more appropriate name might be 'fd'. */
 
-	enum tcp_state state;
+	uint32_t state;
 
 	/* quite honestly each session doesn't need its own socket but it does
 	 * make some things simpler */
@@ -167,6 +157,17 @@ struct tcp_pkt {
 	uint16_t urg;
 } __attribute__((packed));
 
+/* declare all the list functions */
+static list *list_new(void *);
+static list *list_prepend(list *, void *);
+static list *list_remove(list *, void *);
+/* we don't use these
+static unsigned int list_length(list *);
+static void *list_nth(list *, int);
+static list *list_append(list *, void *);
+static void list_free(list *);
+*/
+
 static pcap_t *
 init_pcap()
 {
@@ -238,11 +239,11 @@ send_tcp(struct tcp_session *sess, int flags)
 	return 1;
 }
 
-/* yeah, I probably should figure out some way of reuing send_tcp instead of
+/* yeah, I probably should figure out some way of reusing send_tcp instead of
  * just copying it. but eh. it probably isn't an issue. at least not often. */
 static int
 send_rst(uint32_t dst_ip, uint16_t dst_prt, uint32_t src_prt,
-	 uint32_t seqno, uint32_t ackno, enum tcp_state state, int control)
+	 uint32_t seqno, uint32_t ackno, int state, int control)
 {
 	char errbuf[LIBNET_ERRBUF_SIZE];
 	libnet_t *lnh;
@@ -287,13 +288,14 @@ find_session(uint32_t dst_ip, uint32_t dst_prt, uint32_t src_prt)
 		if (sess->src_prt != src_prt)
 			continue;
 
-		if (sess->state != LISTEN &&
+		if (sess->state != TCP_LISTEN &&
 		    sess->dst_ip == dst_ip && sess->dst_prt == dst_prt)
 			return sess;
 
 		/* TODO: we should be able to support listening for specific
 		 * hosts (or specific ports) */
-		if (sess->state == LISTEN && !sess->dst_ip && !sess->dst_prt)
+		if (sess->state == TCP_LISTEN &&
+		    !sess->dst_ip && !sess->dst_prt)
 			return sess;
 	}
 
@@ -320,7 +322,7 @@ session_setup()
 	struct tcp_session *sess = calloc(1, sizeof (struct tcp_session));
 	char errbuf[LIBNET_ERRBUF_SIZE];
 
-	/* sess->state = CLOSED; */
+	/* sess->state = TCP_CLOSE; */
 
 	if (!(sess->lnh = libnet_init(LIBNET_RAW4, NULL, errbuf))) {
 		fprintf(stderr, "%s\n", errbuf);
@@ -348,7 +350,7 @@ session_setup()
 /* maybe eventually there will be a third argument, so you can specify the port
  * to connect from */
 static struct tcp_session *
-create_session(char *host, uint16_t port)
+create_session(unsigned char *host, uint16_t port)
 {
 	struct tcp_session *sess = session_setup();
 
@@ -380,11 +382,11 @@ create_session(char *host, uint16_t port)
 		/* send the SYN, and we're off! */
 		send_tcp(sess, TH_SYN);
 		sess->seqno++;
-		sess->state = SYN_SENT;
-		printf("SYN_SENT\n");
+		sess->state = TCP_SYN_SENT;
+		printf("%s\n", state_names[sess->state]);
 	} else {
-		sess->state = LISTEN;
-		printf("LISTEN\n");
+		sess->state = TCP_LISTEN;
+		printf("%s\n", state_names[sess->state]);
 	}
 
 	return sess;
@@ -406,8 +408,8 @@ accept_session(struct tcp_session *listener, struct tcp_pkt *pkt)
 
 	send_tcp(sess, TH_SYN | TH_ACK);
 	sess->seqno++;
-	sess->state = SYN_RCVD;
-	printf("SYN_RCVD\n");
+	sess->state = TCP_SYN_RECV;
+	printf("%s\n", state_names[sess->state]);
 
 	return sess;
 }
@@ -428,22 +430,18 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 
 	/* XXX none of these things check seqno/ackno. they should. */
 
-	if ((sess->state != LISTEN) && (pkt->control & TH_RST)) {
+	if ((sess->state != TCP_LISTEN) && (pkt->control & TH_RST)) {
 		fprintf(stderr, "Remote host sent RST\n");
 		remove_session(sess);
 		return;
 	}
 
 	/* XXX none of these things check to see that only the flags they're
-	 * expecting are set. if we're in FIN_WAIT_1 and we get SYN/FIN/ACK
+	 * expecting are set. if we're in FIN_WAIT1 and we get SYN/FIN/ACK
 	 * then we'll just remove the session instead of sending RST. this
 	 * probably isn't a big problem. */
 	switch (sess->state) {
-	case CLOSED:
-		/* we should never get here because we just remove the session
-		 * if it's closed */
-		break;
-	case LISTEN:
+	case TCP_LISTEN:
 		if (pkt->control & TH_SYN) {
 			accept_session(sess, pkt);
 		} else {
@@ -454,11 +452,11 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 			/* don't remove_sess because we're still listening */
 		}
 		break;
-	case SYN_RCVD:
+	case TCP_SYN_RECV:
 		if (pkt->control & TH_ACK) {
 			sess->ackno = ntohl(pkt->seqno) + 1;
-			sess->state = ESTABLISHED;
-			printf("ESTABLISHED\n");
+			sess->state = TCP_ESTABLISHED;
+			printf("%s\n", state_names[sess->state]);
 		} else {
 			send_rst(pkt->ip.src_ip, ntohs(pkt->src_prt),
 				 ntohs(pkt->dst_prt), ntohl(pkt->ackno),
@@ -467,15 +465,15 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 			remove_session(sess);
 		}
 		break;
-	case SYN_SENT:
+	case TCP_SYN_SENT:
 		if ((pkt->control & TH_SYN) && (pkt->control & TH_ACK)) {
 			sess->ackno = ntohl(pkt->seqno) + 1;
 			send_tcp(sess, TH_ACK);
-			sess->state = ESTABLISHED;
-			printf("ESTABLISHED\n");
+			sess->state = TCP_ESTABLISHED;
+			printf("%s\n", state_names[sess->state]);
 		} else {
 			/* XXX actually if we get SYN but no ACK we're supposed
-			 * to send an ACK, go to SYN_RCVD, and wait for the ACK
+			 * to send an ACK, go to SYN_RECV, and wait for the ACK
 			 * to our SYN. but I don't care about that. */
 			send_rst(pkt->ip.src_ip, ntohs(pkt->src_prt),
 				 ntohs(pkt->dst_prt), ntohl(pkt->ackno),
@@ -484,7 +482,7 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 			remove_session(sess);
 		}
 		break;
-	case ESTABLISHED:
+	case TCP_ESTABLISHED:
 		if (pkt->control & TH_FIN) {
 			/* the other side wants to shut down the connection */
 			sess->ackno = ntohl(pkt->seqno) + 1;
@@ -492,21 +490,21 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 			 * right through CLOSE_WAIT to LAST_ACK */
 			send_tcp(sess, TH_FIN | TH_ACK);
 			sess->seqno++;
-			sess->state = LAST_ACK;
-			printf("LAST_ACK\n");
+			sess->state = TCP_LAST_ACK;
+			printf("%s\n", state_names[sess->state]);
 		}
 		/* XXX there are more cases of things to do here */
 		break;
-	case FIN_WAIT_1:
+	case TCP_FIN_WAIT1:
 		/* we sent the initial FIN */
 		if ((pkt->control & TH_ACK) && (pkt->control & TH_FIN)) {
 			sess->ackno = ntohl(pkt->seqno) + 1;
 			send_tcp(sess, TH_ACK);
+			sess->state = TCP_TIME_WAIT;
+			printf("%s\n", state_names[sess->state]);
 			/* we should move to TIME_WAIT in case if the other
 			 * side doesn't receive our ACK, but we just assume
 			 * everything went well */
-			/* sess->state = TIME_WAIT; */
-			printf("TIME_WAIT\n");
 			remove_session(sess);
 			break;
 		}
@@ -515,18 +513,18 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 			/* ACK the FIN, wait for our ACK */
 			sess->ackno = ntohl(pkt->seqno) + 1;
 			send_tcp(sess, TH_ACK);
+			sess->state = TCP_CLOSING;
+			printf("%s\n", state_names[sess->state]);
 			/* just like TIME_WAIT, we should move to CLOSING, but
 			 * we just assume everything went well */
-			/* sess->state = CLOSING; */
-			printf("CLOSING\n");
 			remove_session(sess);
 			break;
 		}
 
 		if (pkt->control & TH_ACK) {
 			/* we've got the ACK, now we're waiting for the FIN */
-			sess->state = FIN_WAIT_2;
-			printf("FIN_WAIT_2\n");
+			sess->state = TCP_FIN_WAIT2;
+			printf("%s\n", state_names[sess->state]);
 			break;
 		}
 
@@ -536,15 +534,15 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 			 ntohl(pkt->seqno) + 1, sess->state, pkt->control);
 		remove_session(sess);
 		break;
-	case FIN_WAIT_2:
+	case TCP_FIN_WAIT2:
 		if (pkt->control & TH_FIN) {
 			/* we've got the FIN, send the ACK and we're done */
 			sess->ackno = ntohl(pkt->seqno) + 1;
 			send_tcp(sess, TH_ACK);
+			sess->state = TCP_TIME_WAIT;
+			printf("%s\n", state_names[sess->state]);
 			/* just like above, we should move to TIME_WAIT, but
 			 * we just assume everything went well */
-			/* sess->state = TIME_WAIT */
-			printf("TIME_WAIT \n");
 			remove_session(sess);
 			break;
 		}
@@ -555,21 +553,22 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 			 ntohl(pkt->seqno) + 1, sess->state, pkt->control);
 		remove_session(sess);
 		break;
-	case CLOSING:
+	case TCP_CLOSING:
 		/* we never get here because we just assume everything went
 		 * fine, and remove the sess before waiting for our ACK */
 		break;
-	case TIME_WAIT:
+	case TCP_TIME_WAIT:
 		/* we never get here because we just assume everything went
 		 * fine, and remove the sess before waiting for our ACK */
 		break;
-	case CLOSE_WAIT:
+	case TCP_CLOSE_WAIT:
 		/* we never get here because we send the FIN with the ACK */
 		break;
-	case LAST_ACK:
+	case TCP_LAST_ACK:
 		if (pkt->control & TH_ACK) {
 			/* now we can remove the session */
-			printf("CLOSED\n");
+			sess->state = TCP_CLOSE;
+			printf("%s\n", state_names[sess->state]);
 			remove_session(sess);
 		} else {
 			send_rst(pkt->ip.src_ip, ntohs(pkt->src_prt),
@@ -619,7 +618,7 @@ process_packet()
 				  ntohs(tcp->dst_prt)))) {
 		send_rst(ip->src_ip, ntohs(tcp->src_prt),
 			 ntohs(tcp->dst_prt), ntohl(tcp->ackno),
-			 ntohl(tcp->seqno) + 1, CLOSED, tcp->control);
+			 ntohl(tcp->seqno) + 1, TCP_CLOSE, tcp->control);
 		free(pkt);
 		return;
 	}
@@ -645,7 +644,7 @@ process_input()
 			return;
 		*arg2++ = 0;
 
-		create_session(arg1, atoi(arg2));
+		create_session((unsigned char *)arg1, atoi(arg2));
 	} else if (!strncasecmp(buf, "listen ", strlen("listen "))) {
 		/* we should make sure that the port isn't already in use
 		 * (unless the user specifies SO_REUSEADDR) */
@@ -658,13 +657,14 @@ process_input()
 			struct tcp_session *sess = l->data;
 
 			if (sess->id == id) {
-				if (sess->state == LISTEN) {
+				if (sess->state == TCP_LISTEN) {
 					remove_session(sess);
 				} else {
 					send_tcp(sess, TH_FIN | TH_ACK);
 					sess->seqno++;
-					sess->state = FIN_WAIT_1;
-					printf("FIN_WAIT_1\n");
+					sess->state = TCP_FIN_WAIT1;
+					printf("%s\n",
+					       state_names[sess->state]);
 				}
 				break;
 			}
@@ -819,7 +819,8 @@ main(int argc, char **argv)
 	 * that address, then you shouldn't have to worry about any of that.
 	 * but then you'll have to modify this client to handle all the routing
 	 * details itself, and that's not fun. */
-	src_ip = libnet_name2addr4(lnh, argc > 1 ? argv[1] : "172.20.102.9",
+	src_ip = libnet_name2addr4(lnh, (unsigned char *)
+				   (argc > 1 ? argv[1] : "172.20.102.9"),
 				   LIBNET_RESOLVE);
 	libnet_destroy(lnh);
 
@@ -856,3 +857,86 @@ main(int argc, char **argv)
 	/* I don't think we'll ever get here, unless things go very wrong */
 	return 1;
 }
+
+/* define all the list functions */
+list *list_new(void *data)
+{
+	list *l = malloc(sizeof(list));
+	l->next = NULL;
+	l->data = data;
+	return l;
+}
+
+list *list_prepend(list *l, void *data)
+{
+	list *s = list_new(data);
+	s->next = l;
+	return s;
+}
+
+list *list_remove(list *l, void *data)
+{
+	list *s = l, *p = NULL;
+
+	if (!s) return NULL;
+	if (s->data == data) {
+		p = s->next;
+		free(s);
+		return p;
+	}
+	while (s->next) {
+		p = s;
+		s = s->next;
+		if (s->data == data) {
+			p->next = s->next;
+			free(s);
+			return l;
+		}
+	}
+	return l;
+}
+
+/*
+unsigned int list_length(list *l)
+{
+	unsigned int c = 0;
+
+	while (l) {
+		l = l->next;
+		c++;
+	}
+
+	return c;
+}
+
+void *list_nth(list *l, int n)
+{
+	while (l && n) {
+		l = l->next;
+		n--;
+	}
+	if (l) return l->data;
+	return NULL;
+}
+
+list *list_append(list *l, void *data)
+{
+	list *s = l;
+
+	if (!s) return list_new(data);
+
+	while (s->next) s = s->next;
+	s->next = list_new(data);
+
+	return l;
+}
+
+void list_free(list *l)
+{
+	while (l) {
+		list *s = l;
+		l = l->next;
+		free(s);
+	}
+}
+*/
