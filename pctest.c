@@ -109,6 +109,116 @@ list_insert_sorted(list *l, void *data, cmpfnc f)
 	return l;
 }
 
+struct timer {
+	struct timeval end;
+	void (*func)(void *);
+	void *arg;
+};
+
+static list *timers = NULL;
+
+static int
+timer_cmp(const void *x, const void *y)
+{
+	const struct timer *a = x, *b = y;
+	if (a->end.tv_sec == b->end.tv_sec)
+		return a->end.tv_usec - b->end.tv_usec;
+	else
+		return a->end.tv_sec - b->end.tv_sec;
+}
+
+static struct timer *
+timer_start(int ms, void (*func)(void *), void *arg)
+{
+	struct timer *timer;
+	struct timeval tv;
+
+	timer = malloc(sizeof (struct timer));
+	if (!timer)
+		return NULL;
+
+	gettimeofday(&tv, NULL);
+
+	timer->func = func;
+	timer->arg = arg;
+	timer->end.tv_sec = tv.tv_sec + (ms / 1000);
+	timer->end.tv_usec = tv.tv_usec + ((ms % 1000) * 1000);
+
+	timers = list_insert_sorted(timers, timer, timer_cmp);
+
+	return timer;
+}
+
+static void
+timer_cancel(struct timer *timer)
+{
+	timers = list_remove(timers, timer);
+	free(timer);
+}
+
+static struct timeval *
+timer_get_sleep_time(struct timeval *tv)
+{
+	if (timers) {
+		/* we keep the timers in order sorted by when they're going to
+		 * expire (first to last), so taking the first on the list should
+		 * always be the first to expire and so we can use it to figure out
+		 * how long to tell select to sleep */
+		struct timer *timer = timers->data;
+
+		gettimeofday(tv, NULL);
+
+		if (timer->end.tv_sec > tv->tv_sec) {
+			tv->tv_sec = 0;
+		} else {
+			tv->tv_sec -= timer->end.tv_sec;
+		}
+
+		if (timer->end.tv_usec > tv->tv_usec) {
+			if (tv->tv_sec) {
+				tv->tv_sec--;
+				tv->tv_usec = 1000000 - timer->end.tv_usec;
+			} else {
+				tv->tv_sec = 0;
+				tv->tv_usec = 0;
+			}
+		} else {
+			tv->tv_usec -= timer->end.tv_usec;
+		}
+
+		return tv;
+	} else {
+		return NULL;
+	}
+}
+
+static void
+timer_process_pending(void)
+{
+	list *cur, *next;
+	struct timeval tv;
+
+	cur = timers;
+	gettimeofday(&tv, NULL);
+	while (cur) {
+		struct timer *timer = cur->data;
+		next = cur->next;
+		/* we get away with this because the timespec is the first element
+		 * of the timer */
+		if (timer_cmp(timer, &tv) <= 0) {
+			if (timer->func)
+				timer->func(timer->arg);
+			timer_cancel(timer);
+			cur = next;
+		} else {
+			/* again, since the timers are sorted by when they expire, as
+			 * soon as you come across one that hasn't expired yet, you know
+			 * that all the rest of them won't have expired yet */
+			break;
+		}
+	}
+}
+
 typedef struct tcp_session {
 	uint32_t id;	/* heh. a more appropriate name might be 'fd'. */
 
@@ -136,12 +246,6 @@ typedef struct tcp_session {
 	/* there's really a bunch of other stuff that I should be paying
 	 * attention to */
 } TCB;
-
-struct timer {
-	struct timeval end;
-	void (*func)(void *);
-	void *arg;
-};
 
 /* I'm sure I didn't need to do this */
 struct enet {
@@ -231,55 +335,7 @@ static uint32_t src_ip;
 static list *sessions = NULL;
 static list *open_connections = NULL;
 static list *listeners = NULL;
-static list *timers = NULL;
 static int sp[2];
-
-static int
-timer_cmp(const void *x, const void *y)
-{
-	const struct timer *a = x, *b = y;
-	if (a->end.tv_sec == b->end.tv_sec)
-		return a->end.tv_usec - b->end.tv_usec;
-	else
-		return a->end.tv_sec - b->end.tv_sec;
-}
-
-static struct timer *
-timer_start(int ms, void (*func)(void *), void *arg)
-{
-	struct timer *timer;
-	struct timeval tp;
-
-	timer = malloc(sizeof (struct timer));
-	if (!timer)
-		return NULL;
-
-	gettimeofday(&tp, NULL);
-
-	timer->func = func;
-	timer->arg = arg;
-	timer->end.tv_sec = tp.tv_sec + (ms / 1000);
-	timer->end.tv_usec = tp.tv_usec + ((ms % 1000) * 1000);
-
-	timers = list_insert_sorted(timers, timer, timer_cmp);
-
-	return timer;
-}
-
-static void
-timer_cancel(struct timer *timer)
-{
-	timers = list_remove(timers, timer);
-	free(timer);
-}
-
-static void
-timer_process(struct timer *timer)
-{
-	if (timer->func)
-		timer->func(timer->arg);
-	timer_cancel(timer);
-}
 
 static pcap_t *
 init_pcap(void)
@@ -1117,47 +1173,16 @@ static void * __attribute__((__noreturn__))
 control_main(void *arg __attribute__((__unused__)))
 {
 	fd_set set;
-	struct timeval tp, *ptp;
-	struct timer *timer;
-	list *cur, *next;
+	struct timeval tv, *ptv;
 
 	while (1) {
 		FD_ZERO(&set);
 		FD_SET(0, &set);
 		FD_SET(sp[1], &set);
 
-		if (timers) {
-			gettimeofday(&tp, NULL);
+		ptv = timer_get_sleep_time(&tv);
 
-			ptp = &tp;
-			/* we keep the timers in order sorted by when they're going to
-			 * expire (first to last), so taking the first on the list should
-			 * always be the first to expire and so we can use it to figure out
-			 * how long to tell select to sleep */
-			timer = timers->data;
-
-			if (timer->end.tv_sec > tp.tv_sec) {
-				tp.tv_sec = 0;
-			} else {
-				tp.tv_sec -= timer->end.tv_sec;
-			}
-
-			if (timer->end.tv_usec > tp.tv_usec) {
-				if (tp.tv_sec) {
-					tp.tv_sec--;
-					tp.tv_usec = 1000000 - timer->end.tv_usec;
-				} else {
-					tp.tv_sec = 0;
-					tp.tv_usec = 0;
-				}
-			} else {
-				tp.tv_usec -= timer->end.tv_usec;
-			}
-		} else {
-			ptp = NULL;
-		}
-
-		if (select(sp[1] + 1, &set, NULL, NULL, ptp) < 0)
+		if (select(sp[1] + 1, &set, NULL, NULL, ptv) < 0)
 			exit(1);
 
 		if (FD_ISSET(0, &set))
@@ -1168,24 +1193,7 @@ control_main(void *arg __attribute__((__unused__)))
 			 * the pcap thread handles everything else itself */
 			process_ip_packet();
 
-		cur = timers;
-		gettimeofday(&tp, NULL);
-		while (cur) {
-			next = cur->next;
-			timer = cur->data;
-			/* we get away with this because the timespec is the first element
-			 * of the timer */
-			if (timer_cmp(timer, &tp) <= 0) {
-				timer_process(timer);
-				timers = list_remove(timers, timer);
-				cur = next;
-			} else {
-				/* again, since the timers are sorted by when they expire, as
-				 * soon as you come across one that hasn't expired yet, you know
-				 * that all the rest of them won't have expired yet */
-				break;
-			}
-		}
+		timer_process_pending();
 	}
 }
 
