@@ -338,16 +338,6 @@ static void packet_cb(u_char *user, const struct pcap_pkthdr *hdr, const u_char 
 		struct ip_pkt *ip = (struct ip_pkt *)pkt;
 		struct tcp_pkt *tcp = (struct tcp_pkt *)pkt;
 
-		/* this is a hack. if we don't already know the MAC address
-		 * we're faking, then we use our syn packet (which pcap should
-		 * pick up since we install the filter before sending the syn)
-		 * to get our MAC address. there are better ways but not many
-		 * of them are as portable or as easy */
-		if (!sess->src_hw[0] && !sess->src_hw[1] &&
-		    ip->src_ip == sess->src_ip && ip->dst_ip == sess->dst_ip) {
-			memcpy(sess->src_hw, enet->src_hw, 6);
-		}
-
 		/* we only deal with TCP */
 		if (ip->protocol != IPPROTO_TCP)
 			return;
@@ -403,10 +393,7 @@ int main(int argc, char **argv)
 					 argc > 1 ? argv[1] : "172.20.102.1",
 					 LIBNET_RESOLVE);
 	sess->dst_prt = argc > 2 ? atoi(argv[2]) : 12345;
-	/* there's probably some great easy portable way of getting the MAC
-	 * address of the host we're going to be using. but since I don't know
-	 * what it is we're going to use our super-fun hacky way. */
-	bzero(sess->src_hw, 6);
+	memcpy(sess->src_hw, libnet_get_hwaddr(sess->lnh), 6);
 	sess->src_ip = libnet_name2addr4(sess->lnh,
 					 argc > 3 ? argv[3] : "172.20.102.9",
 					 LIBNET_RESOLVE);
