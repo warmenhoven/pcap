@@ -30,6 +30,7 @@
 #include <pcap.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <time.h>
 
 char *state_names[] = {
 	"UNKNOWN",
@@ -50,6 +51,14 @@ typedef struct _list {
 	struct _list *next;
 	void *data;
 } list;
+
+typedef void (*tmr_cbf)(void *);
+
+typedef struct _timer {
+	time_t exp;
+	tmr_cbf f;
+	void *data;
+} timer;
 
 struct tcp_session {
 	uint32_t id;	/* heh. a more appropriate name might be 'fd'. */
@@ -83,6 +92,7 @@ struct tcp_session {
 unsigned char src_hw[6];
 uint32_t src_ip;
 list *sessions;
+list *timers;
 uint32_t next_id = 0;
 int sp[2];
 
