@@ -515,7 +515,7 @@ remove_session(TCB *sess)
 }
 
 static void
-state_machine(TCB *sess, struct tcp_pkt *pkt)
+tcp_state_machine(TCB *sess, struct tcp_pkt *pkt)
 {
 	/* here we can assume that the pkt is part of the session and for us */
 
@@ -739,13 +739,11 @@ process_tcp_packet(u_char *pkt)
 		return;
 	}
 
-	if (tcp->offset << 2 != sizeof (struct tcp_pkt) - sizeof (struct ip_pkt)) {
-		/* XXX we don't do tcp options */
-		fprintf(stderr, "unsupported TCP options\n");
+	if (tcp->offset << 2 < sizeof (struct tcp_pkt) - sizeof (struct ip_pkt)) {
+		fprintf(stderr, "invalid TCP header!\n");
 		return;
 	}
 
-	/* maybe we should move this check to state_machine. */
 	if (!(sess = find_session(tcp->ip.src_ip, ntohs(tcp->src_prt),
 							  ntohs(tcp->dst_prt)))) {
 		send_rst(tcp->ip.src_ip, ntohs(tcp->src_prt),
@@ -755,8 +753,7 @@ process_tcp_packet(u_char *pkt)
 	}
 
 	/* this is where the real work is */
-	state_machine(sess, tcp);
-
+	tcp_state_machine(sess, tcp);
 }
 
 static void
