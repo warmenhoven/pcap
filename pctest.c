@@ -314,7 +314,7 @@ session_setup()
 	/* I hear I shouldn't use this function for anything real. oh well. */
 	sess->seqno = libnet_get_prand(LIBNET_PRu32);
 
-	sessions = list_prepend(sessions, sess);
+	sessions = list_append(sessions, sess);
 	/* this is technically wrong but I doubt next_id will ever wrap (unless
 	 * if you're doing mean things to this poor little program) */
 	sess->id = next_id++;
@@ -640,13 +640,14 @@ process_input()
 			struct tcp_session *sess = l->data;
 
 			if (sess->id == id) {
-				/* XXX we should check the state of the session
-				 * first. this might be the wrong thing to do
-				 * at this point. */
-				send_tcp(sess, TH_FIN | TH_ACK);
-				sess->seqno++;
-				sess->state = FIN_WAIT_1;
-				printf("FIN_WAIT_1\n");
+				if (sess->state == LISTEN) {
+					remove_session(sess);
+				} else {
+					send_tcp(sess, TH_FIN | TH_ACK);
+					sess->seqno++;
+					sess->state = FIN_WAIT_1;
+					printf("FIN_WAIT_1\n");
+				}
 				break;
 			}
 
@@ -654,6 +655,17 @@ process_input()
 		}
 		if (!l)
 			printf("couldn't find %d\n", id);
+	} else if (!strcasecmp(buf, "netstat")) {
+		list *l = sessions;
+
+		while (l) {
+			struct tcp_session *sess = l->data;
+			l = l->next;
+
+			printf("port %d with %x:%d id %d\n",
+			       sess->src_prt, ntohl(sess->dst_prt),
+			       sess->dst_prt, sess->id);
+		}
 	} else if (!strcasecmp(buf, "quit")) {
 		/* XXX should send RST to all the sessions */
 		exit(0);
