@@ -32,7 +32,7 @@
 #include <stdio.h>
 #include <time.h>
 
-char *state_names[] = {
+const char *state_names[] = {
 	"UNKNOWN",
 	"ESTABLISHED",
 	"SYN_SENT",
@@ -77,8 +77,8 @@ struct tcp_session {
 	 * byte order, so when comparing against what comes off the wire, make
 	 * sure to do a proper translation */
 	uint16_t src_prt;
-	uint32_t dst_ip;
 	uint16_t dst_prt;
+	uint32_t dst_ip;
 
 	/* these are stored in host byte order mostly by default */
 	uint32_t seqno;
@@ -180,7 +180,7 @@ static void list_free(list *);
 */
 
 static pcap_t *
-init_pcap()
+init_pcap(void)
 {
 	char errbuf[PCAP_ERRBUF_SIZE];
 	char *dev;
@@ -328,7 +328,7 @@ get_port(uint32_t dst_ip, uint16_t dst_prt)
 }
 
 static struct tcp_session *
-session_setup()
+session_setup(void)
 {
 	struct tcp_session *sess = calloc(1, sizeof (struct tcp_session));
 	char errbuf[LIBNET_ERRBUF_SIZE];
@@ -361,7 +361,7 @@ session_setup()
 /* maybe eventually there will be a third argument, so you can specify the port
  * to connect from */
 static struct tcp_session *
-create_session(unsigned char *host, uint16_t port)
+create_session(char *host, uint16_t port)
 {
 	struct tcp_session *sess = session_setup();
 
@@ -375,7 +375,7 @@ create_session(unsigned char *host, uint16_t port)
 		 * packets out over the wire */
 		sess->dst_ip = libnet_name2addr4(sess->lnh, host,
 						 LIBNET_RESOLVE);
-		if (sess->dst_ip == -1) {
+		if (sess->dst_ip == 0xffffffff) {
 			fprintf(stderr, "%s\n", libnet_geterror(sess->lnh));
 			free(sess);
 			return NULL;
@@ -503,6 +503,10 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 			sess->seqno++;
 			sess->state = TCP_LAST_ACK;
 			printf("%s\n", state_names[sess->state]);
+		} else if (pkt->control & TH_PUSH) {
+			if (pkt->control & TH_ACK) {
+			} else {
+			}
 		}
 		/* XXX there are more cases of things to do here */
 		break;
@@ -593,7 +597,7 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 }
 
 static void
-process_packet()
+process_packet(void)
 {
 	struct pcap_pkthdr hdr;
 	u_char *pkt;
@@ -609,7 +613,11 @@ process_packet()
 	if (read(sp[1], &hdr, sizeof (hdr)) != sizeof (hdr))
 		return;
 	pkt = malloc(hdr.len + (hdr.len % 1));
-	if (read(sp[1], pkt, hdr.len) != hdr.len) {
+	if ((len = read(sp[1], pkt, hdr.len)) < 0) {
+		free(pkt);
+		return;
+	}
+	if ((unsigned int)len != hdr.len) {
 		free(pkt);
 		return;
 	}
@@ -668,7 +676,7 @@ process_packet()
 }
 
 static void
-process_input()
+process_input(void)
 {
 	char buf[80];
 	fgets(buf, sizeof(buf), stdin);
@@ -682,14 +690,14 @@ process_input()
 			return;
 		*arg2++ = 0;
 
-		create_session((unsigned char *)arg1, atoi(arg2));
+		create_session(arg1, atoi(arg2));
 	} else if (!strncasecmp(buf, "listen ", strlen("listen "))) {
 		/* we should make sure that the port isn't already in use
 		 * (unless the user specifies SO_REUSEADDR) */
 		create_session(NULL, atoi(buf + strlen("listen ")));
 	} else if (!strncasecmp(buf, "close ", strlen("close "))) {
 		list *l = sessions;
-		int id = atoi(buf + strlen("close "));
+		unsigned int id = atoi(buf + strlen("close "));
 
 		while (l) {
 			struct tcp_session *sess = l->data;
@@ -753,7 +761,7 @@ control_main(void *arg)
 
 /* TODO: convince the host we're running on that it can safely ignore us */
 static int
-arp_reply(unsigned char hw[6], uint32_t ip)
+arp_reply(const unsigned char hw[6], uint32_t ip)
 {
 	/* we probably could make this handle static so that we don't have to
 	 * rebuild it too many times, but hopefully we should only need to
@@ -798,9 +806,9 @@ packet_main(u_char *user, const struct pcap_pkthdr *hdr, const u_char *pkt)
 	 * here and some of them should be in process_packet and some should be
 	 * in state_machine. (and some of them should be in the host and in
 	 * pcap, so this might not be necessary.)*/
-	struct enet *enet = (struct enet *)pkt;
+	const struct enet *enet = (const struct enet *)pkt;
 	if (ntohs(enet->type) == ETHERTYPE_IP) {
-		struct ip_pkt *ip = (struct ip_pkt *)pkt;
+		const struct ip_pkt *ip = (const struct ip_pkt *)pkt;
 
 		/* if it's not for us, we ignore it */
 		if (ip->dst_ip != src_ip)
@@ -814,7 +822,7 @@ packet_main(u_char *user, const struct pcap_pkthdr *hdr, const u_char *pkt)
 		 * address of the host, so if we get an arp from the host about
 		 * our client, we need to just ignore it. the host should deal
 		 * with this gracefully. (there has to be a better way.) */
-		struct arp *arp = (struct arp *)pkt;
+		const struct arp *arp = (const struct arp *)pkt;
 		if ((ntohs(arp->hrd) == ARPHRD_ETHER) &&	/* ethernet*/
 		    (ntohs(arp->pro) == ETHERTYPE_IP) &&	/* ipv4 */
 		    (ntohs(arp->op) == ARPOP_REQUEST) &&	/* request */
@@ -857,7 +865,7 @@ main(int argc, char **argv)
 	 * that address, then you shouldn't have to worry about any of that.
 	 * but then you'll have to modify this client to handle all the routing
 	 * details itself, and that's not fun. */
-	src_ip = libnet_name2addr4(lnh, (unsigned char *)
+	src_ip = libnet_name2addr4(lnh,
 				   (argc > 1 ? argv[1] : "172.20.102.9"),
 				   LIBNET_RESOLVE);
 	libnet_destroy(lnh);
