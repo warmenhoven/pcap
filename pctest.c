@@ -4,19 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* this should be session stuff */
-static unsigned char src_hw[6], dst_hw[6];
-static uint32_t src_ip, dst_ip;
-static uint16_t src_prt, dst_prt;
-static uint32_t seqno;
-/* should also have ackno */
-
-/* this is global pcap stuff */
-static char *dev;
-static pcap_t *lph;
-
-/* this will be useful when sessions are implemented */
-enum tcp_states {
+enum tcp_state {
 	CLOSED,
 	LISTEN,
 	SYN_RCVD,
@@ -29,6 +17,24 @@ enum tcp_states {
 	CLOSE_WAIT,
 	LAST_ACK
 };
+
+struct tcp_session {
+	enum tcp_state state;
+
+	unsigned char src_hw[6];
+	uint32_t src_ip;
+	uint16_t src_prt;
+
+	uint32_t dst_ip;
+	uint16_t dst_prt;
+
+	uint32_t seqno;
+	uint32_t ackno;
+};
+
+/* this is global stuff */
+static char *dev;
+static pcap_t *lph;
 
 /* i'm sure i didn't need to do this */
 struct enet {
@@ -92,14 +98,14 @@ int init_pcap()
 }
 
 /* global */
-int init_filter()
+int init_filter(struct tcp_session *sess)
 {
 	char errbuf[PCAP_ERRBUF_SIZE];
 	bpf_u_int32 net;
 	bpf_u_int32 mask;
 	char *filter_line = malloc(4 + 3 + 5 + 6);
 	struct bpf_program filter;
-	sprintf(filter_line, "arp or port %d", src_prt);
+	sprintf(filter_line, "arp or port %d", sess->src_prt);
 
 	if (pcap_lookupnet(dev, &net, &mask, errbuf) == -1) {
 		fprintf(stderr, "%s\n", errbuf);
@@ -121,8 +127,7 @@ int init_filter()
 	return 0;
 }
 
-/* utility; should pass args */
-int send_syn()
+int send_syn(struct tcp_session *sess)
 {
 	char errbuf[LIBNET_ERRBUF_SIZE];
 	static libnet_t *lnh;
@@ -132,13 +137,15 @@ int send_syn()
 		return 1;
 	}
 
-	if (libnet_build_tcp(src_prt, dst_prt, seqno++, 0, TH_SYN, 32767,
-			     0, 0, LIBNET_TCP_H, NULL, 0, lnh, 0) == -1) {
+	if (libnet_build_tcp(sess->src_prt, sess->dst_prt, sess->seqno++, 0,
+			     TH_SYN, 32767, 0, 0, LIBNET_TCP_H, NULL, 0,
+			     lnh, 0) == -1) {
 		fprintf(stderr, "%s\n", libnet_geterror(lnh));
 		return 1;
 	}
-	if (libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_TCP_H, 0, 242, 0, 64, IPPROTO_TCP,
-			      0, src_ip, dst_ip, NULL, 0, lnh, 0) == -1) {
+	if (libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_TCP_H, 0, 242, 0, 64,
+			      IPPROTO_TCP, 0, sess->src_ip, sess->dst_ip,
+			      NULL, 0, lnh, 0) == -1) {
 		fprintf(stderr, "%s\n", libnet_geterror(lnh));
 		return 1;
 	}
@@ -152,8 +159,7 @@ int send_syn()
 	return 0;
 }
 
-/* utility; should pass args */
-int send_ack(uint32_t ackno)
+int send_ack(struct tcp_session *sess)
 {
 	char errbuf[LIBNET_ERRBUF_SIZE];
 	static libnet_t *lnh;
@@ -163,13 +169,15 @@ int send_ack(uint32_t ackno)
 		return 1;
 	}
 
-	if (libnet_build_tcp(src_prt, dst_prt, seqno++, ackno, TH_ACK, 32767,
-			     0, 0, LIBNET_TCP_H, NULL, 0, lnh, 0) == -1) {
+	if (libnet_build_tcp(sess->src_prt, sess->dst_prt, sess->seqno++,
+			     sess->ackno, TH_ACK, 32767, 0, 0, LIBNET_TCP_H,
+			     NULL, 0, lnh, 0) == -1) {
 		fprintf(stderr, "%s\n", libnet_geterror(lnh));
 		return 1;
 	}
-	if (libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_TCP_H, 0, 242, 0, 64, IPPROTO_TCP,
-			      0, src_ip, dst_ip, NULL, 0, lnh, 0) == -1) {
+	if (libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_TCP_H, 0, 242, 0, 64,
+			      IPPROTO_TCP, 0, sess->src_ip, sess->dst_ip,
+			      NULL, 0, lnh, 0) == -1) {
 		fprintf(stderr, "%s\n", libnet_geterror(lnh));
 		return 1;
 	}
@@ -185,7 +193,7 @@ int send_ack(uint32_t ackno)
 
 /* should deal with this more intelligently */
 /* XXX convince the host we're running on that it can safely ignore us */
-int arp_reply(unsigned char hw[6], uint32_t ip)
+int arp_reply(struct tcp_session *sess, unsigned char hw[6], uint32_t ip)
 {
 	char errbuf[PCAP_ERRBUF_SIZE];
 	libnet_t *lnh;
@@ -195,8 +203,9 @@ int arp_reply(unsigned char hw[6], uint32_t ip)
 		return 1;
 	}
 
-	if (libnet_build_arp(ARPHRD_ETHER, ETHERTYPE_IP, 6, 4, ARPOP_REPLY, src_hw,
-			     (u_char *)&src_ip, hw, (u_char *)&ip, NULL, 0, lnh, 0) == -1) {
+	if (libnet_build_arp(ARPHRD_ETHER, ETHERTYPE_IP, 6, 4, ARPOP_REPLY,
+			     sess->src_hw, (u_char *)&sess->src_ip, hw,
+			     (u_char *)&ip, NULL, 0, lnh, 0) == -1) {
 		fprintf(stderr, "%s\n", libnet_geterror(lnh));
 		return 1;
 	}
@@ -217,29 +226,52 @@ int arp_reply(unsigned char hw[6], uint32_t ip)
 /* main cb function. this needs to get rewritten. desperately. */
 void packet_cb(u_char *user, const struct pcap_pkthdr *hdr, const u_char *pkt)
 {
+	struct tcp_session *sess = (struct tcp_session *)user;
 	struct enet *enet = (struct enet *)pkt;
 	if (ntohs(enet->type) == ETHERTYPE_IP) {
 		struct ip_pkt *ip = (struct ip_pkt *)pkt;
 		struct tcp_pkt *tcp = (struct tcp_pkt *)pkt;
-		if (ip->src_ip == src_ip && ip->dst_ip == dst_ip && !src_hw[0]) {
-			memcpy(src_hw, enet->src_hw, 6);
-			memcpy(dst_hw, enet->dst_hw, 6);
+
+		/* this is a hack. if we don't already know the MAC address
+		 * we're faking, then we use our syn packet (which pcap should
+		 * pick up since we install the filter before sending the syn)
+		 * to get our MAC address. there are better ways but not many
+		 * of them are as portable or as easy */
+		if (!sess->src_hw[0] && !sess->src_hw[1] &&
+		    ip->src_ip == sess->src_ip && ip->dst_ip == sess->dst_ip) {
+			memcpy(sess->src_hw, enet->src_hw, 6);
 		}
 
+		/* we only deal with TCP */
 		if (ip->protocol != IPPROTO_TCP)
 			return;
-		if (ip->src_ip != dst_ip || ip->dst_ip != src_ip)
+		/* if the packet isn't from this session, and we aren't the
+		 * receiver, ignore it */
+		if (ip->src_ip != sess->dst_ip || ip->dst_ip != sess->src_ip)
 			return;
-		if (ntohs(tcp->src_prt) != dst_prt || ntohs(tcp->dst_prt) != src_prt)
+		if (ntohs(tcp->src_prt) != sess->dst_prt ||
+		    ntohs(tcp->dst_prt) != sess->src_prt)
 			return;
 
-		if (tcp->control & TH_SYN && tcp->control & TH_ACK)
-			send_ack(ntohl(tcp->seqno) + 1);
+		/* this is where the real work begins */
+		/* XXX XXX this is just temporary! this needs to be fixed! */
+		if (tcp->control & TH_SYN && tcp->control & TH_ACK) {
+			sess->ackno = ntohl(tcp->seqno) + 1;
+			send_ack(sess);
+		}
 	} else if (ntohs(enet->type) == ETHERTYPE_ARP) {
+		/* since we're "faking" a client, we need to reply to arp
+		 * requests as that client. the problem is, we're using the MAC
+		 * address of the host, so if we get an arp from the host about
+		 * our client, we need to just ignore it. the host should deal
+		 * with this gracefully. */
 		struct arp *arp = (struct arp *)pkt;
-		if ((ntohs(arp->op) == ARPOP_REQUEST) &&
-		    (arp->dst_ip == src_ip) && memcmp(src_hw, arp->src_hw, 6))
-			arp_reply(arp->src_hw, arp->src_ip);
+		if ((ntohs(arp->hrd) == ARPHRD_ETHER) &&	/* ethernet*/
+		    (ntohs(arp->pro) == ETHERTYPE_IP) &&	/* ipv4 */
+		    (ntohs(arp->op) == ARPOP_REQUEST) &&	/* request */
+		    (arp->dst_ip == sess->src_ip) &&		/* for us */
+		    memcmp(sess->src_hw, arp->src_hw, 6))	/* not host */
+			arp_reply(sess, arp->src_hw, arp->src_ip);
 	}
 }
 
@@ -247,27 +279,40 @@ int main(int argc, char **argv)
 {
 	char errbuf[LIBNET_ERRBUF_SIZE];
 	static libnet_t *lnh;
+	struct tcp_session *sess = malloc(sizeof (struct tcp_session));
 
 	if (!(lnh = libnet_init(LIBNET_RAW4, NULL, errbuf))) {
 		fprintf(stderr, "%s\n", errbuf);
 		return 1;
 	}
 
-	init_pcap();
-	seqno = libnet_get_prand(LIBNET_PRu32);
+	if (init_pcap())
+		return 1;
 
-	dst_hw[0] = 0;
-	dst_ip = libnet_name2addr4(lnh, argc > 1 ? argv[1] : "172.20.102.1", LIBNET_RESOLVE);
-	dst_prt = argc > 2 ? atoi(argv[2]) : 80;
-	src_hw[0] = 0;
-	src_ip = libnet_name2addr4(lnh, argc > 3 ? argv[3] : "172.20.102.9", LIBNET_RESOLVE);
-	src_prt = argc > 4 ? atoi(argv[4]) : 12345;
+	/* sess->state = CLOSED; */
+	sess->dst_ip = libnet_name2addr4(lnh,
+					 argc > 1 ? argv[1] : "172.20.102.1",
+					 LIBNET_RESOLVE);
+	sess->dst_prt = argc > 2 ? atoi(argv[2]) : 80;
+	bzero(sess->src_hw, 6);
+	sess->src_ip = libnet_name2addr4(lnh,
+					 argc > 3 ? argv[3] : "172.20.102.9",
+					 LIBNET_RESOLVE);
+	sess->src_prt = argc > 4 ? atoi(argv[4]) : 12345;
+
+	sess->seqno = libnet_get_prand(LIBNET_PRu32);
+	sess->ackno = 0;
 
 	libnet_destroy(lnh);
 
-	init_filter();
-	send_syn();
-	pcap_loop(lph, -1, packet_cb, NULL);
+	if (init_filter(sess))
+		return 1;
+
+	if (send_syn(sess))
+		return 1;
+	sess->state = SYN_SENT;
+
+	pcap_loop(lph, -1, packet_cb, (void *)sess);
 
 	return 0;
 }
