@@ -108,10 +108,7 @@ static int
 timer_cmp(const void *x, const void *y)
 {
 	const struct timer *a = x, *b = y;
-	if (a->end.tv_sec == b->end.tv_sec)
-		return a->end.tv_usec - b->end.tv_usec;
-	else
-		return a->end.tv_sec - b->end.tv_sec;
+	return timercmp(&a->end, &b->end, -);
 }
 
 static struct timer *
