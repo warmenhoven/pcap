@@ -37,15 +37,12 @@ enum tcp_state {
 };
 
 struct tcp_session {
-	pthread_mutex_t lock;
-
 	uint32_t id;	/* heh. a more appropriate name might be 'fd'. */
 
 	enum tcp_state state;
 
 	/* quite honestly each session doesn't need its own socket but it does
-	 * make things simpler (especially since the session's lock then locks
-	 * the socket, so it doesn't need its own lock) */
+	 * make some things simpler */
 	libnet_t *lnh;
 	libnet_ptag_t tcp_id;
 	libnet_ptag_t ip_id;
@@ -68,16 +65,11 @@ struct tcp_session {
 };
 
 /* these are our global variables */
-/* we only emulate one ip address at a time */
 unsigned char src_hw[6];
 uint32_t src_ip;
-/* snslck should be held for as short as possible because every incoming tcp
- * packet needs to be checked against the sessions list. this really should be
- * a read-write lock, since you only change sessions when you add or remove a
- * connection, but you look up sessions on every packet bound for the host. */
-pthread_mutex_t snslck;
 list *sessions;
 uint32_t next_id = 0;
+int sp[2];
 
 /* I'm sure I didn't need to do this */
 struct enet {
@@ -274,28 +266,19 @@ arp_reply(unsigned char hw[6], uint32_t ip)
 }
 
 static struct tcp_session *
-find_session(uint32_t dst_ip, uint32_t dst_prt, uint32_t src_prt, int lock)
+find_session(uint32_t dst_ip, uint32_t dst_prt, uint32_t src_prt)
 {
-	list *l;
-	pthread_mutex_lock(&snslck);
+	list *l = sessions;
 
-	l = sessions;
 	while (l) {
 		struct tcp_session *sess = l->data;
-		pthread_mutex_lock(&sess->lock);
 		if (sess->dst_ip == dst_ip &&
 		    sess->dst_prt == dst_prt &&
-		    sess->src_prt == src_prt) {
-			if (!lock)
-				pthread_mutex_unlock(&sess->lock);
-			pthread_mutex_unlock(&snslck);
+		    sess->src_prt == src_prt)
 			return sess;
-		}
-		pthread_mutex_unlock(&sess->lock);
 		l = l->next;
 	}
 
-	pthread_mutex_unlock(&snslck);
 	return NULL;
 }
 
@@ -307,7 +290,7 @@ get_port(uint32_t dst_ip, uint16_t dst_prt)
 
 	do {
 		src_prt = libnet_get_prand(LIBNET_PRu16);
-	} while (find_session(dst_ip, dst_prt, src_prt, 0));
+	} while (find_session(dst_ip, dst_prt, src_prt));
 
 	return src_prt;
 }
@@ -318,17 +301,10 @@ create_session(char *host, uint16_t port)
 	struct tcp_session *sess = calloc(1, sizeof (struct tcp_session));
 	char errbuf[LIBNET_ERRBUF_SIZE];
 
-	/* initial setup of the tcp session */
-	pthread_mutex_init(&sess->lock, NULL);
-
-	pthread_mutex_lock(&sess->lock);
-
 	/* sess->state = CLOSED; */
 
 	if (!(sess->lnh = libnet_init(LIBNET_RAW4, NULL, errbuf))) {
 		fprintf(stderr, "%s\n", errbuf);
-		pthread_mutex_unlock(&sess->lock);
-		pthread_mutex_destroy(&sess->lock);
 		free(sess);
 		return NULL;
 	}
@@ -340,8 +316,6 @@ create_session(char *host, uint16_t port)
 					 LIBNET_RESOLVE);
 	if (sess->dst_ip == -1) {
 		fprintf(stderr, "%s\n", libnet_geterror(sess->lnh));
-		pthread_mutex_unlock(&sess->lock);
-		pthread_mutex_destroy(&sess->lock);
 		free(sess);
 		return NULL;
 	}
@@ -357,15 +331,11 @@ create_session(char *host, uint16_t port)
 	sess->state = SYN_SENT;
 	printf("SYN_SENT\n");
 
-	pthread_mutex_lock(&snslck);
 	sessions = list_append(sessions, sess);
 	/* this is technically wrong but I doubt next_id will ever wrap (unless
 	 * if you're doing mean things to this poor little program) */
 	sess->id = next_id;
 	printf("created session %d using port %d\n", next_id++, sess->src_prt);
-	pthread_mutex_unlock(&snslck);
-
-	pthread_mutex_unlock(&sess->lock);
 
 	return sess;
 }
@@ -374,11 +344,7 @@ create_session(char *host, uint16_t port)
 static void
 remove_session(struct tcp_session *sess)
 {
-	pthread_mutex_lock(&snslck);
 	sessions = list_remove(sessions, sess);
-	pthread_mutex_unlock(&snslck);
-
-	pthread_mutex_destroy(&sess->lock);
 	libnet_destroy(sess->lnh);
 	free(sess);
 }
@@ -390,8 +356,7 @@ remove_session(struct tcp_session *sess)
 static int
 state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 {
-	/* here we can assume that the pkt is part of the session, we're the
-	 * receiver, and the session is locked. */
+	/* here we can assume that the pkt is part of the session and for us */
 
 	/* XXX none of these things check seqno/ackno. they should. */
 
@@ -530,42 +495,23 @@ state_machine(struct tcp_session *sess, struct tcp_pkt *pkt)
 }
 
 /* 'main' is a misnomer since it's not really a "main" function, it's a
- * callback. pcap sucks. this function needs to get rewritten. desperately. */
+ * callback. pcap sucks. anyway, it can handle arp by itself but anything in ip
+ * needs to be passed to the control thread. */
 static void
 packet_main(u_char *user, const struct pcap_pkthdr *hdr, const u_char *pkt)
 {
+	/* XXX at some point we should be checking packet size so that e.g. the
+	 * IP header really is at least 5 bytes */
 	struct enet *enet = (struct enet *)pkt;
 	if (ntohs(enet->type) == ETHERTYPE_IP) {
 		struct ip_pkt *ip = (struct ip_pkt *)pkt;
-		struct tcp_pkt *tcp = (struct tcp_pkt *)pkt;
-		struct tcp_session *sess;
 
 		/* if it's not for us, we ignore it */
 		if (ip->dst_ip != src_ip)
 			return;
 
-		/* XXX we only deal with TCP; we should handle ICMP too */
-		if (ip->protocol != IPPROTO_TCP)
-			return;
-
-		/* XXX there are more IP options that we need to deal with.
-		 * until then this program isn't a stack, it's a hack. */
-
-		if (!(sess = find_session(ip->src_ip, ntohs(tcp->src_prt),
-					  ntohs(tcp->dst_prt), 1))) {
-			send_rst(ip->src_ip, ntohs(tcp->src_prt),
-				 ntohs(tcp->dst_prt),
-				 ntohl(tcp->ackno), ntohl(tcp->seqno) + 1);
-			return;
-		}
-
-		/* find_session locks sess for us, to avoid race conditions
-		 * (which don't exist yet, but might, once we do timers) */
-
-		/* this is where the real work is. we don't have to unlock it
-		 * if there's a problem, it'll do that for us. */
-		if (state_machine(sess, tcp))
-			pthread_mutex_unlock(&sess->lock);
+		write(sp[0], hdr, sizeof (struct pcap_pkthdr));
+		write(sp[0], pkt, hdr->len);
 	} else if (ntohs(enet->type) == ETHERTYPE_ARP) {
 		/* since we're "faking" a client, we need to reply to arp
 		 * requests as that client. the problem is, we're using the MAC
@@ -582,69 +528,114 @@ packet_main(u_char *user, const struct pcap_pkthdr *hdr, const u_char *pkt)
 	}
 }
 
-static void *
-control_main(void *arg)
+static void
+process_input()
 {
-	while (1) {
-		char buf[80];
-		fgets(buf, sizeof(buf), stdin);
-		if (buf[strlen(buf) - 1] == '\n')
-			buf[strlen(buf) - 1] = 0;
-		if (!strncasecmp(buf, "connect ", strlen("connect "))) {
-			char *arg1, *arg2;
-			arg1 = buf + strlen("connect ");
-			arg2 = strchr(arg1, ' ');
-			if (!arg2)
-				continue;
-			*arg2++ = 0;
+	char buf[80];
+	fgets(buf, sizeof(buf), stdin);
+	if (buf[strlen(buf) - 1] == '\n')
+		buf[strlen(buf) - 1] = 0;
+	if (!strncasecmp(buf, "connect ", strlen("connect "))) {
+		char *arg1, *arg2;
+		arg1 = buf + strlen("connect ");
+		arg2 = strchr(arg1, ' ');
+		if (!arg2)
+			return;
+		*arg2++ = 0;
 
-			create_session(arg1, atoi(arg2));
-		} else if (!strncasecmp(buf, "listen ", strlen("listen "))) {
-			printf("ha! not yet.\n");
-		} else if (!strncasecmp(buf, "close ", strlen("close "))) {
-			list *l;
-			int id = atoi(buf + strlen("close "));
+		create_session(arg1, atoi(arg2));
+	} else if (!strncasecmp(buf, "listen ", strlen("listen "))) {
+		printf("ha! not yet.\n");
+	} else if (!strncasecmp(buf, "close ", strlen("close "))) {
+		list *l = sessions;
+		int id = atoi(buf + strlen("close "));
 
-			pthread_mutex_lock(&snslck);
-			l = sessions;
-			while (l) {
-				struct tcp_session *sess = l->data;
+		while (l) {
+			struct tcp_session *sess = l->data;
 
-				pthread_mutex_lock(&sess->lock);
-				if (sess->id == id) {
-					/* XXX we should check the state of the
-					 * session first. this might be the
-					 * wrong thing to do at this point. */
-					send_tcp(sess, TH_FIN | TH_ACK);
-					sess->state = FIN_WAIT_1;
-					printf("FIN_WAIT_1\n");
-					pthread_mutex_unlock(&sess->lock);
-					break;
-				}
-				pthread_mutex_unlock(&sess->lock);
-
-				l = l->next;
+			if (sess->id == id) {
+				/* XXX we should check the state of the session
+				 * first. this might be the wrong thing to do
+				 * at this point. */
+				send_tcp(sess, TH_FIN | TH_ACK);
+				sess->state = FIN_WAIT_1;
+				printf("FIN_WAIT_1\n");
+				break;
 			}
-			if (!l)
-				printf("couldn't find %d\n", id);
-			pthread_mutex_unlock(&snslck);
+
+			l = l->next;
 		}
+		if (!l)
+			printf("couldn't find %d\n", id);
 	}
 }
 
-static void *
-timer_main(void *arg)
+static void
+process_packet()
 {
-	/* XXX if this is going to be the timer thread, but the pcap thread is
-	 * also sending packets on behalf of the session, then we need to put
-	 * in a lot of information about the session into the struct so that
-	 * the two threads can always understand exactly what the state of the
-	 * session is. a better idea might be to also have a session thread,
-	 * waiting on a condition, that either the pcap or the timer thread can
-	 * then wake up. */
+	struct pcap_pkthdr hdr;
+	u_char *pkt;
+
+	struct ip_pkt *ip;
+	struct tcp_pkt *tcp;
+	struct tcp_session *sess;
+
+	/* XXX this section needs to be fixed, it assumes too much */
+	if (read(sp[1], &hdr, sizeof (hdr)) != sizeof (hdr))
+		return;
+	pkt = malloc(hdr.len);
+	if (read(sp[1], pkt, hdr.len) != hdr.len) {
+		free(pkt);
+		return;
+	}
+
+	ip = (struct ip_pkt *)pkt;
+
+	/* XXX we only deal with TCP; we should handle ICMP too */
+	if (ip->protocol != IPPROTO_TCP) {
+		free(pkt);
+		return;
+	}
+
+	tcp = (struct tcp_pkt *)pkt;
+
+	/* XXX there are more IP options that we need to deal with. until then
+	 * this program isn't a stack, it's a hack. */
+
+	if (!(sess = find_session(ip->src_ip, ntohs(tcp->src_prt),
+				  ntohs(tcp->dst_prt)))) {
+		send_rst(ip->src_ip, ntohs(tcp->src_prt), ntohs(tcp->dst_prt),
+			 ntohl(tcp->ackno), ntohl(tcp->seqno) + 1);
+		free(pkt);
+		return;
+	}
+
+	/* this is where the real work is */
+	state_machine(sess, tcp);
+
+	free(pkt);
+}
+
+/* this function needs to get rewritten. desperately. */
+static void *
+control_main(void *arg)
+{
+	fd_set set;
+
 	while (1) {
+		FD_ZERO(&set);
+		FD_SET(0, &set);
+		FD_SET(sp[1], &set);
+
 		/* XXX for now we don't do timers */
-		sleep(0xffffffff);
+		if (select(sp[1] + 1, &set, NULL, NULL, NULL) < 0)
+			exit(1);
+
+		if (FD_ISSET(0, &set))
+			process_input();
+
+		if (FD_ISSET(sp[1], &set))
+			process_packet();
 	}
 }
 
@@ -685,27 +676,28 @@ main(int argc, char **argv)
 				   LIBNET_RESOLVE);
 	libnet_destroy(lnh);
 
-	pthread_mutex_init(&snslck, NULL);
-
 	if (!(lph = init_pcap()))
 		return 1;
 
-	/* there are four (well, five) options if you want to have a main loop
-	 * other than pcap_loop:
+	/* there are five (well, actually three) options if you want to have a
+	 * main loop other than pcap_loop:
 	 *
-	 * 1. call pcap_dispatch occasionally
-	 * 2. parse packets from pcap_fileno yourself
-	 * 3. use threads
-	 * 4. fork
-	 * 5. rewrite pcap
+	 * 1. parse packets from pcap_fileno yourself
+	 * 2. rewrite pcap
+	 * 3. call pcap_dispatch occasionally
+	 * 4. use threads
+	 * 5. fork
 	 *
-	 * 2 and 5 are more or less the same thing, and if using pcap is this
-	 * bad, I don't want to think about what hacking pcap is like. 1 isn't
+	 * 1 and 2 are more or less the same thing, and if using pcap is this
+	 * bad, I don't want to think about what hacking pcap is like. 3 isn't
 	 * really an option because it increases the load and you'll miss
-	 * certain things. 4 might be a good option, but I've already chosen 3.
+	 * certain things. there's really no difference between 4 and 5 either,
+	 * as long as the pcap thread (process) isn't processing the packets.
+	 * and since I've never really used threads for anything real before,
+	 * we'll use 3.
 	 *
 	 * I'm evil. */
-	pthread_create(&thread, NULL, timer_main, NULL);
+	socketpair(AF_UNIX, SOCK_STREAM, 0, sp);
 	pthread_create(&thread, NULL, control_main, NULL);
 
 	pcap_loop(lph, -1, packet_main, NULL);
