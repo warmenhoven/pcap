@@ -1,16 +1,22 @@
 CFLAGS += -Wall -O2 -g
 LDLIBS += -lpcap -lnet -lpthread
 
-all: tcp jolt2
+TARGET = pctest
+OBJS = list.o pctest.o
+SRCS = Makefile *.c *.h
 
-tcp: pctest
-	@sudo su -c 'cp $< $@'
-	@sudo su -c 'chown root.adm $@'
-	@sudo su -c 'chmod 4750 $@'
+all: $(TARGET)
 
-pctest: list.o pctest.o
+$(TARGET): $(OBJS)
 
-list.o pctest.o: list.h
+$(OBJS): list.h
 
 clean:
-	rm -f pctest pctest.o tcp jolt2
+	rm -f $(TARGET) $(OBJS) $(TARGET).tgz
+
+dist:
+	rm -f $(TARGET).tgz
+	mkdir -p tmp/$(TARGET)
+	cp $(SRCS) tmp/$(TARGET)
+	cd tmp && tar zcf ../$(TARGET).tgz $(TARGET)
+	rm -rf tmp
