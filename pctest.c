@@ -480,27 +480,30 @@ process_packet()
 
 	ip = (struct ip_pkt *)pkt;
 
-	/* XXX we only deal with TCP; we should handle ICMP too */
-	if (ip->protocol != IPPROTO_TCP) {
-		free(pkt);
-		return;
-	}
-
-	tcp = (struct tcp_pkt *)pkt;
-
 	/* XXX there are more IP options that we need to deal with. until then
 	 * this program isn't a stack, it's a hack. */
 
-	if (!(sess = find_session(ip->src_ip, ntohs(tcp->src_prt),
-				  ntohs(tcp->dst_prt)))) {
-		send_rst(ip->src_ip, ntohs(tcp->src_prt), ntohs(tcp->dst_prt),
-			 ntohl(tcp->ackno), ntohl(tcp->seqno) + 1);
-		free(pkt);
-		return;
-	}
+	switch (ip->protocol) {
+	case IPPROTO_ICMP:
+		/* XXX */
+		break;
+	case IPPROTO_TCP:
+		tcp = (struct tcp_pkt *)pkt;
 
-	/* this is where the real work is */
-	state_machine(sess, tcp);
+		/* maybe we should move this check to state_machine. we'll see
+		 * once we implement listening ports */
+		if (!(sess = find_session(ip->src_ip, ntohs(tcp->src_prt),
+					  ntohs(tcp->dst_prt)))) {
+			send_rst(ip->src_ip, ntohs(tcp->src_prt),
+				 ntohs(tcp->dst_prt), ntohl(tcp->ackno),
+				 ntohl(tcp->seqno) + 1);
+			break;
+		}
+
+		/* this is where the real work is */
+		state_machine(sess, tcp);
+		break;
+	}
 
 	free(pkt);
 }
