@@ -117,14 +117,6 @@ struct ip_pkt {
 	uint32_t dst_ip;
 } __attribute__((packed));
 
-struct icmp_pkt {
-	struct ip_pkt ip;	/* XXX this is wrong. I'll fix it once I start
-				   testing with servers other than Linux. */
-	uint8_t type;
-	uint8_t code;
-	uint16_t csum;
-};
-
 struct tcp_pkt {
 	struct ip_pkt ip;	/* XXX this is wrong. I'll fix it once I start
 				   testing with servers other than Linux. */
@@ -507,27 +499,27 @@ process_packet()
 	/* XXX there are more IP options that we need to deal with. until then
 	 * this program isn't a stack, it's a hack. */
 
-	switch (ip->protocol) {
-	case IPPROTO_ICMP:
-		/* XXX */
-		break;
-	case IPPROTO_TCP:
-		tcp = (struct tcp_pkt *)pkt;
-
-		/* maybe we should move this check to state_machine. we'll see
-		 * once we implement listening ports */
-		if (!(sess = find_session(ip->src_ip, ntohs(tcp->src_prt),
-					  ntohs(tcp->dst_prt)))) {
-			send_rst(ip->src_ip, ntohs(tcp->src_prt),
-				 ntohs(tcp->dst_prt), ntohl(tcp->ackno),
-				 ntohl(tcp->seqno) + 1);
-			break;
-		}
-
-		/* this is where the real work is */
-		state_machine(sess, tcp);
-		break;
+	/* we only deal with TCP, because the host screws up ICMP for us */
+	if (ip->protocol != IPPROTO_TCP) {
+		free(pkt);
+		return;
 	}
+
+	tcp = (struct tcp_pkt *)pkt;
+
+	/* maybe we should move this check to state_machine. we'll see
+	 * once we implement listening ports */
+	if (!(sess = find_session(ip->src_ip, ntohs(tcp->src_prt),
+				  ntohs(tcp->dst_prt)))) {
+		send_rst(ip->src_ip, ntohs(tcp->src_prt),
+			 ntohs(tcp->dst_prt), ntohl(tcp->ackno),
+			 ntohl(tcp->seqno) + 1);
+		free(pkt);
+		return;
+	}
+
+	/* this is where the real work is */
+	state_machine(sess, tcp);
 
 	free(pkt);
 }
@@ -571,6 +563,9 @@ process_input()
 		}
 		if (!l)
 			printf("couldn't find %d\n", id);
+	} else if (!strcasecmp(buf, "quit")) {
+		/* XXX should send RST to all the sessions */
+		exit(0);
 	}
 }
 
