@@ -168,13 +168,13 @@ init_pcap()
 		return NULL;
 	}
 
-	filter_line = malloc(4 + 3 + 5 + (4*4));
+	filter_line = malloc(5 + (4*4));
 	/* libnet_name2addr4 puts src_ip in network byte order, so we don't
 	 * need to do any of that here */
 	sa.s_addr = src_ip;
-	/* we need arp because we're faking a client. otherwise we only need
-	 * the packets for the host we're faking. */
-	sprintf(filter_line, "arp or host %s", inet_ntoa(sa));
+	/* this filter line should give us everything we need (including arp
+	 * requests) */
+	sprintf(filter_line, "host %s", inet_ntoa(sa));
 	pcap_compile(lph, &filter, filter_line, 0, net);
 	free(filter_line);
 
