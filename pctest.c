@@ -300,7 +300,7 @@ find_session(uint32_t dst_ip, uint32_t dst_prt, uint32_t src_prt)
 
 	/* TODO: we should be able to support listening for specific
 	 * hosts (or specific ports) */
-	while (l && !dst_ip && !dst_prt) {
+	while (l) {
 		struct tcp_session *sess = l->data;
 		l = l->next;
 
