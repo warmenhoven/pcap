@@ -594,264 +594,322 @@ remove_session(TCB *sess)
 }
 
 static void
-tcp_state_machine(TCB *sess, struct tcp_pkt *pkt)
+tcp_process_listen(TCB *sess, struct tcp_pkt *pkt)
 {
-	/* here we can assume that the pkt is part of the session and for us */
+	if (pkt->control & TH_RST) {
+		/* we're in a listening state, just drop it */
+	} else if (pkt->control & TH_ACK) {
+		send_rst(pkt->ip.src_ip, ntohs(pkt->src_prt),
+				 ntohs(pkt->dst_prt), ntohl(pkt->ackno),
+				 ntohl(pkt->seqno) + 1,
+				 sess->state, pkt->control);
+	} else if (pkt->control & TH_SYN) {
+		accept_session(sess, pkt);
+		/* it is "perfectly legitimate" to have "connection synchronization
+		 * using data-carrying segments" but we don't handle that here. */
+	} else {
+		/* And I quote:
+		 *
+		 * Any other control or text-bearing segment (not containing SYN)
+		 * must have an ACK and thus would be discarded by the ACK
+		 * processing.  An incoming RST segment could not be valid, since it
+		 * could not have been sent in response to anything sent by this
+		 * incarnation of the connection.  So you are unlikely to get here,
+		 * but if you do, drop the segment, and return. */
+	}
+}
 
-	/* XXX most of these things don't do proper ackno checking. they should. */
-
-	if ((sess->state != TCP_LISTEN) && (sess->state != TCP_SYN_SENT)) {
-		unsigned int len = ntohs(pkt->ip.len) -
-			(pkt->ip.ihl << 2) - (pkt->offset << 2);
-		int acceptable = 0;
-		uint32_t rcvnxt = sess->ackno, segseq = ntohl(pkt->seqno);
-
-		if (len == 0) {
-			if ((rcvnxt <= segseq) &&
-				/* if sess->rcv_win is 0 then the check is if
-				 * pkt->seqno <= sess->ackno, which is acceptable,
-				 * since the above check makes it the same check
-				 * as checking if sess->ackno == pkt->seqno */
-				(segseq <= rcvnxt + sess->rcv_win)) {
-				acceptable = 1;
+static void
+tcp_process_syn_sent(TCB *sess, struct tcp_pkt *pkt)
+{
+	if (pkt->control & TH_ACK) {
+		if (ntohl(pkt->ackno) != sess->seqno) {
+			fprintf(stderr, "Invalid ackno on %d\n", sess->id);
+			if (!(pkt->control & TH_RST)) {
+				send_rst(pkt->ip.src_ip, ntohs(pkt->src_prt),
+						 ntohs(pkt->dst_prt), ntohl(pkt->ackno),
+						 ntohl(pkt->seqno) + 1,
+						 sess->state, pkt->control);
+			} else {
+				remove_session(sess);
 			}
-		} else if (sess->rcv_win != 0) {
-			/* if there's data and our window is 0 then it's unacceptable */
-			if (((rcvnxt <= segseq) && (segseq < rcvnxt + sess->rcv_win)) ||
-				((rcvnxt <= segseq + len - 1) &&
-				 (segseq + len - 1 < rcvnxt + sess->rcv_win))) {
-				acceptable = 1;
-			}
-		}
-
-		if (!acceptable && !(pkt->control & TH_RST)) {
-			/* XXX we don't handle URG data properly */
-			/* XXX we need to be updating sess->unacked from pkt->ackno here */
-			fprintf(stderr, "unacceptable segment size\n");
-			send_tcp(sess, TH_ACK);
 			return;
+		} else {
+			sess->unacked = ntohl(pkt->ackno);
 		}
 	}
 
-	if ((sess->state != TCP_LISTEN) && (pkt->control & TH_RST)) {
+	if (pkt->control & TH_RST) {
 		fprintf(stderr, "Remote host sent RST, closing %d\n", sess->id);
 		remove_session(sess);
 		return;
 	}
 
-	/* XXX none of these things check to see that only the flags they're
-	 * expecting are set. if we're in FIN_WAIT1 and we get SYN/FIN/ACK
-	 * then we'll just remove the session instead of sending RST. this
-	 * probably isn't a big problem. */
-	switch (sess->state) {
-	case TCP_LISTEN:
-		if (pkt->control & TH_RST) {
-			/* we're in a listening state, just drop it */
-		} else if (pkt->control & TH_ACK) {
-			send_rst(pkt->ip.src_ip, ntohs(pkt->src_prt),
-					 ntohs(pkt->dst_prt), ntohl(pkt->ackno),
-					 ntohl(pkt->seqno) + 1,
-					 sess->state, pkt->control);
-		} else if (pkt->control & TH_SYN) {
-			accept_session(sess, pkt);
-			/* it is "perfectly legitimate" to have "connection synchronization
-			 * using data-carrying segments" but we don't handle that here. */
-		} else {
-			/* And I quote:
-			 *
-			 * Any other control or text-bearing segment (not containing SYN)
-			 * must have an ACK and thus would be discarded by the ACK
-			 * processing.  An incoming RST segment could not be valid, since it
-			 * could not have been sent in response to anything sent by this
-			 * incarnation of the connection.  So you are unlikely to get here,
-			 * but if you do, drop the segment, and return. */
-		}
-		break;
+	/* any other packet without SYN set we should just drop */
+	if (!(pkt->control & TH_SYN))
+		return;
 
-	case TCP_SYN_RECV:
-		if (!(pkt->control & TH_ACK))
-			break;
-
-		/* XXX this ackno checking is wrong but tolerable */
-		if (ntohl(pkt->ackno) != sess->seqno) {
-			fprintf(stderr, "Invalid ackno on %d\n", sess->id);
-			send_rst(pkt->ip.src_ip, ntohs(pkt->src_prt),
-					 ntohs(pkt->dst_prt), ntohl(pkt->ackno),
-					 ntohl(pkt->seqno) + 1,
-					 sess->state, pkt->control);
-			remove_session(sess);
-			return;
-		}
-
-		sess->ackno = ntohl(pkt->seqno) + 1;
+	sess->ackno = ntohl(pkt->seqno) + 1;
+	if (sess->unacked == sess->seqno) {
 		sess->state = TCP_ESTABLISHED;
+		send_tcp(sess, TH_ACK);
+	} else {
+		sess->state = TCP_SYN_RECV;
+		/* we're resending our initial syn, so we have to decrement the
+		 * seqno to get at our initial seqno for the syn */
+		sess->seqno--;
+		send_tcp(sess, TH_SYN | TH_ACK);
+		sess->seqno++;
+	}
+	printf("%u: %s\n", sess->id, state_names[sess->state]);
+}
+
+static int
+tcp_check_seqno(TCB *sess, struct tcp_pkt *pkt)
+{
+	unsigned int len = ntohs(pkt->ip.len) -
+		(pkt->ip.ihl << 2) - (pkt->offset << 2);
+	uint32_t rcvnxt = sess->ackno, segseq = ntohl(pkt->seqno);
+
+	/* XXX we don't deal correctly with seqno wrap-around */
+
+	if (len == 0) {
+		if ((rcvnxt <= segseq) &&
+			/* if sess->rcv_win is 0 then the check is if
+			 * pkt->seqno <= sess->ackno, which is acceptable,
+			 * since the above check makes it the same check
+			 * as checking if sess->ackno == pkt->seqno */
+			(segseq <= rcvnxt + sess->rcv_win)) {
+			return 0;
+		}
+	} else if (sess->rcv_win != 0) {
+		/* if there's data and our window is 0 then it's unacceptable */
+		if (((rcvnxt <= segseq) && (segseq < rcvnxt + sess->rcv_win)) ||
+			((rcvnxt <= segseq + len - 1) &&
+			 (segseq + len - 1 < rcvnxt + sess->rcv_win))) {
+			return 0;
+		}
+	}
+	return 1;
+}
+
+static int
+tcp_process_syn_recv(TCB *sess, struct tcp_pkt *pkt)
+{
+	if (sess->unacked > ntohl(pkt->ackno) ||
+		ntohl(pkt->ackno) > sess->seqno) {
+		fprintf(stderr, "Invalid ackno on %d\n", sess->id);
+		send_rst(pkt->ip.src_ip, ntohs(pkt->src_prt),
+				 ntohs(pkt->dst_prt), ntohl(pkt->ackno),
+				 ntohl(pkt->seqno) + 1,
+				 sess->state, pkt->control);
+		remove_session(sess);
+		return 1;
+	}
+
+	sess->ackno++;
+	sess->state = TCP_ESTABLISHED;
+	printf("%u: %s\n", sess->id, state_names[sess->state]);
+	/* and continue procesing */
+	return 0;
+}
+
+static void
+tcp_process_last_ack(TCB *sess, struct tcp_pkt *pkt)
+{
+	if (ntohl(pkt->ackno) == sess->seqno) {
+		/* now we can remove the session */
+		sess->state = TCP_CLOSE;
 		printf("%u: %s\n", sess->id, state_names[sess->state]);
-		break;
+		remove_session(sess);
+	} else if (ntohl(pkt->ackno) > sess->seqno) {
+		/* they're acking more than we've sent? anyway, resend FIN (which means
+		 * decrement seqno before sending since it's sort of a retransmit) */
+		sess->seqno--;
+		send_tcp(sess, TH_FIN | TH_ACK);
+		sess->seqno++;
+	}
+}
 
-	case TCP_SYN_SENT:
-		if (pkt->control & TH_ACK) {
-			if (ntohl(pkt->ackno) != sess->seqno) {
-				fprintf(stderr, "Invalid ackno\n");
-				send_rst(pkt->ip.src_ip, ntohs(pkt->src_prt),
-						 ntohs(pkt->dst_prt), ntohl(pkt->ackno),
-						 ntohl(pkt->seqno) + 1,
-						 sess->state, pkt->control);
-				remove_session(sess);
-				return;
-			} else {
-				sess->unacked = ntohl(pkt->ackno);
-			}
-		}
+static int
+tcp_check_ackno(TCB *sess, struct tcp_pkt *pkt)
+{
+	uint32_t snduna = sess->unacked,
+			 segack = ntohl(pkt->ackno),
+			 sndnxt = sess->seqno;
 
-		/* RST should have already been checked; any other packet without SYN
-		 * set we should just drop */
-		if (!(pkt->control & TH_SYN))
-			break;
+	if ((snduna <= segack) && (segack <= sess->seqno)) {
+		sess->unacked = segack;
+		/* XXX "the send window should be updated" */
+	} else if (segack < snduna) {
+		/* the ACK is a duplicate and can be ignored */
+		fprintf(stderr, "duplicate ack on %d\n", sess->id);
+		return 1;
+	} else {
+		/* the ACK acks something not yet sent */
+		fprintf(stderr, "ack for something not set on %d (%u %u)\n", sess->id,
+				segack, sndnxt);
+		send_tcp(sess, TH_ACK);
+		return 1;
+	}
 
-		sess->ackno = ntohl(pkt->seqno) + 1;
-		if (sess->unacked == sess->seqno) {
-			sess->state = TCP_ESTABLISHED;
-			send_tcp(sess, TH_ACK);
-		} else {
-			sess->state = TCP_SYN_RECV;
-			/* we're resending our initial syn, so we have to decrement the
-			 * seqno to get at our initial seqno for the syn */
-			sess->seqno--;
-			send_tcp(sess, TH_SYN | TH_ACK);
-			sess->seqno++;
-		}
-		printf("%u: %s\n", sess->id, state_names[sess->state]);
-		break;
-
-	case TCP_ESTABLISHED:
-		if (pkt->control & TH_FIN) {
-			/* the other side wants to shut down the connection */
-			sess->ackno = ntohl(pkt->seqno) + 1;
-			/* we send both the FIN and the ACK together, and move
-			 * right through CLOSE_WAIT to LAST_ACK */
-			send_tcp(sess, TH_FIN | TH_ACK);
-			sess->seqno++;
-			sess->state = TCP_LAST_ACK;
-			printf("%u: %s\n", sess->id, state_names[sess->state]);
-		}
-		/* XXX there are more cases of things to do here */
-		{
-			unsigned int len = ntohs(pkt->ip.len) -
-				(pkt->ip.ihl << 2) -
-				(pkt->offset << 2);
-			unsigned char *ptr = ((unsigned char *)&pkt->src_prt) +
-				(pkt->offset << 2);
-			unsigned int i;
-
-			printf("read %u: %u bytes\n", sess->id, len);
-
-			for (i = 0; i < len; i++) {
-				printf("%02x ", ptr[i]);
-				if (i && (i + 1) % 16 == 0)
-					printf("\n");
-			}
-			printf("\n");
-			for (i = 0; i < len; i++) {
-				printf("%c ", ptr[i]);
-				if (i && (i + 1) % 16 == 0)
-					printf("\n");
-			}
-			printf("\n");
-			sess->ackno += len;
-			send_tcp(sess, TH_ACK);
-		}
-		break;
-
-	case TCP_FIN_WAIT1:
-		/* we sent the initial FIN */
-		/* XXX there could still be data here that we would need to process */
-		if ((pkt->control & TH_ACK) && (pkt->control & TH_FIN)) {
-			sess->ackno = ntohl(pkt->seqno) + 1;
-			send_tcp(sess, TH_ACK);
-			sess->state = TCP_TIME_WAIT;
-			printf("%u: %s\n", sess->id, state_names[sess->state]);
-			/* we should move to TIME_WAIT in case if the other
-			 * side doesn't receive our ACK, but we just assume
-			 * everything went well */
-			remove_session(sess);
-			break;
-		}
-
-		if (pkt->control & TH_FIN) {
-			/* ACK the FIN, wait for our ACK */
-			sess->ackno = ntohl(pkt->seqno) + 1;
-			send_tcp(sess, TH_ACK);
-			sess->state = TCP_CLOSING;
-			printf("%u: %s\n", sess->id, state_names[sess->state]);
-			/* just like TIME_WAIT, we should move to CLOSING, but
-			 * we just assume everything went well */
-			remove_session(sess);
-			break;
-		}
-
-		if (pkt->control & TH_ACK) {
-			/* we've got the ACK, now we're waiting for the FIN */
+	if (sess->unacked == sess->seqno) {
+		if (sess->state == TCP_FIN_WAIT1) {
+			/* the FIN has been acked, we can move to FIN-WAIT-2 */
 			sess->state = TCP_FIN_WAIT2;
 			printf("%u: %s\n", sess->id, state_names[sess->state]);
-			break;
-		}
-
-		/* we didn't get ACK or FIN, so we RST */
-		send_rst(pkt->ip.src_ip, ntohs(pkt->src_prt),
-				 ntohs(pkt->dst_prt), ntohl(pkt->ackno),
-				 ntohl(pkt->seqno) + 1, sess->state, pkt->control);
-		remove_session(sess);
-		break;
-
-	case TCP_FIN_WAIT2:
-		if (pkt->control & TH_FIN) {
-			/* we've got the FIN, send the ACK and we're done */
-			sess->ackno = ntohl(pkt->seqno) + 1;
-			send_tcp(sess, TH_ACK);
+		} else if (sess->state == TCP_CLOSING) {
+			/* the FIN has been acked, we can move to TIME-WAIT. but we don't
+			 * move to TIME-WAIT, we simply delete the TCB and go straight to
+			 * CLOSED without the 2 MSL delay */
 			sess->state = TCP_TIME_WAIT;
 			printf("%u: %s\n", sess->id, state_names[sess->state]);
-			/* just like above, we should move to TIME_WAIT, but
-			 * we just assume everything went well */
 			remove_session(sess);
-			break;
+			return 1;
 		}
+	}
 
-		/* we're waiting for FIN but didn't get it, so RST */
+	return 0;
+}
+
+static void
+tcp_handle_data(TCB *sess, struct tcp_pkt *pkt)
+{
+	unsigned int len = ntohs(pkt->ip.len) -
+		(pkt->ip.ihl << 2) - (pkt->offset << 2);
+	unsigned char *ptr = ((unsigned char *)&pkt->src_prt) +
+		(pkt->offset << 2);
+	unsigned int i;
+
+	if (len == 0)
+		return;
+
+	printf("read %u: %u bytes\n", sess->id, len);
+
+	for (i = 0; i < len; i++) {
+		printf("%02x ", ptr[i]);
+		if (i && (i + 1) % 16 == 0)
+			printf("\n");
+	}
+	printf("\n");
+	for (i = 0; i < len; i++) {
+		printf(" %c ", ptr[i]);
+		if (i && (i + 1) % 16 == 0)
+			printf("\n");
+	}
+	printf("\n");
+
+	/* XXX this is wrong */
+	sess->ackno += len;
+	send_tcp(sess, TH_ACK);
+}
+
+static void
+tcp_handle_fin(TCB *sess, struct tcp_pkt *pkt)
+{
+	sess->ackno++;
+
+	if ((sess->state == TCP_SYN_RECV) || (sess->state == TCP_ESTABLISHED)) {
+		send_tcp(sess, TH_FIN | TH_ACK);
+		sess->seqno++;
+		/* we send both the FIN and the ACK together, and move
+		 * right through CLOSE_WAIT to LAST_ACK */
+		sess->state = TCP_LAST_ACK;
+		printf("%u: %s\n", sess->id, state_names[sess->state]);
+	} else if (sess->state == TCP_FIN_WAIT1) {
+		/* ACK the FIN, wait for our ACK */
+		send_tcp(sess, TH_ACK);
+		sess->state = TCP_CLOSING;
+		printf("%u: %s\n", sess->id, state_names[sess->state]);
+	} else if (sess->state == TCP_FIN_WAIT2) {
+		/* we've got the FIN, send the ACK and we're done */
+		sess->ackno = ntohl(pkt->seqno) + 1;
+		send_tcp(sess, TH_ACK);
+		sess->state = TCP_TIME_WAIT;
+		printf("%u: %s\n", sess->id, state_names[sess->state]);
+		/* just like above, we should move to TIME_WAIT, but
+		 * we just assume everything went well */
+		remove_session(sess);
+	} else {
+		/* anyone else just stays in their state. TIME-WAIT, if it were
+		 * possible for us, would restart the 2 MSL time-wait timeout. */
+	}
+}
+
+static void
+tcp_state_machine(TCB *sess, struct tcp_pkt *pkt)
+{
+	/* here we can assume that the pkt is part of the session and for us */
+
+	/* XXX none of these things check security, precedence, or URG */
+
+	if (sess->state == TCP_LISTEN) {
+		tcp_process_listen(sess, pkt);
+		return;
+	}
+
+	if (sess->state == TCP_SYN_SENT) {
+		tcp_process_syn_sent(sess, pkt);
+		/* it is "perfectly legitimate" to have "connection synchronization
+		 * using data-carrying segments" but we don't handle that here. */
+		return;
+	}
+
+	/* at this point the state is not CLOSED, LISTEN, or SYN_SENT. also we can't
+	 * be in the CLOSE_WAIT state because we send the FIN with the ACK. also we
+	 * won't be in the TIME_WAIT state because we assume the other side received
+	 * our last ACK. even if it didn't, we'll be in LISTEN or CLOSED, and it
+	 * will get a RST, which is probably not what's expected, but should work
+	 * just as well. */
+
+	if (pkt->control & TH_RST) {
+		fprintf(stderr, "Remote host sent RST, closing %d\n", sess->id);
+		remove_session(sess);
+		return;
+	}
+
+	if (tcp_check_seqno(sess, pkt)) {
+		/* XXX should we be updating sess->unacked from pkt->ackno here? */
+		fprintf(stderr, "unacceptable segment size on %d\n", sess->id);
+		send_tcp(sess, TH_ACK);
+		return;
+	}
+
+	if (pkt->control & TH_SYN) {
+		fprintf(stderr, "SYN on %d\n", sess->id);
 		send_rst(pkt->ip.src_ip, ntohs(pkt->src_prt),
 				 ntohs(pkt->dst_prt), ntohl(pkt->ackno),
-				 ntohl(pkt->seqno) + 1, sess->state, pkt->control);
+				 ntohl(pkt->seqno) + 1,
+				 sess->state, pkt->control);
 		remove_session(sess);
-		break;
-
-	case TCP_CLOSING:
-		/* we never get here because we just assume everything went
-		 * fine, and remove the sess before waiting for our ACK */
-		break;
-
-	case TCP_TIME_WAIT:
-		/* we never get here because we just assume everything went
-		 * fine, and remove the sess before waiting for our ACK */
-		break;
-
-	case TCP_CLOSE_WAIT:
-		/* we never get here because we send the FIN with the ACK */
-		break;
-
-	case TCP_LAST_ACK:
-		if (pkt->control & TH_ACK) {
-			/* now we can remove the session */
-			sess->state = TCP_CLOSE;
-			printf("%u: %s\n", sess->id, state_names[sess->state]);
-			remove_session(sess);
-		} else {
-			send_rst(pkt->ip.src_ip, ntohs(pkt->src_prt),
-					 ntohs(pkt->dst_prt), ntohl(pkt->ackno),
-					 ntohl(pkt->seqno) + 1,
-					 sess->state, pkt->control);
-			remove_session(sess);
-		}
-		break;
+		return;
 	}
+
+	if (!(pkt->control & TH_ACK)) {
+		/* "if the ACK bit is off drop the segment and return" */
+		return;
+	}
+
+	if (sess->state == TCP_SYN_RECV) {
+		if (tcp_process_syn_recv(sess, pkt))
+			return;
+	}
+
+	if (sess->state == TCP_LAST_ACK) {
+		tcp_process_last_ack(sess, pkt);
+		return;
+	}
+
+	/* at this point we're either ESTABLISHED, FIN_WAIT (1 or 2), or CLOSING.
+	 * all of these "Do the same processing as for the ESTABLISHED state" before
+	 * doing their own thing */
+	if (tcp_check_ackno(sess, pkt))
+		return;
+
+	tcp_handle_data(sess, pkt);
+
+	if (pkt->control & TH_FIN)
+		tcp_handle_fin(sess, pkt);
 }
 
 static void
