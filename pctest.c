@@ -18,6 +18,21 @@
  *     I'm able to exchange data then I'll get 1 more point in the Lightweight
  *     Division, 2 more points in the Middleweight Division, and the remainder
  *     of the 5 points here)
+ *
+ * TODO:
+ *   - Support IP options
+ *   - Support TCP options
+ *   - Better initial seqno generation
+ *   - Grow/shrink windows
+ *   - Support user write()
+ *   - Support loopback (talking to self without gateway)
+ *   - Handle data in inital SYN
+ *   - Handle seqno wrap-around
+ *   - Deal with lost data
+ *   - Support security
+ *   - Support precedence
+ *   - Support URG data
+ *   - Support IP fragments
  */
 
 #include <libnet.h>
@@ -605,7 +620,7 @@ tcp_process_listen(TCB *sess, struct tcp_pkt *pkt)
 				 sess->state, pkt->control);
 	} else if (pkt->control & TH_SYN) {
 		accept_session(sess, pkt);
-		/* it is "perfectly legitimate" to have "connection synchronization
+		/* XXX it is "perfectly legitimate" to have "connection synchronization
 		 * using data-carrying segments" but we don't handle that here. */
 	} else {
 		/* And I quote:
