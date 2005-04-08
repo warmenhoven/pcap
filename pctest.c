@@ -648,7 +648,7 @@ tcp_check_ackno(TCB *sess, struct tcp_pkt *pkt)
 			 segack = ntohl(pkt->hdr->th_ack),
 			 sndnxt = sess->seqno;
 
-	if ((snduna <= segack) && (segack <= sess->seqno)) {
+	if ((snduna <= segack) && (segack <= sndnxt)) {
 		sess->unacked = segack;
 		/* XXX "the send window should be updated" */
 	} else if (segack < snduna) {
@@ -662,7 +662,7 @@ tcp_check_ackno(TCB *sess, struct tcp_pkt *pkt)
 		return 1;
 	}
 
-	if (sess->unacked == sess->seqno) {
+	if (snduna == sndnxt) {
 		if (sess->state == TCP_FIN_WAIT1) {
 			/* the FIN has been acked, we can move to FIN-WAIT-2 */
 			sess->state = TCP_FIN_WAIT2;
