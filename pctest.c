@@ -20,8 +20,8 @@
  *     of the 5 points here)
  *
  * TODO:
- *   - Support IP options
- *   - Support TCP options
+ *   - Parse IP options
+ *   - Parse TCP options
  *   - Better initial seqno generation
  *   - Grow/shrink windows
  *   - Support user write()
@@ -264,24 +264,25 @@ struct arp {
 } __attribute__((__packed__));
 
 struct ip_pkt {
-	struct libnet_ethernet_hdr enet;
-	struct libnet_ipv4_hdr hdr;
-} __attribute__((__packed__));
+	struct libnet_ipv4_hdr *hdr;
+	u_char *options;
+	u_char *data;
+};
 
 struct icmp_pkt {
-	struct ip_pkt ip;	/* XXX this is wrong. I'll fix it once I start
-						   supporting ip options (which means a variable ip
-						   header length due to the options) */
-	struct libnet_icmpv4_hdr hdr;
-	u_char data[1];
-} __attribute__((__packed__));
+	struct libnet_ipv4_hdr *ip;
+	struct libnet_icmpv4_hdr *hdr;
+	u_char *data;
+};
 
 struct tcp_pkt {
-	struct ip_pkt ip;	/* XXX this is wrong. I'll fix it once I start
-						   supporting ip options (which means a variable ip
-						   header length due to the options) */
-	struct libnet_tcp_hdr hdr;
-} __attribute__((__packed__));
+	struct libnet_ipv4_hdr *ip;
+	u_char *ip_options;
+	struct libnet_tcp_hdr *hdr;
+	u_char *tcp_options;
+	u_char *data;
+	uint32_t data_len;
+};
 
 /* these are our global variables */
 static unsigned char src_hw[6];
@@ -524,11 +525,11 @@ accept_session(TCB *listener, struct tcp_pkt *pkt)
 	if (!sess)
 		return NULL;
 
-	sess->dst_ip = pkt->ip.hdr.ip_src.s_addr;
-	sess->dst_prt = ntohs(pkt->hdr.th_sport);
+	sess->dst_ip = pkt->ip->ip_src.s_addr;
+	sess->dst_prt = ntohs(pkt->hdr->th_sport);
 	sess->src_prt = listener->src_prt;
 
-	sess->ackno = ntohl(pkt->hdr.th_seq) + 1;
+	sess->ackno = ntohl(pkt->hdr->th_seq) + 1;
 
 	/* XXX "any other control or text should be queued for processing later" */
 
@@ -559,14 +560,14 @@ remove_session(TCB *sess)
 static void
 tcp_process_listen(TCB *sess, struct tcp_pkt *pkt)
 {
-	if (pkt->hdr.th_flags & TH_RST) {
+	if (pkt->hdr->th_flags & TH_RST) {
 		/* we're in a listening state, just drop it */
-	} else if (pkt->hdr.th_flags & TH_ACK) {
-		send_rst(pkt->ip.hdr.ip_src.s_addr, ntohs(pkt->hdr.th_sport),
-				 ntohs(pkt->hdr.th_dport), ntohl(pkt->hdr.th_ack),
-				 ntohl(pkt->hdr.th_seq) + 1,
-				 sess->state, pkt->hdr.th_flags);
-	} else if (pkt->hdr.th_flags & TH_SYN) {
+	} else if (pkt->hdr->th_flags & TH_ACK) {
+		send_rst(pkt->ip->ip_src.s_addr, ntohs(pkt->hdr->th_sport),
+				 ntohs(pkt->hdr->th_dport), ntohl(pkt->hdr->th_ack),
+				 ntohl(pkt->hdr->th_seq) + 1,
+				 sess->state, pkt->hdr->th_flags);
+	} else if (pkt->hdr->th_flags & TH_SYN) {
 		accept_session(sess, pkt);
 		/* XXX it is "perfectly legitimate" to have "connection synchronization
 		 * using data-carrying segments" but we don't handle that here. */
@@ -585,34 +586,34 @@ tcp_process_listen(TCB *sess, struct tcp_pkt *pkt)
 static void
 tcp_process_syn_sent(TCB *sess, struct tcp_pkt *pkt)
 {
-	if (pkt->hdr.th_flags & TH_ACK) {
-		if (ntohl(pkt->hdr.th_ack) != sess->seqno) {
+	if (pkt->hdr->th_flags & TH_ACK) {
+		if (ntohl(pkt->hdr->th_ack) != sess->seqno) {
 			fprintf(stderr, "Invalid ackno on %d\n", sess->id);
-			if (!(pkt->hdr.th_flags & TH_RST)) {
-				send_rst(pkt->ip.hdr.ip_src.s_addr, ntohs(pkt->hdr.th_sport),
-						 ntohs(pkt->hdr.th_dport), ntohl(pkt->hdr.th_ack),
-						 ntohl(pkt->hdr.th_seq) + 1,
-						 sess->state, pkt->hdr.th_flags);
+			if (!(pkt->hdr->th_flags & TH_RST)) {
+				send_rst(pkt->ip->ip_src.s_addr, ntohs(pkt->hdr->th_sport),
+						 ntohs(pkt->hdr->th_dport), ntohl(pkt->hdr->th_ack),
+						 ntohl(pkt->hdr->th_seq) + 1,
+						 sess->state, pkt->hdr->th_flags);
 			} else {
 				remove_session(sess);
 			}
 			return;
 		} else {
-			sess->unacked = ntohl(pkt->hdr.th_ack);
+			sess->unacked = ntohl(pkt->hdr->th_ack);
 		}
 	}
 
-	if (pkt->hdr.th_flags & TH_RST) {
+	if (pkt->hdr->th_flags & TH_RST) {
 		fprintf(stderr, "Remote host sent RST, closing %d\n", sess->id);
 		remove_session(sess);
 		return;
 	}
 
 	/* any other packet without SYN set we should just drop */
-	if (!(pkt->hdr.th_flags & TH_SYN))
+	if (!(pkt->hdr->th_flags & TH_SYN))
 		return;
 
-	sess->ackno = ntohl(pkt->hdr.th_seq) + 1;
+	sess->ackno = ntohl(pkt->hdr->th_seq) + 1;
 	if (sess->unacked == sess->seqno) {
 		sess->state = TCP_ESTABLISHED;
 		send_tcp(sess, TH_ACK);
@@ -630,18 +631,18 @@ tcp_process_syn_sent(TCB *sess, struct tcp_pkt *pkt)
 static int
 tcp_check_seqno(TCB *sess, struct tcp_pkt *pkt)
 {
-	unsigned int len = ntohs(pkt->ip.hdr.ip_len) -
-		(pkt->ip.hdr.ip_hl << 2) - (pkt->hdr.th_off << 2);
-	uint32_t rcvnxt = sess->ackno, segseq = ntohl(pkt->hdr.th_seq);
+	unsigned int len = ntohs(pkt->ip->ip_len) -
+		(pkt->ip->ip_hl << 2) - (pkt->hdr->th_off << 2);
+	uint32_t rcvnxt = sess->ackno, segseq = ntohl(pkt->hdr->th_seq);
 
 	/* XXX we don't deal correctly with seqno wrap-around */
 
 	if (len == 0) {
 		if ((rcvnxt <= segseq) &&
 			/* if sess->rcv_win is 0 then the check is if
-			 * pkt->hdr.th_seq <= sess->ackno, which is acceptable,
+			 * pkt->hdr->th_seq <= sess->ackno, which is acceptable,
 			 * since the above check makes it the same check
-			 * as checking if sess->ackno == pkt->hdr.th_seq */
+			 * as checking if sess->ackno == pkt->hdr->th_seq */
 			(segseq <= rcvnxt + sess->rcv_win)) {
 			return 0;
 		}
@@ -659,12 +660,12 @@ tcp_check_seqno(TCB *sess, struct tcp_pkt *pkt)
 static int
 tcp_process_syn_recv(TCB *sess, struct tcp_pkt *pkt)
 {
-	if (sess->unacked > ntohl(pkt->hdr.th_ack) ||
-		ntohl(pkt->hdr.th_ack) > sess->seqno) {
+	if (sess->unacked > ntohl(pkt->hdr->th_ack) ||
+		ntohl(pkt->hdr->th_ack) > sess->seqno) {
 		fprintf(stderr, "Invalid ackno on %d\n", sess->id);
-		send_rst(pkt->ip.hdr.ip_src.s_addr, ntohs(pkt->hdr.th_sport),
-				 ntohs(pkt->hdr.th_dport), ntohl(pkt->hdr.th_ack),
-				 ntohl(pkt->hdr.th_seq) + 1, sess->state, pkt->hdr.th_flags);
+		send_rst(pkt->ip->ip_src.s_addr, ntohs(pkt->hdr->th_sport),
+				 ntohs(pkt->hdr->th_dport), ntohl(pkt->hdr->th_ack),
+				 ntohl(pkt->hdr->th_seq) + 1, sess->state, pkt->hdr->th_flags);
 		remove_session(sess);
 		return 1;
 	}
@@ -679,12 +680,12 @@ tcp_process_syn_recv(TCB *sess, struct tcp_pkt *pkt)
 static void
 tcp_process_last_ack(TCB *sess, struct tcp_pkt *pkt)
 {
-	if (ntohl(pkt->hdr.th_ack) == sess->seqno) {
+	if (ntohl(pkt->hdr->th_ack) == sess->seqno) {
 		/* now we can remove the session */
 		sess->state = TCP_CLOSE;
 		printf("%u: %s\n", sess->id, state_names[sess->state]);
 		remove_session(sess);
-	} else if (ntohl(pkt->hdr.th_ack) > sess->seqno) {
+	} else if (ntohl(pkt->hdr->th_ack) > sess->seqno) {
 		/* they're acking more than we've sent? anyway, resend FIN (which means
 		 * decrement seqno before sending since it's sort of a retransmit) */
 		sess->seqno--;
@@ -697,7 +698,7 @@ static int
 tcp_check_ackno(TCB *sess, struct tcp_pkt *pkt)
 {
 	uint32_t snduna = sess->unacked,
-			 segack = ntohl(pkt->hdr.th_ack),
+			 segack = ntohl(pkt->hdr->th_ack),
 			 sndnxt = sess->seqno;
 
 	if ((snduna <= segack) && (segack <= sess->seqno)) {
@@ -737,32 +738,28 @@ tcp_check_ackno(TCB *sess, struct tcp_pkt *pkt)
 static void
 tcp_handle_data(TCB *sess, struct tcp_pkt *pkt)
 {
-	unsigned int len = ntohs(pkt->ip.hdr.ip_len) -
-		(pkt->ip.hdr.ip_hl << 2) - (pkt->hdr.th_off << 2);
-	unsigned char *ptr = ((unsigned char *)&pkt->hdr.th_sport) +
-		(pkt->hdr.th_off << 2);
 	unsigned int i;
 
-	if (len == 0)
+	if (pkt->data_len == 0)
 		return;
 
-	printf("read %u: %u bytes\n", sess->id, len);
+	printf("read %u: %u bytes\n", sess->id, pkt->data_len);
 
-	for (i = 0; i < len; i++) {
-		printf("%02x ", ptr[i]);
+	for (i = 0; i < pkt->data_len; i++) {
+		printf("%02x ", pkt->data[i]);
 		if (i && (i + 1) % 16 == 0)
 			printf("\n");
 	}
 	printf("\n");
-	for (i = 0; i < len; i++) {
-		printf(" %c ", ptr[i]);
+	for (i = 0; i < pkt->data_len; i++) {
+		printf(" %c ", pkt->data[i]);
 		if (i && (i + 1) % 16 == 0)
 			printf("\n");
 	}
 	printf("\n");
 
 	/* XXX this is wrong */
-	sess->ackno += len;
+	sess->ackno += pkt->data_len;
 	send_tcp(sess, TH_ACK);
 }
 
@@ -785,7 +782,7 @@ tcp_handle_fin(TCB *sess, struct tcp_pkt *pkt)
 		printf("%u: %s\n", sess->id, state_names[sess->state]);
 	} else if (sess->state == TCP_FIN_WAIT2) {
 		/* we've got the FIN, send the ACK and we're done */
-		sess->ackno = ntohl(pkt->hdr.th_seq) + 1;
+		sess->ackno = ntohl(pkt->hdr->th_seq) + 1;
 		send_tcp(sess, TH_ACK);
 		sess->state = TCP_TIME_WAIT;
 		printf("%u: %s\n", sess->id, state_names[sess->state]);
@@ -824,29 +821,29 @@ tcp_state_machine(TCB *sess, struct tcp_pkt *pkt)
 	 * will get a RST, which is probably not what's expected, but should work
 	 * just as well. */
 
-	if (pkt->hdr.th_flags & TH_RST) {
+	if (pkt->hdr->th_flags & TH_RST) {
 		fprintf(stderr, "Remote host sent RST, closing %d\n", sess->id);
 		remove_session(sess);
 		return;
 	}
 
 	if (tcp_check_seqno(sess, pkt)) {
-		/* XXX should we be updating sess->unacked from pkt->hdr.th_ack here? */
+		/* XXX should we be updating sess->unacked from hdr->th_ack here? */
 		fprintf(stderr, "unacceptable segment size on %d\n", sess->id);
 		send_tcp(sess, TH_ACK);
 		return;
 	}
 
-	if (pkt->hdr.th_flags & TH_SYN) {
+	if (pkt->hdr->th_flags & TH_SYN) {
 		fprintf(stderr, "SYN on %d\n", sess->id);
-		send_rst(pkt->ip.hdr.ip_src.s_addr, ntohs(pkt->hdr.th_sport),
-				 ntohs(pkt->hdr.th_dport), ntohl(pkt->hdr.th_ack),
-				 ntohl(pkt->hdr.th_seq) + 1, sess->state, pkt->hdr.th_flags);
+		send_rst(pkt->ip->ip_src.s_addr, ntohs(pkt->hdr->th_sport),
+				 ntohs(pkt->hdr->th_dport), ntohl(pkt->hdr->th_ack),
+				 ntohl(pkt->hdr->th_seq) + 1, sess->state, pkt->hdr->th_flags);
 		remove_session(sess);
 		return;
 	}
 
-	if (!(pkt->hdr.th_flags & TH_ACK)) {
+	if (!(pkt->hdr->th_flags & TH_ACK)) {
 		/* "if the ACK bit is off drop the segment and return" */
 		return;
 	}
@@ -869,54 +866,63 @@ tcp_state_machine(TCB *sess, struct tcp_pkt *pkt)
 
 	tcp_handle_data(sess, pkt);
 
-	if (pkt->hdr.th_flags & TH_FIN)
+	if (pkt->hdr->th_flags & TH_FIN)
 		tcp_handle_fin(sess, pkt);
 }
 
 static void
-process_tcp_packet(struct tcp_pkt *tcp)
+process_tcp_packet(struct ip_pkt *ip)
 {
+	struct tcp_pkt tcp;
 	TCB *sess;
 
 	uint16_t csum;
 	int sum, len;
 
-	csum = tcp->hdr.th_sum;
-	tcp->hdr.th_sum = 0;
-	sum = libnet_in_cksum((u_int16_t *)&tcp->ip.hdr.ip_src, 8);
-	len = ntohs(tcp->ip.hdr.ip_len) - (tcp->ip.hdr.ip_hl << 2);
+	tcp.ip = ip->hdr;
+	tcp.ip_options = ip->options;
+	tcp.hdr = (struct libnet_tcp_hdr *)ip->data;
+
+	csum = tcp.hdr->th_sum;
+	tcp.hdr->th_sum = 0;
+	sum = libnet_in_cksum((u_int16_t *)&ip->hdr->ip_src, 8);
+	len = ntohs(ip->hdr->ip_len) - (ip->hdr->ip_hl << 2);
 	sum += ntohs(IPPROTO_TCP + len);
-	sum += libnet_in_cksum((u_int16_t *)&tcp->hdr.th_sport, len);
-	tcp->hdr.th_sum = LIBNET_CKSUM_CARRY(sum);
-	if (csum != tcp->hdr.th_sum) {
+	sum += libnet_in_cksum((u_int16_t *)&tcp.hdr->th_sport, len);
+	tcp.hdr->th_sum = LIBNET_CKSUM_CARRY(sum);
+	if (csum != tcp.hdr->th_sum) {
 		fprintf(stderr, "checksum mismatch in TCP header (src %s)!\n",
-				libnet_addr2name4(tcp->ip.hdr.ip_src.s_addr,
-								  LIBNET_DONT_RESOLVE));
+				libnet_addr2name4(ip->hdr->ip_src.s_addr, LIBNET_DONT_RESOLVE));
 		return;
 	}
 
-	if ((unsigned int)(tcp->hdr.th_off << 2) < sizeof (struct libnet_tcp_hdr)) {
+	if ((unsigned int)(tcp.hdr->th_off << 2) < sizeof (struct libnet_tcp_hdr)) {
 		fprintf(stderr, "invalid TCP header (src %s)!\n",
-				libnet_addr2name4(tcp->ip.hdr.ip_src.s_addr,
-								  LIBNET_DONT_RESOLVE));
+				libnet_addr2name4(ip->hdr->ip_src.s_addr, LIBNET_DONT_RESOLVE));
 		return;
 	}
 
-	if (!(sess = find_session(tcp->ip.hdr.ip_src.s_addr,
-							  ntohs(tcp->hdr.th_sport),
-							  ntohs(tcp->hdr.th_dport)))) {
-		if (!(tcp->hdr.th_flags & TH_RST)) {
+	if (!(sess = find_session(ip->hdr->ip_src.s_addr, ntohs(tcp.hdr->th_sport),
+							  ntohs(tcp.hdr->th_dport)))) {
+		if (!(tcp.hdr->th_flags & TH_RST)) {
 			/* if they're sending us a RST then we don't need to send RST back,
 			 * we can safely drop it. */
-			send_rst(tcp->ip.hdr.ip_src.s_addr, ntohs(tcp->hdr.th_sport),
-					 ntohs(tcp->hdr.th_dport), ntohl(tcp->hdr.th_ack),
-					 ntohl(tcp->hdr.th_seq) + 1, TCP_CLOSE, tcp->hdr.th_flags);
+			send_rst(ip->hdr->ip_src.s_addr, ntohs(tcp.hdr->th_sport),
+					 ntohs(tcp.hdr->th_dport), ntohl(tcp.hdr->th_ack),
+					 ntohl(tcp.hdr->th_seq) + 1, TCP_CLOSE, tcp.hdr->th_flags);
 		}
 		return;
 	}
 
+	tcp.tcp_options = (u_char *)tcp.hdr + sizeof (struct libnet_tcp_hdr);
+	/* XXX we don't actually do anything with the options, but eh */
+
+	tcp.data = (u_char *)&tcp.hdr->th_sport + (tcp.hdr->th_off << 2);
+	tcp.data_len = ntohs(ip->hdr->ip_len) - (ip->hdr->ip_hl << 2) -
+		(tcp.hdr->th_off << 2);
+
 	/* this is where the real work is */
-	tcp_state_machine(sess, tcp);
+	tcp_state_machine(sess, &tcp);
 }
 
 static void
@@ -934,11 +940,11 @@ icmp_echo_reply(struct icmp_pkt *icmp)
 		return;
 	}
 
-	len = ntohs(icmp->ip.hdr.ip_len) - LIBNET_IPV4_H - LIBNET_ICMPV4_ECHO_H;
+	len = ntohs(icmp->ip->ip_len) - LIBNET_IPV4_H - LIBNET_ICMPV4_ECHO_H;
 	payload = icmp->data;
 
-	if (libnet_build_icmpv4_echo(ICMP_ECHOREPLY, 0, 0, ntohs(icmp->hdr.icmp_id),
-								 ntohs(icmp->hdr.icmp_seq), payload, len,
+	if (libnet_build_icmpv4_echo(ICMP_ECHOREPLY, 0, 0, ntohs(icmp->hdr->icmp_id),
+								 ntohs(icmp->hdr->icmp_seq), payload, len,
 								 lnh, 0) == -1) {
 		fprintf(stderr, "%s", libnet_geterror(lnh));
 		libnet_destroy(lnh);
@@ -947,7 +953,7 @@ icmp_echo_reply(struct icmp_pkt *icmp)
 
 	if (libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_ICMPV4_ECHO_H + len, 0, 0x42,
 						  0, 64, IPPROTO_ICMP, 0, src_ip,
-						  icmp->ip.hdr.ip_src.s_addr, NULL, 0, lnh, 0) == -1) {
+						  icmp->ip->ip_src.s_addr, NULL, 0, lnh, 0) == -1) {
 		fprintf(stderr, "%s", libnet_geterror(lnh));
 		libnet_destroy(lnh);
 		return;
@@ -962,44 +968,52 @@ icmp_echo_reply(struct icmp_pkt *icmp)
 }
 
 static void
-process_icmp_packet(struct icmp_pkt *icmp)
+process_icmp_packet(struct ip_pkt *ip)
 {
-	switch (icmp->hdr.icmp_type) {
+	struct icmp_pkt icmp;
+
+	icmp.ip = ip->hdr;
+	icmp.hdr = (struct libnet_icmpv4_hdr *)ip->data;
+	icmp.data = (u_char *)(icmp.hdr + 1);
+
+	switch (icmp.hdr->icmp_type) {
 	case ICMP_ECHO:
 		printf("being pinged (src %s)\n",
-			   libnet_addr2name4(icmp->ip.hdr.ip_src.s_addr,
-								 LIBNET_DONT_RESOLVE));
-		icmp_echo_reply(icmp);
+			   libnet_addr2name4(ip->hdr->ip_src.s_addr, LIBNET_DONT_RESOLVE));
+		icmp_echo_reply(&icmp);
 		break;
 	case ICMP_ECHOREPLY:
 		printf("received ping response from %s\n",
-			   libnet_addr2name4(icmp->ip.hdr.ip_src.s_addr, LIBNET_RESOLVE));
+			   libnet_addr2name4(ip->hdr->ip_src.s_addr, LIBNET_RESOLVE));
 		break;
 	default:
 		fprintf(stderr, "received unhandled icmp type %d (src %s)\n",
-				icmp->hdr.icmp_type,
-				libnet_addr2name4(icmp->ip.hdr.ip_src.s_addr, LIBNET_RESOLVE));
+				icmp.hdr->icmp_type,
+				libnet_addr2name4(ip->hdr->ip_src.s_addr, LIBNET_RESOLVE));
 		break;
 	}
 }
 
 static void
-process_ip_packet(struct ip_pkt *ip)
+process_ip_packet(struct libnet_ethernet_hdr *enet)
 {
+	struct ip_pkt ip;
 	uint16_t csum;
 	int sum;
 
-	if (ip->hdr.ip_hl < 5 || ip->hdr.ip_v != 4) {
-		fprintf(stderr, "bad IP packet, len = %d, ver = %d\n", ip->hdr.ip_hl,
-				ip->hdr.ip_v);
+	ip.hdr = (struct libnet_ipv4_hdr *)(enet + 1);
+
+	if (ip.hdr->ip_hl < 5 || ip.hdr->ip_v != 4) {
+		fprintf(stderr, "bad IP packet, len = %d, ver = %d\n", ip.hdr->ip_hl,
+				ip.hdr->ip_v);
 		return;
 	}
 
-	csum = ip->hdr.ip_sum;
-	ip->hdr.ip_sum = 0;
-	sum = libnet_in_cksum((u_int16_t *)&ip->hdr, ip->hdr.ip_hl << 2);
-	ip->hdr.ip_sum = LIBNET_CKSUM_CARRY(sum);
-	if (csum != ip->hdr.ip_sum) {
+	csum = ip.hdr->ip_sum;
+	ip.hdr->ip_sum = 0;
+	sum = libnet_in_cksum((u_int16_t *)ip.hdr, ip.hdr->ip_hl << 2);
+	ip.hdr->ip_sum = LIBNET_CKSUM_CARRY(sum);
+	if (csum != ip.hdr->ip_sum) {
 		fprintf(stderr, "checksum mismatch in IP header!\n");
 		return;
 	}
@@ -1010,43 +1024,36 @@ process_ip_packet(struct ip_pkt *ip)
 	 * init_pcap so that it gives us broadcast packets. if we ever want to
 	 * be really evil and do horrible things to other people's connections
 	 * then we'll have to modify this and init_pcap. */
-	if (ip->hdr.ip_dst.s_addr != src_ip) {
+	if (ip.hdr->ip_dst.s_addr != src_ip) {
 		return;
 	}
 
-	if (ip->hdr.ip_hl != 5) {
-		/* XXX there are more IP options that we need to deal with. until then
-		 * this program isn't a stack, it's a hack. */
-
-		/* XXX we don't deal with options. even worse, we don't send an icmp
-		 * message saying we don't. worse still, we don't send a RST either, so
-		 * we'll just keep getting this packet over and over. */
-		fprintf(stderr, "ip header length != 5 (src %s)!\n",
-				libnet_addr2name4(ip->hdr.ip_src.s_addr, LIBNET_DONT_RESOLVE));
-		return;
-	}
-
-	if (ip->hdr.ip_off & IP_MF) {
+	if (ip.hdr->ip_off & IP_MF) {
 		/* XXX we don't deal with fragmentation at all (and again, we don't tell
 		 * whoever we're talking to that we don't) */
 		fprintf(stderr, "fragmentation being used (src %s)\n",
-				libnet_addr2name4(ip->hdr.ip_src.s_addr, LIBNET_DONT_RESOLVE));
+				libnet_addr2name4(ip.hdr->ip_src.s_addr, LIBNET_DONT_RESOLVE));
 		return;
 	}
 
-	switch (ip->hdr.ip_p) {
+	ip.options = (u_char *)ip.hdr + sizeof (struct libnet_ipv4_hdr);
+	/* XXX we don't actually do anything with the options, but eh */
+
+	ip.data = (u_char *)ip.hdr + (ip.hdr->ip_hl << 2);
+
+	switch (ip.hdr->ip_p) {
 	case IPPROTO_TCP:
-		process_tcp_packet((struct tcp_pkt *)ip);
+		process_tcp_packet(&ip);
 		break;
 	case IPPROTO_ICMP:
-		process_icmp_packet((struct icmp_pkt *)ip);
+		process_icmp_packet(&ip);
 		break;
 	default:
 		/* that's right, we don't handle udp! when's the last time you used udp.
 		 * honestly. and don't tell me you actually use dns or ntp! or nfs. or
 		 * smb. *shudder* */
 		fprintf(stderr, "received unhandled protocol %d (src %s)\n",
-				ip->hdr.ip_p, libnet_addr2name4(ip->hdr.ip_src.s_addr,
+				ip.hdr->ip_p, libnet_addr2name4(ip.hdr->ip_src.s_addr,
 												LIBNET_DONT_RESOLVE));
 		break;
 	}
@@ -1089,7 +1096,7 @@ process_packet(void)
 
 	switch (ntohs(enet->ether_type)) {
 	case ETHERTYPE_IP:
-		process_ip_packet((struct ip_pkt *)enet);
+		process_ip_packet(enet);
 		break;
 	default:
 		fprintf(stderr, "received unhandled ethernet type %d\n",
