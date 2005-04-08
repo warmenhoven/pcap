@@ -1,38 +1,37 @@
 /*
- * right now in the TCP bake off I get 17 points:
+ * right now in the TCP bake off I get 30 points:
  *
  * Featherweight Division:
- *   1 points for talking to myself
- *   1 points for gracefully ending the conversation
+ *   1 point for talking to myself
+ *   1 point for saying something to myself
+ *   1 point for gracefully ending the conversation
  *   2 points for repeating the above without reinitializing
  *
  * Middleweight Division:
  *   2 points for talking to someone else
- *   2 point for gracefully ending the conversaion
+ *   2 points for saying something to someone else
+ *   2 points for gracefully ending the conversaion
  *   4 points for repeating the above without reinitializing
  *
  * Heavyweight Division:
- *   5 points for being able to talk to more than one other TCP at the same time
- *     (since I can't actually "talk" to them yet, I'm only giving myself 5
- *     points, for being able to be connected to more than one at a time. once
- *     I'm able to exchange data then I'll get 1 more point in the Lightweight
- *     Division, 2 more points in the Middleweight Division, and the remainder
- *     of the 5 points here)
+ *   10 points for being able to talk to more than one other TCP at the same time
  *
  * TODO:
- *   - Parse IP options
- *   - Parse TCP options
- *   - Better initial seqno generation
- *   - Grow/shrink windows
- *   - Support user write()
- *   - Support loopback (talking to self without gateway)
- *   - Handle data in inital SYN
- *   - Handle seqno wrap-around
- *   - Deal with lost data
- *   - Support security
- *   - Support precedence
- *   - Support URG data
- *   - Support IP fragments
+ *   IP:
+ *     - Parse IP options
+ *     - Support IP fragments
+ *     - Support precedence
+ *     - Support loopback (talking to self without gateway)
+ *
+ *   TCP:
+ *     - Parse TCP options
+ *     - Handle data in inital SYN
+ *     - Support URG data
+ *     - Better initial seqno generation
+ *     - Handle seqno wrap-around
+ *     - Grow/shrink windows
+ *     - Use timers and retransmission
+ *     - Deal with lost received data
  */
 
 #include <libnet.h>
@@ -49,7 +48,7 @@ typedef int (*cmpfnc)(const void *, const void *);
 static list *
 list_new(void *data)
 {
-	list *l = malloc(sizeof(list));
+	list *l = malloc(sizeof (list));
 	l->next = NULL;
 	l->data = data;
 	return l;
@@ -255,13 +254,13 @@ typedef struct tcp_session {
 
 struct arp {
 	struct libnet_ethernet_hdr enet;
-	struct libnet_arp_hdr hdr;
+	struct libnet_arp_hdr hdr __attribute__((__packed__));
 	/* everything from here down is IPv4 but that's all we need */
-	unsigned char src_hw[6];
-	uint32_t src_ip;
-	unsigned char dst_hw[6];
-	uint32_t dst_ip;
-} __attribute__((__packed__));
+	unsigned char src_hw[6] __attribute__((__packed__));
+	uint32_t src_ip __attribute__((__packed__));
+	unsigned char dst_hw[6] __attribute__((__packed__));
+	uint32_t dst_ip __attribute__((__packed__));
+};
 
 struct ip_pkt {
 	struct libnet_ipv4_hdr *hdr;
@@ -293,12 +292,12 @@ static list *listeners = NULL;
 static int sp[2];
 
 static int
-send_tcp(TCB *sess, int flags)
+send_tcp(TCB *sess, int flags, u_char *data, uint32_t len)
 {
 	if ((sess->tcp_id =
 		 libnet_build_tcp(sess->src_prt, sess->dst_prt, sess->seqno,
 						  sess->ackno, flags, sess->rcv_win, 0, 0, LIBNET_TCP_H,
-						  NULL, 0, sess->lnh, sess->tcp_id)) == -1) {
+						  data, len, sess->lnh, sess->tcp_id)) == -1) {
 		fprintf(stderr, "%s", libnet_geterror(sess->lnh));
 		return 0;
 	}
@@ -463,60 +462,6 @@ session_setup(void)
 	return sess;
 }
 
-/* maybe eventually there will be a third argument, so you can specify the port
- * to connect from */
-static TCB *
-create_session(char *host, uint16_t port)
-{
-	TCB *sess;
-
-	if (host) {
-		if ((sess = session_setup()) == NULL)
-			return NULL;
-
-		/* XXX we should have some check to see if sess->dst_ip ==
-		 * src_ip, so that we can detect when we're trying to send
-		 * packets to ourselves, because we won't be able to put those
-		 * packets out over the wire */
-		sess->dst_ip = libnet_name2addr4(sess->lnh, host,
-						 LIBNET_RESOLVE);
-		if (sess->dst_ip == 0xffffffff) {
-			fprintf(stderr, "%s", libnet_geterror(sess->lnh));
-			free(sess);
-			return NULL;
-		}
-		sess->dst_prt = port;
-		sess->src_prt = get_port(sess->dst_ip, sess->dst_prt);
-
-		/* send the SYN, and we're off! */
-		send_tcp(sess, TH_SYN);
-		sess->seqno++;
-		sess->state = TCP_SYN_SENT;
-		printf("%u: %s (port %u)\n", sess->id, state_names[sess->state],
-			   sess->src_prt);
-		open_connections = list_prepend(open_connections, sess);
-	} else {
-		/* listening socket */
-		if ((sess = find_session(0, 0, port)) != NULL) {
-			fprintf(stderr, "id %d already listening on port %d\n",
-					sess->id, port);
-			return sess;
-		}
-		if ((sess = session_setup()) == NULL)
-			return NULL;
-
-		sess->dst_ip = 0;
-		sess->dst_prt = 0;
-		sess->src_prt = port;
-
-		sess->state = TCP_LISTEN;
-		printf("%u: %s\n", sess->id, state_names[sess->state]);
-		listeners = list_prepend(listeners, sess);
-	}
-
-	return sess;
-}
-
 static TCB *
 accept_session(TCB *listener, struct tcp_pkt *pkt)
 {
@@ -533,7 +478,7 @@ accept_session(TCB *listener, struct tcp_pkt *pkt)
 
 	/* XXX "any other control or text should be queued for processing later" */
 
-	send_tcp(sess, TH_SYN | TH_ACK);
+	send_tcp(sess, TH_SYN | TH_ACK, NULL, 0);
 	sess->seqno++;
 	sess->state = TCP_SYN_RECV;
 	printf("%u: %s\n", sess->id, state_names[sess->state]);
@@ -616,13 +561,13 @@ tcp_process_syn_sent(TCB *sess, struct tcp_pkt *pkt)
 	sess->ackno = ntohl(pkt->hdr->th_seq) + 1;
 	if (sess->unacked == sess->seqno) {
 		sess->state = TCP_ESTABLISHED;
-		send_tcp(sess, TH_ACK);
+		send_tcp(sess, TH_ACK, NULL, 0);
 	} else {
 		sess->state = TCP_SYN_RECV;
 		/* we're resending our initial syn, so we have to decrement the
 		 * seqno to get at our initial seqno for the syn */
 		sess->seqno--;
-		send_tcp(sess, TH_SYN | TH_ACK);
+		send_tcp(sess, TH_SYN | TH_ACK, NULL, 0);
 		sess->seqno++;
 	}
 	printf("%u: %s\n", sess->id, state_names[sess->state]);
@@ -689,7 +634,7 @@ tcp_process_last_ack(TCB *sess, struct tcp_pkt *pkt)
 		/* they're acking more than we've sent? anyway, resend FIN (which means
 		 * decrement seqno before sending since it's sort of a retransmit) */
 		sess->seqno--;
-		send_tcp(sess, TH_FIN | TH_ACK);
+		send_tcp(sess, TH_FIN | TH_ACK, NULL, 0);
 		sess->seqno++;
 	}
 }
@@ -712,7 +657,7 @@ tcp_check_ackno(TCB *sess, struct tcp_pkt *pkt)
 		/* the ACK acks something not yet sent */
 		fprintf(stderr, "ack for something not set on %d (%u %u)\n", sess->id,
 				segack, sndnxt);
-		send_tcp(sess, TH_ACK);
+		send_tcp(sess, TH_ACK, NULL, 0);
 		return 1;
 	}
 
@@ -763,7 +708,7 @@ tcp_handle_data(TCB *sess, struct tcp_pkt *pkt)
 
 	/* XXX this is wrong */
 	sess->ackno += pkt->data_len;
-	send_tcp(sess, TH_ACK);
+	send_tcp(sess, TH_ACK, NULL, 0);
 }
 
 static void
@@ -772,7 +717,7 @@ tcp_handle_fin(TCB *sess, struct tcp_pkt *pkt)
 	sess->ackno++;
 
 	if ((sess->state == TCP_SYN_RECV) || (sess->state == TCP_ESTABLISHED)) {
-		send_tcp(sess, TH_FIN | TH_ACK);
+		send_tcp(sess, TH_FIN | TH_ACK, NULL, 0);
 		sess->seqno++;
 		/* we send both the FIN and the ACK together, and move
 		 * right through CLOSE_WAIT to LAST_ACK */
@@ -780,13 +725,13 @@ tcp_handle_fin(TCB *sess, struct tcp_pkt *pkt)
 		printf("%u: %s\n", sess->id, state_names[sess->state]);
 	} else if (sess->state == TCP_FIN_WAIT1) {
 		/* ACK the FIN, wait for our ACK */
-		send_tcp(sess, TH_ACK);
+		send_tcp(sess, TH_ACK, NULL, 0);
 		sess->state = TCP_CLOSING;
 		printf("%u: %s\n", sess->id, state_names[sess->state]);
 	} else if (sess->state == TCP_FIN_WAIT2) {
 		/* we've got the FIN, send the ACK and we're done */
 		sess->ackno = ntohl(pkt->hdr->th_seq) + 1;
-		send_tcp(sess, TH_ACK);
+		send_tcp(sess, TH_ACK, NULL, 0);
 		sess->state = TCP_TIME_WAIT;
 		printf("%u: %s\n", sess->id, state_names[sess->state]);
 		/* just like above, we should move to TIME_WAIT, but
@@ -833,7 +778,7 @@ tcp_state_machine(TCB *sess, struct tcp_pkt *pkt)
 	if (tcp_check_seqno(sess, pkt)) {
 		/* XXX should we be updating sess->unacked from hdr->th_ack here? */
 		fprintf(stderr, "unacceptable segment size on %d\n", sess->id);
-		send_tcp(sess, TH_ACK);
+		send_tcp(sess, TH_ACK, NULL, 0);
 		return;
 	}
 
@@ -1110,6 +1055,7 @@ process_packet(void)
 	free(pkt);
 }
 
+/* INPUT { */
 static void
 ping(char *host)
 {
@@ -1160,6 +1106,60 @@ ping(char *host)
 	return;
 }
 
+/* maybe eventually there will be a third argument, so you can specify the port
+ * to connect from */
+static TCB *
+create_session(char *host, uint16_t port)
+{
+	TCB *sess;
+
+	if (host) {
+		if ((sess = session_setup()) == NULL)
+			return NULL;
+
+		/* XXX we should have some check to see if sess->dst_ip ==
+		 * src_ip, so that we can detect when we're trying to send
+		 * packets to ourselves, because we won't be able to put those
+		 * packets out over the wire */
+		sess->dst_ip = libnet_name2addr4(sess->lnh, host,
+						 LIBNET_RESOLVE);
+		if (sess->dst_ip == 0xffffffff) {
+			fprintf(stderr, "%s", libnet_geterror(sess->lnh));
+			free(sess);
+			return NULL;
+		}
+		sess->dst_prt = port;
+		sess->src_prt = get_port(sess->dst_ip, sess->dst_prt);
+
+		/* send the SYN, and we're off! */
+		send_tcp(sess, TH_SYN, NULL, 0);
+		sess->seqno++;
+		sess->state = TCP_SYN_SENT;
+		printf("%u: %s (port %u)\n", sess->id, state_names[sess->state],
+			   sess->src_prt);
+		open_connections = list_prepend(open_connections, sess);
+	} else {
+		/* listening socket */
+		if ((sess = find_session(0, 0, port)) != NULL) {
+			fprintf(stderr, "id %d already listening on port %d\n",
+					sess->id, port);
+			return sess;
+		}
+		if ((sess = session_setup()) == NULL)
+			return NULL;
+
+		sess->dst_ip = 0;
+		sess->dst_prt = 0;
+		sess->src_prt = port;
+
+		sess->state = TCP_LISTEN;
+		printf("%u: %s\n", sess->id, state_names[sess->state]);
+		listeners = list_prepend(listeners, sess);
+	}
+
+	return sess;
+}
+
 static void
 fake_timeout(void *arg __attribute__((__unused__)))
 {
@@ -1172,10 +1172,14 @@ static void
 process_input(void)
 {
 	char buf[80];
-	fgets(buf, sizeof(buf), stdin);
+	fgets(buf, sizeof (buf), stdin);
 	if (buf[strlen(buf) - 1] == '\n')
 		buf[strlen(buf) - 1] = 0;
-	if (!strncasecmp(buf, "connect ", strlen("connect "))) {
+	if (!strncasecmp(buf, "ping ", strlen("ping "))) {
+		char *arg1;
+		arg1 = buf + strlen("ping ");
+		ping(arg1);
+	} else if (!strncasecmp(buf, "connect ", strlen("connect "))) {
 		char *arg1, *arg2;
 		arg1 = buf + strlen("connect ");
 		arg2 = strchr(arg1, ' ');
@@ -1186,10 +1190,43 @@ process_input(void)
 		create_session(arg1, atoi(arg2));
 	} else if (!strncasecmp(buf, "listen ", strlen("listen "))) {
 		create_session(NULL, atoi(buf + strlen("listen ")));
-	} else if (!strncasecmp(buf, "ping ", strlen("ping "))) {
-		char *arg1;
-		arg1 = buf + strlen("ping ");
-		ping(arg1);
+	} else if (!strncasecmp(buf, "write ", strlen("write "))) {
+		list *l = sessions;
+		unsigned int id;
+		char *arg1, *arg2;
+		arg1 = buf + strlen("write ");
+		arg2 = strchr(arg1, ' ');
+		if (!arg2)
+			return;
+		*arg2++ = 0;
+		id = atoi(arg1);
+
+		while (l) {
+			TCB *sess = l->data;
+
+			if (sess->id > id) {
+				l = NULL;
+				break;
+			}
+
+			if (sess->id < id) {
+				l = l->next;
+				continue;
+			}
+
+			if ((sess->state == TCP_ESTABLISHED) ||
+				/* it's not possible for us to be in CLOSE_WAIT but we check it
+				 * anyway, just to be pedantic */
+				(sess->state == TCP_CLOSE_WAIT)) {
+				send_tcp(sess, TH_PUSH | TH_ACK, (u_char *)arg2, strlen(arg2));
+				sess->seqno += strlen(arg2);
+				/* XXX should add it to the send queue in case we need to
+				 * retransmit. in that case we should also set a timer. */
+			}
+			break;
+		}
+		if (!l)
+			printf("couldn't find %u\n", id);
 	} else if (!strncasecmp(buf, "close ", strlen("close "))) {
 		list *l = sessions;
 		unsigned int id = atoi(buf + strlen("close "));
@@ -1212,7 +1249,7 @@ process_input(void)
 				remove_session(sess);
 			} else if (sess->state == TCP_ESTABLISHED ||
 					   sess->state == TCP_SYN_RECV) {
-				send_tcp(sess, TH_FIN | TH_ACK);
+				send_tcp(sess, TH_FIN | TH_ACK, NULL, 0);
 				sess->seqno++;
 				sess->state = TCP_FIN_WAIT1;
 				printf("%u: %s\n",
@@ -1258,6 +1295,7 @@ process_input(void)
 		exit(0);
 	}
 }
+/* } */
 
 /* this function needs to get rewritten. desperately. */
 static void * __attribute__((__noreturn__))
