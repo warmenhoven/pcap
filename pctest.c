@@ -299,22 +299,28 @@ send_tcp(TCB *sess, int flags, u_char *data, uint32_t len)
 						  sess->ackno, flags, sess->rcv_win, 0, 0, LIBNET_TCP_H,
 						  data, len, sess->lnh, sess->tcp_id)) == -1) {
 		fprintf(stderr, "%s", libnet_geterror(sess->lnh));
-		return 0;
+		return 1;
 	}
 	if ((sess->ip_id =
 		 libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_TCP_H, 0, 242, 0, 64,
 						   IPPROTO_TCP, 0, src_ip, sess->dst_ip,
 						   NULL, 0, sess->lnh, sess->ip_id)) == -1) {
 		fprintf(stderr, "%s", libnet_geterror(sess->lnh));
-		return 0;
+		return 1;
 	}
 
 	if (libnet_write(sess->lnh) == -1) {
 		fprintf(stderr, "%s", libnet_geterror(sess->lnh));
-		return 0;
+		return 1;
 	}
 
-	return 1;
+	if (flags & TH_SYN)
+		sess->seqno++;
+	if (flags & TH_FIN)
+		sess->seqno++;
+	sess->seqno += len;
+
+	return 0;
 }
 
 /* yeah, I probably should figure out some way of reusing send_tcp instead of
@@ -479,7 +485,6 @@ accept_session(TCB *listener, struct tcp_pkt *pkt)
 	/* XXX "any other control or text should be queued for processing later" */
 
 	send_tcp(sess, TH_SYN | TH_ACK, NULL, 0);
-	sess->seqno++;
 	sess->state = TCP_SYN_RECV;
 	printf("%u: %s\n", sess->id, state_names[sess->state]);
 
@@ -568,7 +573,6 @@ tcp_process_syn_sent(TCB *sess, struct tcp_pkt *pkt)
 		 * seqno to get at our initial seqno for the syn */
 		sess->seqno--;
 		send_tcp(sess, TH_SYN | TH_ACK, NULL, 0);
-		sess->seqno++;
 	}
 	printf("%u: %s\n", sess->id, state_names[sess->state]);
 }
@@ -615,7 +619,6 @@ tcp_process_syn_recv(TCB *sess, struct tcp_pkt *pkt)
 		return 1;
 	}
 
-	sess->ackno++;
 	sess->state = TCP_ESTABLISHED;
 	printf("%u: %s\n", sess->id, state_names[sess->state]);
 	/* and continue procesing */
@@ -635,7 +638,6 @@ tcp_process_last_ack(TCB *sess, struct tcp_pkt *pkt)
 		 * decrement seqno before sending since it's sort of a retransmit) */
 		sess->seqno--;
 		send_tcp(sess, TH_FIN | TH_ACK, NULL, 0);
-		sess->seqno++;
 	}
 }
 
@@ -655,8 +657,7 @@ tcp_check_ackno(TCB *sess, struct tcp_pkt *pkt)
 		return 1;
 	} else {
 		/* the ACK acks something not yet sent */
-		fprintf(stderr, "ack for something not set on %d (%u %u)\n", sess->id,
-				segack, sndnxt);
+		fprintf(stderr, "ack for something not sent on %d\n", sess->id);
 		send_tcp(sess, TH_ACK, NULL, 0);
 		return 1;
 	}
@@ -718,7 +719,6 @@ tcp_handle_fin(TCB *sess, struct tcp_pkt *pkt)
 
 	if ((sess->state == TCP_SYN_RECV) || (sess->state == TCP_ESTABLISHED)) {
 		send_tcp(sess, TH_FIN | TH_ACK, NULL, 0);
-		sess->seqno++;
 		/* we send both the FIN and the ACK together, and move
 		 * right through CLOSE_WAIT to LAST_ACK */
 		sess->state = TCP_LAST_ACK;
@@ -730,6 +730,8 @@ tcp_handle_fin(TCB *sess, struct tcp_pkt *pkt)
 		printf("%u: %s\n", sess->id, state_names[sess->state]);
 	} else if (sess->state == TCP_FIN_WAIT2) {
 		/* we've got the FIN, send the ACK and we're done */
+		/* XXX if there's still data missing then we don't want to set ackno to
+		 * pkt->hdr->th_seq + 1; we want to receive that data still */
 		sess->ackno = ntohl(pkt->hdr->th_seq) + 1;
 		send_tcp(sess, TH_ACK, NULL, 0);
 		sess->state = TCP_TIME_WAIT;
@@ -1133,7 +1135,6 @@ create_session(char *host, uint16_t port)
 
 		/* send the SYN, and we're off! */
 		send_tcp(sess, TH_SYN, NULL, 0);
-		sess->seqno++;
 		sess->state = TCP_SYN_SENT;
 		printf("%u: %s (port %u)\n", sess->id, state_names[sess->state],
 			   sess->src_prt);
@@ -1219,7 +1220,6 @@ process_input(void)
 				 * anyway, just to be pedantic */
 				(sess->state == TCP_CLOSE_WAIT)) {
 				send_tcp(sess, TH_PUSH | TH_ACK, (u_char *)arg2, strlen(arg2));
-				sess->seqno += strlen(arg2);
 				/* XXX should add it to the send queue in case we need to
 				 * retransmit. in that case we should also set a timer. */
 			}
@@ -1250,7 +1250,6 @@ process_input(void)
 			} else if (sess->state == TCP_ESTABLISHED ||
 					   sess->state == TCP_SYN_RECV) {
 				send_tcp(sess, TH_FIN | TH_ACK, NULL, 0);
-				sess->seqno++;
 				sess->state = TCP_FIN_WAIT1;
 				printf("%u: %s\n",
 					   sess->id,
