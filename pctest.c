@@ -44,7 +44,6 @@
  *
  *   And finally, all of the evil things I'd like to do:
  *    - Increased control over remote window size
- *    - Reimplement sting (http://www.cs.ucsd.edu/~savage/sting/)
  */
 
 #include <libnet.h>
@@ -261,8 +260,22 @@ typedef struct tcp_session {
 	uint16_t snd_win; /* aka SND.WND */
 	uint16_t rcv_win; /* aka RCV.WND */
 
+	struct timer *tmr;
 	/* there's really a bunch of other stuff that I should be paying
 	 * attention to */
+
+	/* this is where we start getting evil: reimplementing sting */
+	int sting;
+	uint32_t iss;
+	int count;
+	int sting_acks;
+	int data_lost;
+#define STING_STRING "GET / HTTP/1.0\n" \
+		"Accept: text/plain\nAccept: */*\n" \
+		"User-Agent: Mozilla/4.0 " \
+		"(compatible; MSIE 5.0; Windows NT; DigExt; Sting)\n\n"
+#define STING_COUNT 100
+#define STING_DELAY 100
 } TCB;
 
 /* this probably wasn't entirely necessary but it's convenient */
@@ -515,6 +528,7 @@ remove_session(TCB *sess)
 	}
 	sessions = list_remove(sessions, sess);
 	libnet_destroy(sess->lnh);
+	timer_cancel(sess->tmr);
 	free(sess);
 }
 
@@ -541,6 +555,27 @@ tcp_process_listen(TCB *sess, struct tcp_pkt *pkt)
 		 * could not have been sent in response to anything sent by this
 		 * incarnation of the connection.  So you are unlikely to get here,
 		 * but if you do, drop the segment, and return. */
+	}
+}
+
+static void
+sting(void *data)
+{
+	TCB *sess = data;
+
+	u_char str[] = STING_STRING;
+
+	sess->count++;
+	send_tcp(sess, TH_PUSH | TH_ACK, &str[sess->count], 1);
+
+	if (sess->count != STING_COUNT) {
+		sess->tmr = timer_start(STING_DELAY, sting, data);
+	} else {
+		/* so now we send the last byte */
+		sess->tmr = NULL;
+		sess->seqno = sess->iss;
+		send_tcp(sess, TH_PUSH | TH_ACK, &str[0], 1);
+		sess->seqno = sess->iss + STING_COUNT + 1;
 	}
 }
 
@@ -578,6 +613,13 @@ tcp_process_syn_sent(TCB *sess, struct tcp_pkt *pkt)
 		send_tcp(sess, TH_SYN | TH_ACK, NULL, 0);
 	}
 	printf("%u: %s\n", sess->id, state_names[sess->state]);
+
+	/* we assume that sting will always go this route */
+	if ((sess->state == TCP_ESTABLISHED) && sess->sting) {
+		/* bump seqno deliberately despite not having sent anything yet */
+		sess->seqno++;
+		sting(sess);
+	}
 }
 
 static int
@@ -689,6 +731,9 @@ tcp_handle_data(TCB *sess, struct tcp_pkt *pkt)
 {
 	unsigned int i;
 
+	if (sess->sting)
+		return;
+
 	if (pkt->data_len == 0)
 		return;
 
@@ -745,6 +790,40 @@ tcp_handle_fin(TCB *sess, struct tcp_pkt *pkt)
 	} else {
 		/* anyone else just stays in their state. TIME-WAIT, if it were
 		 * possible for us, would restart the 2 MSL time-wait timeout. */
+	}
+}
+
+static void
+sting_process(TCB *sess, struct tcp_pkt *pkt)
+{
+	u_char str[] = STING_STRING;
+
+	if (sess->state != TCP_ESTABLISHED) {
+		fprintf(stderr, "sting session stopping?\n");
+		timer_cancel(sess->tmr);
+		return;
+	}
+
+	if (ntohl(pkt->hdr->th_ack) == sess->iss) {
+		/* they're still waiting for our first byte */
+		sess->sting_acks++;
+	} else if (ntohl(pkt->hdr->th_ack) == sess->seqno) {
+		printf("sting to %s:\n",
+			   libnet_addr2name4(pkt->ip->ip_src.s_addr, LIBNET_DONT_RESOLVE));
+		printf("remote received %d/%d packets\n", STING_COUNT - sess->data_lost,
+			   STING_COUNT);
+		printf("we received %d/%d acks\n", sess->sting_acks,
+			   STING_COUNT - sess->data_lost);
+
+		send_tcp(sess, TH_RST | TH_ACK, NULL, 0);
+		remove_session(sess);
+	} else {
+		/* this indicates that they dropped something and need it resent */
+		sess->data_lost++;
+
+		sess->seqno = ntohl(pkt->hdr->th_ack);
+		send_tcp(sess, TH_PUSH | TH_ACK, &str[sess->seqno - sess->iss], 1);
+		sess->seqno = sess->iss + STING_COUNT + 1;
 	}
 }
 
@@ -821,6 +900,9 @@ tcp_state_machine(TCB *sess, struct tcp_pkt *pkt)
 
 	if (pkt->hdr->th_flags & TH_FIN)
 		tcp_handle_fin(sess, pkt);
+
+	if (sess->sting)
+		sting_process(sess, pkt);
 }
 
 static void
@@ -1181,6 +1263,21 @@ process_input(void)
 		char *arg1;
 		arg1 = buf + strlen("ping ");
 		ping(arg1);
+	} else if (!strncasecmp(buf, "sting ", strlen("sting "))) {
+		TCB *sess;
+		char *arg1, *arg2;
+		uint16_t port = 80;
+		arg1 = buf + strlen("sting ");
+		arg2 = strchr(arg1, ' ');
+		if (arg2) {
+			*arg2++ = 0;
+			port = atoi(arg2);
+		}
+
+		sess = create_session(arg1, port);
+		sess->sting = 1;
+		/* by this time seqno is iss+1 but that's fine for our purposes */
+		sess->iss = sess->seqno;
 	} else if (!strncasecmp(buf, "connect ", strlen("connect "))) {
 		char *arg1, *arg2;
 		arg1 = buf + strlen("connect ");
@@ -1214,6 +1311,11 @@ process_input(void)
 			if (sess->id < id) {
 				l = l->next;
 				continue;
+			}
+
+			if (sess->sting) {
+				fprintf(stderr, "can't write to sting session!\n");
+				break;
 			}
 
 			if ((sess->state == TCP_ESTABLISHED) ||
