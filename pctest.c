@@ -328,9 +328,9 @@ send_tcp(TCB *sess, int flags, u_char *data, uint32_t len)
 		return 1;
 	}
 	if ((sess->ip_id =
-		 libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_TCP_H, 0, 242, 0, 64,
-						   IPPROTO_TCP, 0, src_ip, sess->dst_ip,
-						   NULL, 0, sess->lnh, sess->ip_id)) == -1) {
+		 libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_TCP_H, IPTOS_RELIABILITY, 242,
+						   0, 64, IPPROTO_TCP, 0, src_ip, sess->dst_ip, NULL, 0,
+						   sess->lnh, sess->ip_id)) == -1) {
 		fprintf(stderr, "%s", libnet_geterror(sess->lnh));
 		return 1;
 	}
@@ -985,9 +985,10 @@ icmp_echo_reply(struct icmp_pkt *icmp)
 		return;
 	}
 
-	if (libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_ICMPV4_ECHO_H + len, 0, 0x42,
-						  0, 64, IPPROTO_ICMP, 0, src_ip,
-						  icmp->ip->ip_src.s_addr, NULL, 0, lnh, 0) == -1) {
+	if (libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_ICMPV4_ECHO_H + len,
+						  icmp->ip->ip_tos, 0x42, 0, 64, IPPROTO_ICMP, 0,
+						  src_ip, icmp->ip->ip_src.s_addr,
+						  NULL, 0, lnh, 0) == -1) {
 		fprintf(stderr, "%s", libnet_geterror(lnh));
 		libnet_destroy(lnh);
 		return;
@@ -1005,6 +1006,7 @@ static void
 process_icmp_packet(struct ip_pkt *ip)
 {
 	struct icmp_pkt icmp;
+	struct timeval tv, diff;
 
 	icmp.ip = ip->hdr;
 	icmp.hdr = (struct libnet_icmpv4_hdr *)ip->data;
@@ -1016,8 +1018,12 @@ process_icmp_packet(struct ip_pkt *ip)
 		icmp_echo_reply(&icmp);
 		break;
 	case ICMP_ECHOREPLY:
-		printf("received ping response from %s\n",
-			   libnet_addr2name4(ip->hdr->ip_src.s_addr, LIBNET_RESOLVE));
+		gettimeofday(&tv, NULL);
+		timersub(&tv, (struct timeval *)(icmp.hdr->icmp_data), &diff);
+		printf("received ping response from %s (%ld.%.03ld ms)\n",
+			   libnet_addr2name4(ip->hdr->ip_src.s_addr, LIBNET_RESOLVE),
+			   (diff.tv_sec * 1000) + (diff.tv_usec / 1000),
+			   diff.tv_usec % 1000);
 		break;
 	default:
 		fprintf(stderr, "received unhandled icmp type %d (src %s)\n",
@@ -1167,6 +1173,8 @@ ping(char *host)
 
 	for (i = 0; i < sizeof (payload); i++)
 		payload[i] = i;
+
+	gettimeofday((struct timeval *)&payload[0], NULL);
 
 	if ((tag = libnet_build_icmpv4_echo(ICMP_ECHO, 0, 0, 0x42, 0, payload,
 										sizeof (payload), lnh, 0)) == -1) {
