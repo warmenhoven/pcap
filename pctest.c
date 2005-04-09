@@ -285,7 +285,6 @@ struct ip_pkt {
 struct icmp_pkt {
 	struct libnet_ipv4_hdr *ip;
 	struct libnet_icmpv4_hdr *hdr;
-	u_char *data;
 };
 
 struct tcp_pkt {
@@ -886,7 +885,6 @@ icmp_echo_reply(struct icmp_pkt *icmp)
 	 * rebuild it too many times */
 	char errbuf[LIBNET_ERRBUF_SIZE];
 	libnet_t *lnh;
-	u_char *payload;
 	unsigned int len;
 
 	if (!(lnh = libnet_init(LIBNET_RAW4, NULL, errbuf))) {
@@ -895,10 +893,10 @@ icmp_echo_reply(struct icmp_pkt *icmp)
 	}
 
 	len = ntohs(icmp->ip->ip_len) - LIBNET_IPV4_H - LIBNET_ICMPV4_ECHO_H;
-	payload = icmp->data;
 
 	if (libnet_build_icmpv4_echo(ICMP_ECHOREPLY, 0, 0, ntohs(icmp->hdr->icmp_id),
-								 ntohs(icmp->hdr->icmp_seq), payload, len,
+								 ntohs(icmp->hdr->icmp_seq),
+								 (u_int8_t *)icmp->hdr->icmp_data, len,
 								 lnh, 0) == -1) {
 		fprintf(stderr, "%s", libnet_geterror(lnh));
 		libnet_destroy(lnh);
@@ -928,7 +926,6 @@ process_icmp_packet(struct ip_pkt *ip)
 
 	icmp.ip = ip->hdr;
 	icmp.hdr = (struct libnet_icmpv4_hdr *)ip->data;
-	icmp.data = (u_char *)(icmp.hdr + 1);
 
 	switch (icmp.hdr->icmp_type) {
 	case ICMP_ECHO:
