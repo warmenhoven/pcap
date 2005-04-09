@@ -32,6 +32,19 @@
  *     - Grow/shrink windows
  *     - Use timers and retransmission
  *     - Deal with lost received data
+ *
+ *   General:
+ *     - Don't call libnet_init so many times
+ *     - Drop root privileges after opening pcap and raw sockets
+ *
+ *   Then there are the things done by a real TCP stack (as opposed to this
+ *   toy), that aren't in the spec:
+ *    - delayed ACKs
+ *    - header prediction
+ *
+ *   And finally, all of the evil things I'd like to do:
+ *    - Increased control over remote window size
+ *    - Reimplement sting (http://www.cs.ucsd.edu/~savage/sting/)
  */
 
 #include <libnet.h>
@@ -252,6 +265,7 @@ typedef struct tcp_session {
 	 * attention to */
 } TCB;
 
+/* this probably wasn't entirely necessary but it's convenient */
 struct arp {
 	struct libnet_ethernet_hdr enet;
 	struct libnet_arp_hdr hdr __attribute__((__packed__));
@@ -335,7 +349,7 @@ send_rst(uint32_t dst_ip, uint16_t dst_prt, uint32_t src_prt,
 
 	if (!(lnh = libnet_init(LIBNET_RAW4, NULL, errbuf))) {
 		fprintf(stderr, "%s\n", errbuf);
-		return 0;
+		return 1;
 	}
 
 	if (!(control & TH_ACK))
@@ -345,7 +359,7 @@ send_rst(uint32_t dst_ip, uint16_t dst_prt, uint32_t src_prt,
 						 0, 0, 0, LIBNET_TCP_H, NULL, 0, lnh, 0) == -1) {
 		fprintf(stderr, "%s", libnet_geterror(lnh));
 		libnet_destroy(lnh);
-		return 0;
+		return 1;
 	}
 
 	if (libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_TCP_H, 0x10, 0, 0, 64,
@@ -353,19 +367,19 @@ send_rst(uint32_t dst_ip, uint16_t dst_prt, uint32_t src_prt,
 						  lnh, 0) == -1) {
 		fprintf(stderr, "%s", libnet_geterror(lnh));
 		libnet_destroy(lnh);
-		return 0;
+		return 1;
 	}
 
 	if (libnet_write(lnh) == -1) {
 		fprintf(stderr, "%s", libnet_geterror(lnh));
 		libnet_destroy(lnh);
-		return 0;
+		return 1;
 	}
 
 	fprintf(stderr, "RST'ing (Port = %d, State = %s, Control = %02x)\n",
 			src_prt, state_names[state], control);
 	libnet_destroy(lnh);
-	return 1;
+	return 0;
 }
 
 static TCB *
@@ -482,8 +496,6 @@ accept_session(TCB *listener, struct tcp_pkt *pkt)
 
 	sess->ackno = ntohl(pkt->hdr->th_seq) + 1;
 
-	/* XXX "any other control or text should be queued for processing later" */
-
 	send_tcp(sess, TH_SYN | TH_ACK, NULL, 0);
 	sess->state = TCP_SYN_RECV;
 	printf("%u: %s\n", sess->id, state_names[sess->state]);
@@ -539,27 +551,19 @@ tcp_process_syn_sent(TCB *sess, struct tcp_pkt *pkt)
 	if (pkt->hdr->th_flags & TH_ACK) {
 		if (ntohl(pkt->hdr->th_ack) != sess->seqno) {
 			fprintf(stderr, "Invalid ackno on %d\n", sess->id);
-			if (!(pkt->hdr->th_flags & TH_RST)) {
-				send_rst(pkt->ip->ip_src.s_addr, ntohs(pkt->hdr->th_sport),
-						 ntohs(pkt->hdr->th_dport), ntohl(pkt->hdr->th_ack),
-						 ntohl(pkt->hdr->th_seq) + 1,
-						 sess->state, pkt->hdr->th_flags);
-			} else {
-				remove_session(sess);
-			}
+			send_rst(pkt->ip->ip_src.s_addr, ntohs(pkt->hdr->th_sport),
+					 ntohs(pkt->hdr->th_dport), ntohl(pkt->hdr->th_ack),
+					 ntohl(pkt->hdr->th_seq) + 1,
+					 sess->state, pkt->hdr->th_flags);
+			remove_session(sess);
 			return;
 		} else {
 			sess->unacked = ntohl(pkt->hdr->th_ack);
 		}
 	}
 
-	if (pkt->hdr->th_flags & TH_RST) {
-		fprintf(stderr, "Remote host sent RST, closing %d\n", sess->id);
-		remove_session(sess);
-		return;
-	}
-
-	/* any other packet without SYN set we should just drop */
+	/* by now we've already handled RST and ACK. any other packet without SYN
+	 * should just be dropped */
 	if (!(pkt->hdr->th_flags & TH_SYN))
 		return;
 
@@ -757,9 +761,15 @@ tcp_state_machine(TCB *sess, struct tcp_pkt *pkt)
 		return;
 	}
 
+	if (pkt->hdr->th_flags & TH_RST) {
+		fprintf(stderr, "Remote host sent RST, closing %d\n", sess->id);
+		remove_session(sess);
+		return;
+	}
+
 	if (sess->state == TCP_SYN_SENT) {
 		tcp_process_syn_sent(sess, pkt);
-		/* it is "perfectly legitimate" to have "connection synchronization
+		/* XXX it is "perfectly legitimate" to have "connection synchronization
 		 * using data-carrying segments" but we don't handle that here. */
 		return;
 	}
@@ -770,12 +780,6 @@ tcp_state_machine(TCB *sess, struct tcp_pkt *pkt)
 	 * our last ACK. even if it didn't, we'll be in LISTEN or CLOSED, and it
 	 * will get a RST, which is probably not what's expected, but should work
 	 * just as well. */
-
-	if (pkt->hdr->th_flags & TH_RST) {
-		fprintf(stderr, "Remote host sent RST, closing %d\n", sess->id);
-		remove_session(sess);
-		return;
-	}
 
 	if (tcp_check_seqno(sess, pkt)) {
 		/* XXX should we be updating sess->unacked from hdr->th_ack here? */
