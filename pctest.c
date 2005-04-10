@@ -694,7 +694,7 @@ tcp_check_ackno(TCB *sess, struct tcp_pkt *pkt)
 			 sndnxt = sess->seqno;
 
 	if ((snduna <= segack) && (segack <= sndnxt)) {
-		sess->unacked = segack;
+		snduna = sess->unacked = segack;
 		/* XXX "the send window should be updated" */
 	} else if (segack < snduna) {
 		/* the ACK is a duplicate and can be ignored */
