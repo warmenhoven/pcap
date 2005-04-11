@@ -37,7 +37,6 @@
  *   General:
  *     - Don't call libnet_init so many times
  *     - Drop root privileges after opening pcap and raw sockets
- *     - Do proper length validation
  *
  *   Then there are the things done by a real TCP stack (as opposed to this
  *   toy), that aren't in the spec:
@@ -917,6 +916,12 @@ process_tcp_packet(struct ip_pkt *ip)
 	uint16_t csum;
 	int sum, len;
 
+	if (ntohs(ip->hdr->ip_len) < (ip->hdr->ip_hl << 2) + LIBNET_TCP_H) {
+		fprintf(stderr, "invalid tcp packet (src %s)\n",
+				libnet_addr2name4(ip->hdr->ip_src.s_addr, LIBNET_DONT_RESOLVE));
+		return;
+	}
+
 	tcp.ip = ip->hdr;
 	tcp.ip_options = ip->options;
 	tcp.hdr = (struct libnet_tcp_hdr *)ip->data;
@@ -952,6 +957,13 @@ process_tcp_packet(struct ip_pkt *ip)
 		return;
 	}
 
+	if (ntohs(ip->hdr->ip_len) <
+		(ip->hdr->ip_hl << 2) + (tcp.hdr->th_off << 2)) {
+		fprintf(stderr, "invalid th_off (src %s)\n",
+				libnet_addr2name4(ip->hdr->ip_src.s_addr, LIBNET_DONT_RESOLVE));
+		return;
+	}
+
 	tcp.tcp_options = (u_char *)tcp.hdr + LIBNET_TCP_H;
 	/* XXX we don't actually do anything with the options, but eh */
 
@@ -972,7 +984,8 @@ icmp_echo_reply(struct icmp_pkt *icmp)
 	libnet_t *lnh;
 	unsigned int len;
 
-	if (ntohs(icmp->ip->ip_len) < LIBNET_IPV4_H + LIBNET_ICMPV4_ECHO_H) {
+	if (ntohs(icmp->ip->ip_len) <
+		(icmp->ip->ip_hl << 2) + LIBNET_ICMPV4_ECHO_H) {
 		fprintf(stderr, "invalid icmp echo packet (src %s)\n",
 				libnet_addr2name4(icmp->ip->ip_src.s_addr,
 								  LIBNET_DONT_RESOLVE));
@@ -982,7 +995,8 @@ icmp_echo_reply(struct icmp_pkt *icmp)
 	printf("being pinged (src %s)\n",
 		   libnet_addr2name4(icmp->ip->ip_src.s_addr, LIBNET_DONT_RESOLVE));
 
-	len = ntohs(icmp->ip->ip_len) - LIBNET_IPV4_H - LIBNET_ICMPV4_ECHO_H;
+	len = ntohs(icmp->ip->ip_len) - (icmp->ip->ip_hl << 2) -
+		LIBNET_ICMPV4_ECHO_H;
 
 	if (!(lnh = libnet_init(LIBNET_RAW4, NULL, errbuf))) {
 		fprintf(stderr, "%s\n", errbuf);
@@ -1023,7 +1037,7 @@ process_icmp_echo_reply(struct icmp_pkt *icmp)
 
 	gettimeofday(&tv, NULL);
 
-	if (ntohs(icmp->ip->ip_len) != LIBNET_IPV4_H + 64) {
+	if (ntohs(icmp->ip->ip_len) != (icmp->ip->ip_hl << 2) + 64) {
 		fprintf(stderr, "improper echo reply (src %s)\n",
 				libnet_addr2name4(icmp->ip->ip_src.s_addr, LIBNET_RESOLVE));
 		return;
@@ -1118,8 +1132,13 @@ process_ip_packet(struct libnet_ethernet_hdr *enet, uint32_t len)
 				libnet_addr2name4(ip.hdr->ip_src.s_addr, LIBNET_DONT_RESOLVE));
 		return;
 	}
-	/* now we know that there's at least as much data as ip_len says, so we can
-	 * use that for validation from now on */
+	if ((ip.hdr->ip_hl << 2) > ntohs(ip.hdr->ip_len)) {
+		fprintf(stderr, "invalid ip_hl (src %s)\n",
+				libnet_addr2name4(ip.hdr->ip_src.s_addr, LIBNET_DONT_RESOLVE));
+		return;
+	}
+	/* now we know that there's at least as much data as ip_len says and that
+	 * ip_hl isn't invalid, so we can use those for validation from now on */
 
 	ip.options = (u_char *)ip.hdr + LIBNET_IPV4_H;
 	/* XXX we don't actually do anything with the options, but eh */
