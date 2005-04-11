@@ -29,10 +29,15 @@
  *     - data in inital SYN
  *     - URG
  *     - Better initial seqno generation
+ *     - slow start
+ *     - congestion avoidance
  *     - seqno wrap-around
  *     - Grow/shrink windows
- *     - retransmission/timers
+ *     - retransmission/timers (Karn, Jacobson, exp. backoff, etc.)
  *     - Deal with lost received data
+ *
+ *   General:
+ *     - argv parsing (specify device, user to run as, etc.)
  *
  *   Then there are the things done by a real TCP stack (as opposed to this
  *   toy), that aren't in the spec:
@@ -310,6 +315,8 @@ static list *listeners = NULL;
 static int sp[2];
 static libnet_t *lnh_link = NULL;
 static libnet_t *lnh_raw4 = NULL;
+static u_int16_t ip_id;
+static const u_int8_t ip_ttl = 64;
 
 static int
 send_tcp(TCB *sess, int flags, u_char *data, uint32_t len)
@@ -322,9 +329,9 @@ send_tcp(TCB *sess, int flags, u_char *data, uint32_t len)
 		fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
 		return 1;
 	}
-	if (libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_TCP_H, IPTOS_RELIABILITY, 242,
-						  0, 64, IPPROTO_TCP, 0, src_ip, sess->dst_ip, NULL, 0,
-						  lnh_raw4, 0) == -1) {
+	if (libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_TCP_H, IPTOS_RELIABILITY,
+						  ip_id++, 0, ip_ttl, IPPROTO_TCP, 0, src_ip,
+						  sess->dst_ip, NULL, 0, lnh_raw4, 0) == -1) {
 		fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
 		return 1;
 	}
@@ -362,8 +369,8 @@ send_rst(uint32_t dst_ip, uint16_t dst_prt, uint32_t src_prt,
 		return 1;
 	}
 
-	if (libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_TCP_H, IPTOS_LOWDELAY, 0, 0,
-						  64, IPPROTO_TCP, 0, src_ip, dst_ip, NULL, 0,
+	if (libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_TCP_H, IPTOS_LOWDELAY, ip_id++,
+						  0, ip_ttl, IPPROTO_TCP, 0, src_ip, dst_ip, NULL, 0,
 						  lnh_raw4, 0) == -1) {
 		fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
 		return 1;
@@ -981,7 +988,7 @@ icmp_echo_reply(struct icmp_pkt *icmp)
 	}
 
 	if (libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_ICMPV4_ECHO_H + len,
-						  icmp->ip->ip_tos, 0x42, 0, 64, IPPROTO_ICMP, 0,
+						  icmp->ip->ip_tos, ip_id++, 0, ip_ttl, IPPROTO_ICMP, 0,
 						  src_ip, icmp->ip->ip_src.s_addr,
 						  NULL, 0, lnh_raw4, 0) == -1) {
 		fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
@@ -1208,9 +1215,9 @@ ping(char *host)
 		return;
 	}
 
-	if (libnet_build_ipv4(LIBNET_IPV4_H + 64, IPTOS_LOWDELAY, 0, 0,
-						  64, IPPROTO_ICMP, 0, src_ip, dst_ip,
-						  NULL, 0, lnh_raw4, 0) == -1) {
+	if (libnet_build_ipv4(LIBNET_IPV4_H + 64, IPTOS_LOWDELAY, ip_id++, 0,
+						  ip_ttl, IPPROTO_ICMP, 0, src_ip, dst_ip, NULL, 0,
+						  lnh_raw4, 0) == -1) {
 		fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
 		return;
 	}
@@ -1525,21 +1532,15 @@ packet_main(u_char *user __attribute__((__unused__)),
 }
 
 static pcap_t *
-init_pcap(void)
+init_pcap(char *dev)
 {
 	char errbuf[PCAP_ERRBUF_SIZE];
-	char *dev;
 	pcap_t *lph;
 
 	bpf_u_int32 net;
 	bpf_u_int32 mask;
 	char *filter_line;
 	struct bpf_program filter;
-
-	if (!(dev = pcap_lookupdev(errbuf))) {
-		fprintf(stderr, "%s\n", errbuf);
-		return NULL;
-	}
 
 	if (!(lph = pcap_open_live(dev, BUFSIZ, 0, 0, errbuf))) {
 		fprintf(stderr, "%s\n", errbuf);
@@ -1576,22 +1577,27 @@ main(int argc, char **argv)
 	char errbuf[LIBNET_ERRBUF_SIZE];
 	pcap_t *lph;
 
+	const char *user = "nobody";
+	char *dev = NULL;
+
 	if (argc < 2) {
 		printf("Usage: %s <ip>\n", argv[0]);
 		return 1;
 	}
 
-	if (!(lnh_raw4 = libnet_init(LIBNET_RAW4, NULL, errbuf))) {
+	if (!(lnh_link = libnet_init(LIBNET_LINK, dev, errbuf))) {
 		fprintf(stderr, "%s\n", errbuf);
 		return 1;
 	}
+	dev = (char *)libnet_getdevice(lnh_link);
 
-	libnet_seed_prand(lnh_raw4);
+	libnet_seed_prand(lnh_link);
 
 	/* setup of global variables */
-	memcpy(src_hw, libnet_get_hwaddr(lnh_raw4), 6);
+	memcpy(src_hw, libnet_get_hwaddr(lnh_link), 6);
+	ip_id = libnet_get_prand(LIBNET_PRu16);
 
-	if (!(lnh_link = libnet_init(LIBNET_LINK, NULL, errbuf))) {
+	if (!(lnh_raw4 = libnet_init(LIBNET_RAW4, dev, errbuf))) {
 		fprintf(stderr, "%s\n", errbuf);
 		return 1;
 	}
@@ -1616,14 +1622,15 @@ main(int argc, char **argv)
 		return 1;
 	}
 
-	if (!(lph = init_pcap()))
+	if (!(lph = init_pcap(dev)))
 		return 1;
 
 	/* now that we've created all of our sockets and opened up pcap, drop root
-	 * privileges and run as user 'nobody' */
-	pswd = getpwnam("nobody");
+	 * privileges and run as specified user (defaults to 'nobody'). right now
+	 * there's no way to specify it without changing the code though. */
+	pswd = getpwnam(user);
 	if (!pswd || setuid(pswd->pw_uid)) {
-		fprintf(stderr, "can't drop root privs\n");
+		fprintf(stderr, "I ain't %s! (can't drop root privs)\n", user);
 		return 1;
 	}
 
