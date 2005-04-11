@@ -388,8 +388,9 @@ send_rst(uint32_t dst_ip, uint16_t dst_prt, uint32_t src_prt,
 		return 1;
 	}
 
-	fprintf(stderr, "RST'ing (Port = %d, State = %s, Control = %02x)\n",
-			src_prt, state_names[state], control);
+	fprintf(stderr, "RST'ing (IP = %s, Port = %d, State = %s, Cntrl = %02x)\n",
+			libnet_addr2name4(dst_ip, LIBNET_DONT_RESOLVE), src_prt,
+			state_names[state], control);
 	libnet_destroy(lnh);
 	return 0;
 }
