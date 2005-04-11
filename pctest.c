@@ -376,8 +376,8 @@ send_rst(uint32_t dst_ip, uint16_t dst_prt, uint32_t src_prt,
 		return 1;
 	}
 
-	if (libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_TCP_H, 0x10, 0, 0, 64,
-						  IPPROTO_TCP, 0, src_ip, dst_ip, NULL, 0,
+	if (libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_TCP_H, IPTOS_LOWDELAY, 0, 0,
+						  64, IPPROTO_TCP, 0, src_ip, dst_ip, NULL, 0,
 						  lnh, 0) == -1) {
 		fprintf(stderr, "%s", libnet_geterror(lnh));
 		libnet_destroy(lnh);
@@ -972,12 +972,22 @@ icmp_echo_reply(struct icmp_pkt *icmp)
 	libnet_t *lnh;
 	unsigned int len;
 
+	if (ntohs(icmp->ip->ip_len) < LIBNET_IPV4_H + LIBNET_ICMPV4_ECHO_H) {
+		fprintf(stderr, "invalid icmp echo packet (src %s)\n",
+				libnet_addr2name4(icmp->ip->ip_src.s_addr,
+								  LIBNET_DONT_RESOLVE));
+		return;
+	}
+
+	printf("being pinged (src %s)\n",
+		   libnet_addr2name4(icmp->ip->ip_src.s_addr, LIBNET_DONT_RESOLVE));
+
+	len = ntohs(icmp->ip->ip_len) - LIBNET_IPV4_H - LIBNET_ICMPV4_ECHO_H;
+
 	if (!(lnh = libnet_init(LIBNET_RAW4, NULL, errbuf))) {
 		fprintf(stderr, "%s\n", errbuf);
 		return;
 	}
-
-	len = ntohs(icmp->ip->ip_len) - LIBNET_IPV4_H - LIBNET_ICMPV4_ECHO_H;
 
 	if (libnet_build_icmpv4_echo(ICMP_ECHOREPLY, 0, 0, ntohs(icmp->hdr->icmp_id),
 								 ntohs(icmp->hdr->icmp_seq),
@@ -1006,27 +1016,47 @@ icmp_echo_reply(struct icmp_pkt *icmp)
 }
 
 static void
+process_icmp_echo_reply(struct icmp_pkt *icmp)
+{
+	struct timeval tv, diff;
+	int i;
+
+	gettimeofday(&tv, NULL);
+
+	if (ntohs(icmp->ip->ip_len) != LIBNET_IPV4_H + 64) {
+		fprintf(stderr, "improper echo reply (src %s)\n",
+				libnet_addr2name4(icmp->ip->ip_src.s_addr, LIBNET_RESOLVE));
+		return;
+	}
+
+	for (i = sizeof (struct timeval); i < 64 - LIBNET_ICMPV4_ECHO_H; i++) {
+		if (icmp->hdr->icmp_data[i] != i) {
+			fprintf(stderr, "byte %d is %02x, should be %02x\n",
+					i, icmp->hdr->icmp_data[i], i);
+		}
+	}
+
+	timersub(&tv, (struct timeval *)(icmp->hdr->icmp_data), &diff);
+	printf("received ping response from %s (%ld.%.03ld ms)\n",
+		   libnet_addr2name4(icmp->ip->ip_src.s_addr, LIBNET_RESOLVE),
+		   (diff.tv_sec * 1000) + (diff.tv_usec / 1000),
+		   diff.tv_usec % 1000);
+}
+
+static void
 process_icmp_packet(struct ip_pkt *ip)
 {
 	struct icmp_pkt icmp;
-	struct timeval tv, diff;
 
 	icmp.ip = ip->hdr;
 	icmp.hdr = (struct libnet_icmpv4_hdr *)ip->data;
 
 	switch (icmp.hdr->icmp_type) {
 	case ICMP_ECHO:
-		printf("being pinged (src %s)\n",
-			   libnet_addr2name4(ip->hdr->ip_src.s_addr, LIBNET_DONT_RESOLVE));
 		icmp_echo_reply(&icmp);
 		break;
 	case ICMP_ECHOREPLY:
-		gettimeofday(&tv, NULL);
-		timersub(&tv, (struct timeval *)(icmp.hdr->icmp_data), &diff);
-		printf("received ping response from %s (%ld.%.03ld ms)\n",
-			   libnet_addr2name4(ip->hdr->ip_src.s_addr, LIBNET_RESOLVE),
-			   (diff.tv_sec * 1000) + (diff.tv_usec / 1000),
-			   diff.tv_usec % 1000);
+		process_icmp_echo_reply(&icmp);
 		break;
 	default:
 		fprintf(stderr, "received unhandled icmp type %d (src %s)\n",
@@ -1205,7 +1235,7 @@ ping(char *host)
 		return;
 	}
 
-	if (libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_ICMPV4_ECHO_H + 64, 0, 0, 0,
+	if (libnet_build_ipv4(LIBNET_IPV4_H + 64, IPTOS_LOWDELAY, 0, 0,
 						  64, IPPROTO_ICMP, 0, src_ip, dst_ip,
 						  NULL, 0, lnh, 0) == -1) {
 		fprintf(stderr, "%s", libnet_geterror(lnh));
@@ -1620,6 +1650,10 @@ main(int argc, char **argv)
 	 * but then you'll have to modify this client to handle all the routing
 	 * details itself, and that's not fun. */
 	src_ip = libnet_name2addr4(lnh, argv[1], LIBNET_RESOLVE);
+	if (src_ip == (uint32_t)-1) {
+		fprintf(stderr, "invalid host name %s\n", argv[1]);
+		return 1;
+	}
 	libnet_destroy(lnh);
 
 	if (!(lph = init_pcap()))
