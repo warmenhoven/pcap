@@ -1475,20 +1475,20 @@ arp_reply(const unsigned char hw[6], uint32_t ip)
 						 src_hw, (u_char *)&src_ip, hwa, (u_char *)&ip,
 						 NULL, 0, lnh_link, 0) == -1) {
 		fprintf(stderr, "%s", libnet_geterror(lnh_link));
-		return 0;
+		return 1;
 	}
 
 	if (libnet_autobuild_ethernet(hwa, ETHERTYPE_ARP, lnh_link) == -1) {
 		fprintf(stderr, "%s", libnet_geterror(lnh_link));
-		return 0;
+		return 1;
 	}
 
 	if (libnet_write(lnh_link) == -1) {
 		fprintf(stderr, "%s", libnet_geterror(lnh_link));
-		return 0;
+		return 1;
 	}
 
-	return 1;
+	return 0;
 }
 
 /* 'main' is a misnomer since it's not really a "main" function, it's a
@@ -1619,7 +1619,8 @@ main(int argc, char **argv)
 	if (!(lph = init_pcap()))
 		return 1;
 
-	/* drop root privileges, run as user 'nobody' */
+	/* now that we've created all of our sockets and opened up pcap, drop root
+	 * privileges and run as user 'nobody' */
 	pswd = getpwnam("nobody");
 	if (!pswd || setuid(pswd->pw_uid)) {
 		fprintf(stderr, "can't drop root privs\n");
