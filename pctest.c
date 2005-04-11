@@ -34,10 +34,6 @@
  *     - retransmission/timers
  *     - Deal with lost received data
  *
- *   General:
- *     - Don't call libnet_init so many times
- *     - Drop root privileges after opening pcap and raw sockets
- *
  *   Then there are the things done by a real TCP stack (as opposed to this
  *   toy), that aren't in the spec:
  *    - delayed/selective ACKs
@@ -50,6 +46,7 @@
 #include <libnet.h>
 #include <pcap.h>
 #include <pthread.h>
+#include <pwd.h>
 
 /* LIST { */
 typedef struct _list {
@@ -235,12 +232,6 @@ typedef struct tcp_session {
 
 	uint32_t state;
 
-	/* quite honestly each session doesn't need its own socket but it does
-	 * make some things simpler */
-	libnet_t *lnh;
-	libnet_ptag_t tcp_id;
-	libnet_ptag_t ip_id;
-
 	/* these describe the session. the src_ip is global. libnet_name2addr4
 	 * puts ip addresses in network byte order, so those will always be
 	 * that way. however, ports stored in the session will always be host
@@ -317,27 +308,29 @@ static list *sessions = NULL;
 static list *open_connections = NULL;
 static list *listeners = NULL;
 static int sp[2];
+static libnet_t *lnh_link = NULL;
+static libnet_t *lnh_raw4 = NULL;
 
 static int
 send_tcp(TCB *sess, int flags, u_char *data, uint32_t len)
 {
-	if ((sess->tcp_id =
-		 libnet_build_tcp(sess->src_prt, sess->dst_prt, sess->seqno,
-						  sess->ackno, flags, sess->rcv_win, 0, 0, LIBNET_TCP_H,
-						  data, len, sess->lnh, sess->tcp_id)) == -1) {
-		fprintf(stderr, "%s", libnet_geterror(sess->lnh));
+	libnet_clear_packet(lnh_raw4);
+
+	if (libnet_build_tcp(sess->src_prt, sess->dst_prt, sess->seqno, sess->ackno,
+						 flags, sess->rcv_win, 0, 0, LIBNET_TCP_H, data, len,
+						 lnh_raw4, 0) == -1) {
+		fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
 		return 1;
 	}
-	if ((sess->ip_id =
-		 libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_TCP_H, IPTOS_RELIABILITY, 242,
-						   0, 64, IPPROTO_TCP, 0, src_ip, sess->dst_ip, NULL, 0,
-						   sess->lnh, sess->ip_id)) == -1) {
-		fprintf(stderr, "%s", libnet_geterror(sess->lnh));
+	if (libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_TCP_H, IPTOS_RELIABILITY, 242,
+						  0, 64, IPPROTO_TCP, 0, src_ip, sess->dst_ip, NULL, 0,
+						  lnh_raw4, 0) == -1) {
+		fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
 		return 1;
 	}
 
-	if (libnet_write(sess->lnh) == -1) {
-		fprintf(stderr, "%s", libnet_geterror(sess->lnh));
+	if (libnet_write(lnh_raw4) == -1) {
+		fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
 		return 1;
 	}
 
@@ -356,43 +349,34 @@ static int
 send_rst(uint32_t dst_ip, uint16_t dst_prt, uint32_t src_prt,
 		 uint32_t seqno, uint32_t ackno, int state, int control)
 {
-	char errbuf[LIBNET_ERRBUF_SIZE];
-	libnet_t *lnh;
 	u_int8_t cntrl = TH_RST;
-
-	if (!(lnh = libnet_init(LIBNET_RAW4, NULL, errbuf))) {
-		fprintf(stderr, "%s\n", errbuf);
-		return 1;
-	}
 
 	if (!(control & TH_ACK))
 		cntrl |= TH_ACK;
 
-	if (libnet_build_tcp(src_prt, dst_prt, seqno, ackno, cntrl,
-						 0, 0, 0, LIBNET_TCP_H, NULL, 0, lnh, 0) == -1) {
-		fprintf(stderr, "%s", libnet_geterror(lnh));
-		libnet_destroy(lnh);
+	libnet_clear_packet(lnh_raw4);
+
+	if (libnet_build_tcp(src_prt, dst_prt, seqno, ackno, cntrl, 0, 0, 0,
+						 LIBNET_TCP_H, NULL, 0, lnh_raw4, 0) == -1) {
+		fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
 		return 1;
 	}
 
 	if (libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_TCP_H, IPTOS_LOWDELAY, 0, 0,
 						  64, IPPROTO_TCP, 0, src_ip, dst_ip, NULL, 0,
-						  lnh, 0) == -1) {
-		fprintf(stderr, "%s", libnet_geterror(lnh));
-		libnet_destroy(lnh);
+						  lnh_raw4, 0) == -1) {
+		fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
 		return 1;
 	}
 
-	if (libnet_write(lnh) == -1) {
-		fprintf(stderr, "%s", libnet_geterror(lnh));
-		libnet_destroy(lnh);
+	if (libnet_write(lnh_raw4) == -1) {
+		fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
 		return 1;
 	}
 
 	fprintf(stderr, "RST'ing (IP = %s, Port = %d, State = %s, Cntrl = %02x)\n",
 			libnet_addr2name4(dst_ip, LIBNET_DONT_RESOLVE), src_prt,
 			state_names[state], control);
-	libnet_destroy(lnh);
 	return 0;
 }
 
@@ -467,15 +451,8 @@ static TCB *
 session_setup(void)
 {
 	TCB *sess = calloc(1, sizeof (TCB));
-	char errbuf[LIBNET_ERRBUF_SIZE];
 
 	/* sess->state = TCP_CLOSE; */
-
-	if (!(sess->lnh = libnet_init(LIBNET_RAW4, NULL, errbuf))) {
-		fprintf(stderr, "%s\n", errbuf);
-		free(sess);
-		return NULL;
-	}
 
 	/* XXX this isn't actually supposed to be random; it's supposed to be
 	 * somewhat internal-clock-based so that if we happen to be using the same
@@ -529,7 +506,6 @@ remove_session(TCB *sess)
 		open_connections = list_remove(open_connections, sess);
 	}
 	sessions = list_remove(sessions, sess);
-	libnet_destroy(sess->lnh);
 	timer_cancel(sess->tmr);
 	free(sess);
 }
@@ -978,10 +954,6 @@ process_tcp_packet(struct ip_pkt *ip)
 static void
 icmp_echo_reply(struct icmp_pkt *icmp)
 {
-	/* we probably could make this handle static so that we don't have to
-	 * rebuild it too many times */
-	char errbuf[LIBNET_ERRBUF_SIZE];
-	libnet_t *lnh;
 	unsigned int len;
 
 	if (ntohs(icmp->ip->ip_len) <
@@ -998,35 +970,27 @@ icmp_echo_reply(struct icmp_pkt *icmp)
 	len = ntohs(icmp->ip->ip_len) - (icmp->ip->ip_hl << 2) -
 		LIBNET_ICMPV4_ECHO_H;
 
-	if (!(lnh = libnet_init(LIBNET_RAW4, NULL, errbuf))) {
-		fprintf(stderr, "%s\n", errbuf);
-		return;
-	}
+	libnet_clear_packet(lnh_raw4);
 
 	if (libnet_build_icmpv4_echo(ICMP_ECHOREPLY, 0, 0, ntohs(icmp->hdr->icmp_id),
 								 ntohs(icmp->hdr->icmp_seq),
 								 (u_int8_t *)icmp->hdr->icmp_data, len,
-								 lnh, 0) == -1) {
-		fprintf(stderr, "%s", libnet_geterror(lnh));
-		libnet_destroy(lnh);
+								 lnh_raw4, 0) == -1) {
+		fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
 		return;
 	}
 
 	if (libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_ICMPV4_ECHO_H + len,
 						  icmp->ip->ip_tos, 0x42, 0, 64, IPPROTO_ICMP, 0,
 						  src_ip, icmp->ip->ip_src.s_addr,
-						  NULL, 0, lnh, 0) == -1) {
-		fprintf(stderr, "%s", libnet_geterror(lnh));
-		libnet_destroy(lnh);
+						  NULL, 0, lnh_raw4, 0) == -1) {
+		fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
 		return;
 	}
 
-	if (libnet_write(lnh) == -1) {
-		fprintf(stderr, "%s", libnet_geterror(lnh));
+	if (libnet_write(lnh_raw4) == -1) {
+		fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
 	}
-
-	libnet_destroy(lnh);
-	return;
 }
 
 static void
@@ -1221,24 +1185,15 @@ process_packet(void)
 static void
 ping(char *host)
 {
-	/* we probably could make this handle static so that we don't have to
-	 * rebuild it too many times */
-	char errbuf[LIBNET_ERRBUF_SIZE];
-	libnet_t *lnh;
-	libnet_ptag_t tag;
 	uint32_t dst_ip;
 	u_char payload[64 - LIBNET_ICMPV4_ECHO_H];
 	unsigned int i;
 
-	if (!(lnh = libnet_init(LIBNET_RAW4, NULL, errbuf))) {
-		fprintf(stderr, "%s\n", errbuf);
-		return;
-	}
+	libnet_clear_packet(lnh_raw4);
 
-	dst_ip = libnet_name2addr4(lnh, host, LIBNET_RESOLVE);
+	dst_ip = libnet_name2addr4(lnh_raw4, host, LIBNET_RESOLVE);
 	if (dst_ip == 0xffffffff) {
-		fprintf(stderr, "%s", libnet_geterror(lnh));
-		libnet_destroy(lnh);
+		fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
 		return;
 	}
 
@@ -1247,27 +1202,22 @@ ping(char *host)
 
 	gettimeofday((struct timeval *)&payload[0], NULL);
 
-	if ((tag = libnet_build_icmpv4_echo(ICMP_ECHO, 0, 0, 0x42, 0, payload,
-										sizeof (payload), lnh, 0)) == -1) {
-		fprintf(stderr, "%s", libnet_geterror(lnh));
-		libnet_destroy(lnh);
+	if (libnet_build_icmpv4_echo(ICMP_ECHO, 0, 0, 0x42, 0, payload,
+								 sizeof (payload), lnh_raw4, 0) == -1) {
+		fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
 		return;
 	}
 
 	if (libnet_build_ipv4(LIBNET_IPV4_H + 64, IPTOS_LOWDELAY, 0, 0,
 						  64, IPPROTO_ICMP, 0, src_ip, dst_ip,
-						  NULL, 0, lnh, 0) == -1) {
-		fprintf(stderr, "%s", libnet_geterror(lnh));
-		libnet_destroy(lnh);
+						  NULL, 0, lnh_raw4, 0) == -1) {
+		fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
 		return;
 	}
 
-	if (libnet_write(lnh) == -1) {
-		fprintf(stderr, "%s", libnet_geterror(lnh));
+	if (libnet_write(lnh_raw4) == -1) {
+		fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
 	}
-
-	libnet_destroy(lnh);
-	return;
 }
 
 /* maybe eventually there will be a third argument, so you can specify the port
@@ -1285,10 +1235,9 @@ create_session(char *host, uint16_t port)
 		 * src_ip, so that we can detect when we're trying to send
 		 * packets to ourselves, because we won't be able to put those
 		 * packets out over the wire */
-		sess->dst_ip = libnet_name2addr4(sess->lnh, host,
-						 LIBNET_RESOLVE);
+		sess->dst_ip = libnet_name2addr4(lnh_raw4, host, LIBNET_RESOLVE);
 		if (sess->dst_ip == 0xffffffff) {
-			fprintf(stderr, "%s", libnet_geterror(sess->lnh));
+			fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
 			free(sess);
 			return NULL;
 		}
@@ -1512,45 +1461,33 @@ control_main(void *arg __attribute__((__unused__)))
 static int
 arp_reply(const unsigned char hw[6], uint32_t ip)
 {
-	/* we probably could make this handle static so that we don't have to
-	 * rebuild it too many times, but hopefully we should only need to
-	 * build it once. */
-	char errbuf[LIBNET_ERRBUF_SIZE];
-	libnet_t *lnh;
 	unsigned char hwa[6];
 
 	printf("replying to arp from %s (%02x:%02x:%02x:%02x:%02x:%02x)\n",
 		   libnet_addr2name4(ip, LIBNET_DONT_RESOLVE),
 		   hw[0], hw[1], hw[2], hw[3], hw[4], hw[5]);
 
-	if (!(lnh = libnet_init(LIBNET_LINK, NULL, errbuf))) {
-		fprintf(stderr, "%s\n", errbuf);
-		return 0;
-	}
-
 	memcpy(hwa, hw, 6);
+
+	libnet_clear_packet(lnh_link);
 
 	if (libnet_build_arp(ARPHRD_ETHER, ETHERTYPE_IP, 6, 4, ARPOP_REPLY,
 						 src_hw, (u_char *)&src_ip, hwa, (u_char *)&ip,
-						 NULL, 0, lnh, 0) == -1) {
-		fprintf(stderr, "%s", libnet_geterror(lnh));
-		libnet_destroy(lnh);
+						 NULL, 0, lnh_link, 0) == -1) {
+		fprintf(stderr, "%s", libnet_geterror(lnh_link));
 		return 0;
 	}
 
-	if (libnet_autobuild_ethernet(hwa, ETHERTYPE_ARP, lnh) == -1) {
-		fprintf(stderr, "%s", libnet_geterror(lnh));
-		libnet_destroy(lnh);
+	if (libnet_autobuild_ethernet(hwa, ETHERTYPE_ARP, lnh_link) == -1) {
+		fprintf(stderr, "%s", libnet_geterror(lnh_link));
 		return 0;
 	}
 
-	if (libnet_write(lnh) == -1) {
-		fprintf(stderr, "%s", libnet_geterror(lnh));
-		libnet_destroy(lnh);
+	if (libnet_write(lnh_link) == -1) {
+		fprintf(stderr, "%s", libnet_geterror(lnh_link));
 		return 0;
 	}
 
-	libnet_destroy(lnh);
 	return 1;
 }
 
@@ -1633,27 +1570,32 @@ init_pcap(void)
 int
 main(int argc, char **argv)
 {
+	struct passwd *pswd;
 	pthread_t thread;
 
 	char errbuf[LIBNET_ERRBUF_SIZE];
 	pcap_t *lph;
-
-	libnet_t *lnh;
 
 	if (argc < 2) {
 		printf("Usage: %s <ip>\n", argv[0]);
 		return 1;
 	}
 
-	if (!(lnh = libnet_init(LIBNET_RAW4, NULL, errbuf))) {
+	if (!(lnh_raw4 = libnet_init(LIBNET_RAW4, NULL, errbuf))) {
 		fprintf(stderr, "%s\n", errbuf);
 		return 1;
 	}
 
-	libnet_seed_prand(lnh);
+	libnet_seed_prand(lnh_raw4);
 
 	/* setup of global variables */
-	memcpy(src_hw, libnet_get_hwaddr(lnh), 6);
+	memcpy(src_hw, libnet_get_hwaddr(lnh_raw4), 6);
+
+	if (!(lnh_link = libnet_init(LIBNET_LINK, NULL, errbuf))) {
+		fprintf(stderr, "%s\n", errbuf);
+		return 1;
+	}
+
 	/* you need to pick this IP address based on three characteristics:
 	 *
 	 * 1. it cannot be the same address as the host's address
@@ -1668,15 +1610,21 @@ main(int argc, char **argv)
 	 * that address, then you shouldn't have to worry about any of that.
 	 * but then you'll have to modify this client to handle all the routing
 	 * details itself, and that's not fun. */
-	src_ip = libnet_name2addr4(lnh, argv[1], LIBNET_RESOLVE);
+	src_ip = libnet_name2addr4(lnh_raw4, argv[1], LIBNET_RESOLVE);
 	if (src_ip == (uint32_t)-1) {
 		fprintf(stderr, "invalid host name %s\n", argv[1]);
 		return 1;
 	}
-	libnet_destroy(lnh);
 
 	if (!(lph = init_pcap()))
 		return 1;
+
+	/* drop root privileges, run as user 'nobody' */
+	pswd = getpwnam("nobody");
+	if (!pswd || setuid(pswd->pw_uid)) {
+		fprintf(stderr, "can't drop root privs\n");
+		return 1;
+	}
 
 	/* there are five (well, actually three) options if you want to have a
 	 * main loop other than pcap_loop:
@@ -1702,6 +1650,8 @@ main(int argc, char **argv)
 	 * no need for locking. */
 	socketpair(AF_UNIX, SOCK_STREAM, 0, sp);
 	pthread_create(&thread, NULL, control_main, NULL);
+	/* from now on, lnh_link is only allowed to be used by the pcap thread, and
+	 * lnh_raw4 is only allowed to be used by the control thread */
 
 	pcap_loop(lph, -1, packet_main, NULL);
 
