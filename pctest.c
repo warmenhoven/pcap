@@ -18,28 +18,30 @@
  *
  * TODO:
  *   IP:
- *     - Parse IP options
- *     - Support IP fragments
- *     - Support precedence
- *     - Support loopback (talking to self without gateway)
+ *     - IP options
+ *     - IP fragments
+ *     - precedence
+ *     - Loopback
+ *     - Talk to host
  *
  *   TCP:
- *     - Parse TCP options
- *     - Handle data in inital SYN
- *     - Support URG data
+ *     - TCP options
+ *     - data in inital SYN
+ *     - URG
  *     - Better initial seqno generation
- *     - Handle seqno wrap-around
+ *     - seqno wrap-around
  *     - Grow/shrink windows
- *     - Use timers and retransmission
+ *     - retransmission/timers
  *     - Deal with lost received data
  *
  *   General:
  *     - Don't call libnet_init so many times
  *     - Drop root privileges after opening pcap and raw sockets
+ *     - Do proper length validation
  *
  *   Then there are the things done by a real TCP stack (as opposed to this
  *   toy), that aren't in the spec:
- *    - delayed ACKs
+ *    - delayed/selective ACKs
  *    - header prediction
  *
  *   And finally, all of the evil things I'd like to do:
@@ -932,7 +934,7 @@ process_tcp_packet(struct ip_pkt *ip)
 		return;
 	}
 
-	if ((unsigned int)(tcp.hdr->th_off << 2) < sizeof (struct libnet_tcp_hdr)) {
+	if ((tcp.hdr->th_off << 2) < LIBNET_TCP_H) {
 		fprintf(stderr, "invalid TCP header (src %s)!\n",
 				libnet_addr2name4(ip->hdr->ip_src.s_addr, LIBNET_DONT_RESOLVE));
 		return;
@@ -950,7 +952,7 @@ process_tcp_packet(struct ip_pkt *ip)
 		return;
 	}
 
-	tcp.tcp_options = (u_char *)tcp.hdr + sizeof (struct libnet_tcp_hdr);
+	tcp.tcp_options = (u_char *)tcp.hdr + LIBNET_TCP_H;
 	/* XXX we don't actually do anything with the options, but eh */
 
 	tcp.data = (u_char *)&tcp.hdr->th_sport + (tcp.hdr->th_off << 2);
@@ -1035,11 +1037,16 @@ process_icmp_packet(struct ip_pkt *ip)
 }
 
 static void
-process_ip_packet(struct libnet_ethernet_hdr *enet)
+process_ip_packet(struct libnet_ethernet_hdr *enet, uint32_t len)
 {
 	struct ip_pkt ip;
 	uint16_t csum;
 	int sum;
+
+	if (len < LIBNET_ETH_H + LIBNET_IPV4_H) {
+		fprintf(stderr, "packet does not include full header\n");
+		return;
+	}
 
 	ip.hdr = (struct libnet_ipv4_hdr *)(enet + 1);
 
@@ -1076,7 +1083,15 @@ process_ip_packet(struct libnet_ethernet_hdr *enet)
 		return;
 	}
 
-	ip.options = (u_char *)ip.hdr + sizeof (struct libnet_ipv4_hdr);
+	if (len < (uint32_t)(LIBNET_ETH_H + (uint16_t)ntohs(ip.hdr->ip_len))) {
+		fprintf(stderr, "invalid ip_len (src %s)\n",
+				libnet_addr2name4(ip.hdr->ip_src.s_addr, LIBNET_DONT_RESOLVE));
+		return;
+	}
+	/* now we know that there's at least as much data as ip_len says, so we can
+	 * use that for validation from now on */
+
+	ip.options = (u_char *)ip.hdr + LIBNET_IPV4_H;
 	/* XXX we don't actually do anything with the options, but eh */
 
 	ip.data = (u_char *)ip.hdr + (ip.hdr->ip_hl << 2);
@@ -1132,11 +1147,17 @@ process_packet(void)
 	printf("\n\n");
 #endif
 
+	if (hdr.len < LIBNET_ETH_H) {
+		fprintf(stderr, "pcap packet too short!\n");
+		free(pkt);
+		return;
+	}
+
 	enet = (struct libnet_ethernet_hdr *)pkt;
 
 	switch (ntohs(enet->ether_type)) {
 	case ETHERTYPE_IP:
-		process_ip_packet(enet);
+		process_ip_packet(enet, hdr.len);
 		break;
 	default:
 		fprintf(stderr, "received unhandled ethernet type %d\n",
@@ -1449,6 +1470,10 @@ arp_reply(const unsigned char hw[6], uint32_t ip)
 	libnet_t *lnh;
 	unsigned char hwa[6];
 
+	printf("replying to arp from %s (%02x:%02x:%02x:%02x:%02x:%02x)\n",
+		   libnet_addr2name4(ip, LIBNET_DONT_RESOLVE),
+		   hw[0], hw[1], hw[2], hw[3], hw[4], hw[5]);
+
 	if (!(lnh = libnet_init(LIBNET_LINK, NULL, errbuf))) {
 		fprintf(stderr, "%s\n", errbuf);
 		return 0;
@@ -1497,7 +1522,7 @@ packet_main(u_char *user __attribute__((__unused__)),
 		 * our client, we need to just ignore it. the host should deal
 		 * with this gracefully. (there has to be a better way.) */
 		const struct arp *arp = (const struct arp *)pkt;
-		if (hdr->len < sizeof (struct arp))
+		if (hdr->len < LIBNET_ARP_ETH_IP_H)
 			return;
 		if ((ntohs(arp->hdr.ar_hrd) == ARPHRD_ETHER) &&	/* ethernet*/
 			(ntohs(arp->hdr.ar_pro) == ETHERTYPE_IP) &&	/* ipv4 */
