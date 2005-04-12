@@ -1579,7 +1579,7 @@ packet_main(u_char *user __attribute__((__unused__)),
 		 * our client, we need to just ignore it. the host should deal
 		 * with this gracefully. (there has to be a better way.) */
 		const struct arp *arp = (const struct arp *)pkt;
-		if (hdr->len < LIBNET_ARP_ETH_IP_H)
+		if (hdr->len < LIBNET_ETH_H + LIBNET_ARP_ETH_IP_H)
 			return;
 		if ((ntohs(arp->hdr.ar_hrd) == ARPHRD_ETHER) &&	/* ethernet*/
 			(ntohs(arp->hdr.ar_pro) == ETHERTYPE_IP) &&	/* ipv4 */
