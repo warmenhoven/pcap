@@ -1,4 +1,4 @@
-LDLIBS += -lpcap -lnet -lpthread
+LDLIBS += -lnet -lpcap -lpthread
 
 TARGET = pctest
 
@@ -10,7 +10,7 @@ clean:
 test: $(TARGET)
 	./tcp
 
-ifneq "$(PICKY)" ""
+ifneq "$(PICKY)" "0"
 NITPICKY_WARNINGS =	\
 			-W \
 			-Waggregate-return \

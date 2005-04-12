@@ -39,6 +39,7 @@
  *
  *   General:
  *     - argv parsing (specify device, user to run as, etc.)
+ *     - convince the host we're running on that it can safely ignore us
  *
  *   Then there are the things done by a real TCP stack (as opposed to this
  *   toy), that aren't in the spec:
@@ -1497,7 +1498,6 @@ process_input(void)
 }
 /* } */
 
-/* this function needs to get rewritten. desperately. */
 static void * __attribute__((__noreturn__))
 control_main(void *arg __attribute__((__unused__)))
 {
@@ -1527,7 +1527,6 @@ control_main(void *arg __attribute__((__unused__)))
 }
 
 /* PCAP { */
-/* TODO: convince the host we're running on that it can safely ignore us */
 static int
 arp_reply(const unsigned char hw[6], uint32_t ip)
 {
