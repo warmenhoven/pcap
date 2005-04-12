@@ -10,7 +10,7 @@ clean:
 test: $(TARGET)
 	./tcp
 
-ifneq "$(PICKY)" "0"
+ifneq "$(PICKY)" ""
 NITPICKY_WARNINGS =	\
 			-W \
 			-Waggregate-return \
