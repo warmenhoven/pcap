@@ -984,7 +984,8 @@ icmp_echo_reply(struct icmp_pkt *icmp)
 
 	libnet_clear_packet(lnh_raw4);
 
-	if (libnet_build_icmpv4_echo(ICMP_ECHOREPLY, 0, 0, ntohs(icmp->hdr->icmp_id),
+	if (libnet_build_icmpv4_echo(ICMP_ECHOREPLY, 0, 0,
+								 ntohs(icmp->hdr->icmp_id),
 								 ntohs(icmp->hdr->icmp_seq),
 								 (u_int8_t *)icmp->hdr->icmp_data, len,
 								 lnh_raw4, 0) == -1) {
