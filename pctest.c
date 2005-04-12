@@ -14,7 +14,9 @@
  *   4 points for repeating the above without reinitializing
  *
  * Heavyweight Division:
- *   10 points for being able to talk to more than one other TCP at the same time
+ *   10 points for being able to talk to more than one other TCP at
+ *      the same time
+ *   10 points for correctly handling sequence number wraparound
  *
  * TODO:
  *   IP:
@@ -31,7 +33,6 @@
  *     - Better initial seqno generation
  *     - slow start
  *     - congestion avoidance
- *     - seqno wrap-around
  *     - Grow/shrink windows
  *     - retransmission/timers (Karn, Jacobson, exp. backoff, etc.)
  *     - Deal with lost received data
@@ -248,7 +249,9 @@ typedef struct tcp_session {
 
 	/* these are stored in host byte order mostly by default */
 	uint32_t seqno; /* aka SND.NXT */
+	uint32_t iss;
 	uint32_t ackno; /* aka RCV.NXT */
+	uint32_t irs;
 
 	uint32_t unacked; /* aka SND.UNA */
 
@@ -263,7 +266,6 @@ typedef struct tcp_session {
 
 	/* this is where we start getting evil: reimplementing sting */
 	int sting;
-	uint32_t iss;
 	int count;
 	int sting_acks;
 	int data_lost;
@@ -492,7 +494,8 @@ accept_session(TCB *listener, struct tcp_pkt *pkt)
 	sess->dst_prt = ntohs(pkt->hdr->th_sport);
 	sess->src_prt = listener->src_prt;
 
-	sess->ackno = ntohl(pkt->hdr->th_seq) + 1;
+	sess->irs = ntohl(pkt->hdr->th_seq);
+	sess->ackno = sess->irs + 1;
 
 	send_tcp(sess, TH_SYN | TH_ACK, NULL, 0);
 	sess->state = TCP_SYN_RECV;
@@ -586,7 +589,8 @@ tcp_process_syn_sent(TCB *sess, struct tcp_pkt *pkt)
 	if (!(pkt->hdr->th_flags & TH_SYN))
 		return;
 
-	sess->ackno = ntohl(pkt->hdr->th_seq) + 1;
+	sess->irs = ntohl(pkt->hdr->th_seq);
+	sess->ackno = sess->irs + 1;
 	if (sess->unacked == sess->seqno) {
 		sess->state = TCP_ESTABLISHED;
 		send_tcp(sess, TH_ACK, NULL, 0);
@@ -614,22 +618,21 @@ tcp_check_seqno(TCB *sess, struct tcp_pkt *pkt)
 		(pkt->ip->ip_hl << 2) - (pkt->hdr->th_off << 2);
 	uint32_t rcvnxt = sess->ackno, segseq = ntohl(pkt->hdr->th_seq);
 
-	/* XXX we don't deal correctly with seqno wrap-around */
-
 	if (len == 0) {
-		if ((rcvnxt <= segseq) &&
+		if ((0 <= (int32_t)(segseq - rcvnxt)) &&
 			/* if sess->rcv_win is 0 then the check is if
 			 * pkt->hdr->th_seq <= sess->ackno, which is acceptable,
 			 * since the above check makes it the same check
 			 * as checking if sess->ackno == pkt->hdr->th_seq */
-			(segseq <= rcvnxt + sess->rcv_win)) {
+			(0 <= (int32_t)(rcvnxt + sess->rcv_win - segseq))) {
 			return 0;
 		}
 	} else if (sess->rcv_win != 0) {
 		/* if there's data and our window is 0 then it's unacceptable */
-		if (((rcvnxt <= segseq) && (segseq < rcvnxt + sess->rcv_win)) ||
-			((rcvnxt <= segseq + len - 1) &&
-			 (segseq + len - 1 < rcvnxt + sess->rcv_win))) {
+		if (((0 <= (int32_t)(segseq - rcvnxt)) &&
+			 (0 < (int32_t)(rcvnxt + sess->rcv_win - segseq))) ||
+			((0 <= (int32_t)(segseq + len - 1 - rcvnxt)) &&
+			 (0 < (int32_t)(rcvnxt + sess->rcv_win - (segseq + len - 1))))) {
 			return 0;
 		}
 	}
@@ -678,10 +681,11 @@ tcp_check_ackno(TCB *sess, struct tcp_pkt *pkt)
 			 segack = ntohl(pkt->hdr->th_ack),
 			 sndnxt = sess->seqno;
 
-	if ((snduna <= segack) && (segack <= sndnxt)) {
+	if ((0 <= (int32_t)(segack - snduna)) &&
+		(0 <= (int32_t)(sndnxt - segack))) {
 		snduna = sess->unacked = segack;
 		/* XXX "the send window should be updated" */
-	} else if (segack < snduna) {
+	} else if (0 < (int32_t)(snduna - segack)) {
 		/* the ACK is a duplicate and can be ignored */
 		fprintf(stderr, "duplicate ack on %d\n", sess->id);
 		return 1;
@@ -748,6 +752,7 @@ tcp_handle_data(TCB *sess, struct tcp_pkt *pkt)
 static void
 tcp_handle_fin(TCB *sess, struct tcp_pkt *pkt)
 {
+	/* XXX this is wrong */
 	sess->ackno++;
 
 	if ((sess->state == TCP_SYN_RECV) || (sess->state == TCP_ESTABLISHED)) {
