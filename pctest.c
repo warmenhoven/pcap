@@ -363,6 +363,8 @@ send_rst(uint32_t dst_ip, uint16_t dst_prt, uint32_t src_prt,
 
 	if (!(control & TH_ACK))
 		cntrl |= TH_ACK;
+	else
+		ackno = 0;
 
 	libnet_clear_packet(lnh_raw4);
 
