@@ -1,5 +1,5 @@
 /*
- * right now in the TCP bake off I get 30 points:
+ * right now in the TCP bake off I get 35 points:
  *
  * Featherweight Division:
  *   1 point for talking to myself
