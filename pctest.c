@@ -324,12 +324,12 @@ send_tcp(TCB *sess, int flags, u_char *data, uint32_t len)
 	libnet_clear_packet(lnh_raw4);
 
 	if (libnet_build_tcp(sess->src_prt, sess->dst_prt, sess->seqno, sess->ackno,
-						 flags, sess->rcv_win, 0, 0, LIBNET_TCP_H, data, len,
-						 lnh_raw4, 0) == -1) {
+						 flags, sess->rcv_win, 0, 0, LIBNET_TCP_H + len, data,
+						 len, lnh_raw4, 0) == -1) {
 		fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
 		return 1;
 	}
-	if (libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_TCP_H, IPTOS_RELIABILITY,
+	if (libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_TCP_H + len, IPTOS_RELIABILITY,
 						  ip_id++, 0, ip_ttl, IPPROTO_TCP, 0, src_ip,
 						  sess->dst_ip, NULL, 0, lnh_raw4, 0) == -1) {
 		fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
@@ -1227,6 +1227,54 @@ ping(char *host)
 	}
 }
 
+static int
+nasty(char *host, uint16_t dst_prt)
+{
+	uint32_t dst_ip;
+	uint16_t src_prt;
+	uint32_t seqno;
+	/* since it's a string there's an implied NUL, so only seven bytes here */
+	u_int8_t opts[] = "\x02\x04\xff\xff\x00\x01\x01";
+
+	dst_ip = libnet_name2addr4(lnh_raw4, host, LIBNET_RESOLVE);
+	if (dst_ip == 0xffffffff) {
+		fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
+		return 1;
+	}
+
+	src_prt = libnet_get_prand(LIBNET_PRu16);
+	seqno = libnet_get_prand(LIBNET_PRu32);
+
+	libnet_clear_packet(lnh_raw4);
+
+	if (libnet_build_tcp_options(opts, sizeof (opts), lnh_raw4, 0) == -1) {
+		fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
+		return 1;
+	}
+
+	if (libnet_build_tcp(src_prt, dst_prt, seqno, 0,
+						 TH_SYN | TH_PUSH | TH_URG | TH_FIN, 0xffff, 0, 10,
+						 LIBNET_TCP_H + 2 * sizeof (opts), opts, sizeof (opts),
+						 lnh_raw4, 0) == -1) {
+		fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
+		return 1;
+	}
+
+	if (libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_TCP_H + 2 * sizeof (opts),
+						  IPTOS_LOWDELAY, ip_id++, 0, ip_ttl, IPPROTO_TCP, 0,
+						  src_ip, dst_ip, NULL, 0, lnh_raw4, 0) == -1) {
+		fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
+		return 1;
+	}
+
+	if (libnet_write(lnh_raw4) == -1) {
+		fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
+		return 1;
+	}
+
+	return 0;
+}
+
 /* maybe eventually there will be a third argument, so you can specify the port
  * to connect from */
 static TCB *
@@ -1313,6 +1361,15 @@ process_input(void)
 		sess->sting = 1;
 		/* by this time seqno is iss+1 but that's fine for our purposes */
 		sess->iss = sess->seqno;
+	} else if (!strncasecmp(buf, "nasty ", strlen("nasty "))) {
+		char *arg1, *arg2;
+		arg1 = buf + strlen("nasty ");
+		arg2 = strchr(arg1, ' ');
+		if (!arg2)
+			return;
+		*arg2++ = 0;
+
+		nasty(arg1, atoi(arg2));
 	} else if (!strncasecmp(buf, "connect ", strlen("connect "))) {
 		char *arg1, *arg2;
 		arg1 = buf + strlen("connect ");
