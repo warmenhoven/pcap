@@ -967,6 +967,43 @@ process_tcp_packet(struct ip_pkt *ip)
 }
 
 static void
+process_udp_packet(struct ip_pkt *ip)
+{
+	/* that's right, we don't handle udp! when's the last time you used udp.
+	 * honestly. and don't tell me you actually use dns or ntp! or nfs. or
+	 * smb. *shudder* */
+	unsigned int len;
+
+	printf("rejecting udp (src %s)\n",
+		   libnet_addr2name4(ip->hdr->ip_src.s_addr, LIBNET_DONT_RESOLVE));
+
+	len = (ip->hdr->ip_hl << 2) + 64;
+	if (len > ntohs(ip->hdr->ip_len))
+		len = ntohs(ip->hdr->ip_len);
+
+	libnet_clear_packet(lnh_raw4);
+
+	if (libnet_build_icmpv4_unreach(ICMP_UNREACH, ICMP_UNREACH_PORT, 0,
+									(u_int8_t *)ip->hdr, len,
+									lnh_raw4, 0) == -1) {
+		fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
+		return;
+	}
+
+	if (libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_ICMPV4_UNREACH_H + len,
+						  0, ip_id++, 0, ip_ttl, IPPROTO_ICMP, 0,
+						  src_ip, ip->hdr->ip_src.s_addr,
+						  NULL, 0, lnh_raw4, 0) == -1) {
+		fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
+		return;
+	}
+
+	if (libnet_write(lnh_raw4) == -1) {
+		fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
+	}
+}
+
+static void
 icmp_echo_reply(struct icmp_pkt *icmp)
 {
 	unsigned int len;
@@ -1129,13 +1166,13 @@ process_ip_packet(struct libnet_ethernet_hdr *enet, uint32_t len)
 	case IPPROTO_TCP:
 		process_tcp_packet(&ip);
 		break;
+	case IPPROTO_UDP:
+		process_udp_packet(&ip);
+		break;
 	case IPPROTO_ICMP:
 		process_icmp_packet(&ip);
 		break;
 	default:
-		/* that's right, we don't handle udp! when's the last time you used udp.
-		 * honestly. and don't tell me you actually use dns or ntp! or nfs. or
-		 * smb. *shudder* */
 		fprintf(stderr, "received unhandled protocol %d (src %s)\n",
 				ip.hdr->ip_p, libnet_addr2name4(ip.hdr->ip_src.s_addr,
 												LIBNET_DONT_RESOLVE));
