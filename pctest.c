@@ -525,7 +525,7 @@ remove_session(TCB *sess)
 	free(sess);
 }
 
-static void
+static TCB *
 tcp_process_listen(TCB *sess, struct tcp_pkt *pkt)
 {
 	if (pkt->hdr->th_flags & TH_RST) {
@@ -533,9 +533,7 @@ tcp_process_listen(TCB *sess, struct tcp_pkt *pkt)
 	} else if (pkt->hdr->th_flags & TH_ACK) {
 		send_rst(sess->state, pkt);
 	} else if (pkt->hdr->th_flags & TH_SYN) {
-		accept_session(sess, pkt);
-		/* XXX it is "perfectly legitimate" to have "connection synchronization
-		 * using data-carrying segments" but we don't handle that here. */
+		return accept_session(sess, pkt);
 	} else {
 		/* And I quote:
 		 *
@@ -546,6 +544,7 @@ tcp_process_listen(TCB *sess, struct tcp_pkt *pkt)
 		 * incarnation of the connection.  So you are unlikely to get here,
 		 * but if you do, drop the segment, and return. */
 	}
+	return NULL;
 }
 
 static void
@@ -822,7 +821,9 @@ tcp_state_machine(TCB *sess, struct tcp_pkt *pkt)
 	/* XXX none of these things check security, precedence, or URG */
 
 	if (sess->state == TCP_LISTEN) {
-		tcp_process_listen(sess, pkt);
+		sess = tcp_process_listen(sess, pkt);
+		/* XXX it is "perfectly legitimate" to have "connection synchronization
+		 * using data-carrying segments" but we don't handle that here. */
 		return;
 	}
 
