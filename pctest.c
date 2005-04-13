@@ -356,27 +356,28 @@ send_tcp(TCB *sess, int flags, u_char *data, uint32_t len)
 /* yeah, I probably should figure out some way of reusing send_tcp instead of
  * just copying it. but eh. it probably isn't an issue. at least not often. */
 static int
-send_rst(uint32_t dst_ip, uint16_t dst_prt, uint32_t src_prt,
-		 uint32_t seqno, uint32_t ackno, int state, int control)
+send_rst(uint32_t state, struct tcp_pkt *tcp)
 {
+	uint32_t ackno = ntohl(tcp->hdr->th_seq) + 1;
 	u_int8_t cntrl = TH_RST;
 
-	if (!(control & TH_ACK))
+	if (!(tcp->hdr->th_flags & TH_ACK))
 		cntrl |= TH_ACK;
 	else
 		ackno = 0;
 
 	libnet_clear_packet(lnh_raw4);
 
-	if (libnet_build_tcp(src_prt, dst_prt, seqno, ackno, cntrl, 0, 0, 0,
+	if (libnet_build_tcp(ntohs(tcp->hdr->th_dport), ntohs(tcp->hdr->th_sport),
+						 ntohl(tcp->hdr->th_ack), ackno, cntrl, 0, 0, 0,
 						 LIBNET_TCP_H, NULL, 0, lnh_raw4, 0) == -1) {
 		fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
 		return 1;
 	}
 
 	if (libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_TCP_H, IPTOS_LOWDELAY, ip_id++,
-						  0, ip_ttl, IPPROTO_TCP, 0, src_ip, dst_ip, NULL, 0,
-						  lnh_raw4, 0) == -1) {
+						  0, ip_ttl, IPPROTO_TCP, 0, src_ip,
+						  tcp->ip->ip_src.s_addr, NULL, 0, lnh_raw4, 0) == -1) {
 		fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
 		return 1;
 	}
@@ -386,9 +387,10 @@ send_rst(uint32_t dst_ip, uint16_t dst_prt, uint32_t src_prt,
 		return 1;
 	}
 
-	fprintf(stderr, "RST'ing (IP = %s, Port = %d, State = %s, Cntrl = %02x)\n",
-			libnet_addr2name4(dst_ip, LIBNET_DONT_RESOLVE), src_prt,
-			state_names[state], control);
+	fprintf(stderr, "RST'ing (SRC = %s:%d, DPort = %d (%s), Cntrl = %02x)\n",
+			libnet_addr2name4(tcp->ip->ip_src.s_addr, LIBNET_DONT_RESOLVE),
+			ntohs(tcp->hdr->th_sport), ntohs(tcp->hdr->th_dport),
+			state_names[state], tcp->hdr->th_flags);
 	return 0;
 }
 
@@ -529,10 +531,7 @@ tcp_process_listen(TCB *sess, struct tcp_pkt *pkt)
 	if (pkt->hdr->th_flags & TH_RST) {
 		/* we're in a listening state, just drop it */
 	} else if (pkt->hdr->th_flags & TH_ACK) {
-		send_rst(pkt->ip->ip_src.s_addr, ntohs(pkt->hdr->th_sport),
-				 ntohs(pkt->hdr->th_dport), ntohl(pkt->hdr->th_ack),
-				 ntohl(pkt->hdr->th_seq) + 1,
-				 sess->state, pkt->hdr->th_flags);
+		send_rst(sess->state, pkt);
 	} else if (pkt->hdr->th_flags & TH_SYN) {
 		accept_session(sess, pkt);
 		/* XXX it is "perfectly legitimate" to have "connection synchronization
@@ -576,10 +575,7 @@ tcp_process_syn_sent(TCB *sess, struct tcp_pkt *pkt)
 	if (pkt->hdr->th_flags & TH_ACK) {
 		if (ntohl(pkt->hdr->th_ack) != sess->seqno) {
 			fprintf(stderr, "Invalid ackno on %d\n", sess->id);
-			send_rst(pkt->ip->ip_src.s_addr, ntohs(pkt->hdr->th_sport),
-					 ntohs(pkt->hdr->th_dport), ntohl(pkt->hdr->th_ack),
-					 ntohl(pkt->hdr->th_seq) + 1,
-					 sess->state, pkt->hdr->th_flags);
+			send_rst(sess->state, pkt);
 			remove_session(sess);
 			return;
 		} else {
@@ -648,9 +644,7 @@ tcp_process_syn_recv(TCB *sess, struct tcp_pkt *pkt)
 	if (sess->unacked > ntohl(pkt->hdr->th_ack) ||
 		ntohl(pkt->hdr->th_ack) > sess->seqno) {
 		fprintf(stderr, "Invalid ackno on %d\n", sess->id);
-		send_rst(pkt->ip->ip_src.s_addr, ntohs(pkt->hdr->th_sport),
-				 ntohs(pkt->hdr->th_dport), ntohl(pkt->hdr->th_ack),
-				 ntohl(pkt->hdr->th_seq) + 1, sess->state, pkt->hdr->th_flags);
+		send_rst(sess->state, pkt);
 		remove_session(sess);
 		return 1;
 	}
@@ -861,9 +855,7 @@ tcp_state_machine(TCB *sess, struct tcp_pkt *pkt)
 
 	if (pkt->hdr->th_flags & TH_SYN) {
 		fprintf(stderr, "SYN on %d\n", sess->id);
-		send_rst(pkt->ip->ip_src.s_addr, ntohs(pkt->hdr->th_sport),
-				 ntohs(pkt->hdr->th_dport), ntohl(pkt->hdr->th_ack),
-				 ntohl(pkt->hdr->th_seq) + 1, sess->state, pkt->hdr->th_flags);
+		send_rst(sess->state, pkt);
 		remove_session(sess);
 		return;
 	}
@@ -941,9 +933,7 @@ process_tcp_packet(struct ip_pkt *ip)
 		if (!(tcp.hdr->th_flags & TH_RST)) {
 			/* if they're sending us a RST then we don't need to send RST back,
 			 * we can safely drop it. */
-			send_rst(ip->hdr->ip_src.s_addr, ntohs(tcp.hdr->th_sport),
-					 ntohs(tcp.hdr->th_dport), ntohl(tcp.hdr->th_ack),
-					 ntohl(tcp.hdr->th_seq) + 1, TCP_CLOSE, tcp.hdr->th_flags);
+			send_rst(TCP_CLOSE, &tcp);
 		}
 		return;
 	}
