@@ -65,6 +65,7 @@ static list *
 list_new(void *data)
 {
 	list *l = malloc(sizeof (list));
+	if (!l) return NULL;
 	l->next = NULL;
 	l->data = data;
 	return l;
@@ -1204,6 +1205,10 @@ reassemble_ip_frag(struct ip_frag *frag, struct ip_pkt *pkt)
 	frag->timer = NULL;
 
 	frag->data = malloc(LIBNET_IPV4_H + cur);
+	if (!frag->data) {
+		free_ip_frag(frag);
+		return NULL;
+	}
 
 	l = frag->bits;
 	while (l) {
@@ -1236,6 +1241,7 @@ add_ip_frag(struct ip_pkt *pkt)
 
 	if (!frag) {
 		frag = malloc(sizeof (struct ip_frag));
+		if (!frag) return NULL;
 		frag->ip_src = pkt->hdr->ip_src.s_addr;
 		frag->ip_id = pkt->hdr->ip_id;
 		frag->ip_p = pkt->hdr->ip_p;
@@ -1253,10 +1259,15 @@ add_ip_frag(struct ip_pkt *pkt)
 	more = ntohs(pkt->hdr->ip_off) & IP_MF ? 1 : 0;
 
 	bit = malloc(sizeof (struct ip_frag_bit));
+	if (!bit) return NULL;
 	bit->offset = offset;
 	bit->len = len;
 	bit->end = !more;
 	bit->data = malloc(len);
+	if (!bit->data) {
+		free(bit);
+		return NULL;
+	}
 	memcpy(bit->data, pkt->data, len);
 	/* XXX we should also be copying and verifying options, but eh */
 
@@ -1364,6 +1375,8 @@ process_packet(void)
 	if (read(sp[1], &hdr, sizeof (hdr)) != sizeof (hdr))
 		return;
 	pkt = malloc(hdr.len);
+	if (!pkt)
+		return;
 	if ((len = read(sp[1], pkt, hdr.len)) < 0) {
 		free(pkt);
 		return;
