@@ -258,8 +258,8 @@ typedef struct tcp_session {
 
 	/* I didn't actually start using Linux to get away from windows; I started
 	 * using it because I wanted to know about computing in general */
-	uint16_t snd_win; /* aka SND.WND */
-	uint16_t rcv_win; /* aka RCV.WND */
+	uint32_t snd_win; /* aka SND.WND */
+	uint32_t rcv_win; /* aka RCV.WND */
 
 	struct timer *tmr;
 	/* there's really a bunch of other stuff that I should be paying
@@ -277,6 +277,19 @@ typedef struct tcp_session {
 #define STING_COUNT 100
 #define STING_DELAY 100
 } TCB;
+
+struct ip_frag {
+	uint32_t ip_src;
+	u_int16_t ip_id;
+	u_int8_t ip_p;
+	u_int8_t pad;
+	/* a data buffer */
+	uint8_t *data;
+	/* a header buffer (no options!) */
+	struct libnet_ipv4_hdr hdr;
+	uint32_t data_len;
+	struct timer *timer;
+};
 
 /* this probably wasn't entirely necessary but it's convenient */
 struct arp {
@@ -310,16 +323,17 @@ struct tcp_pkt {
 };
 
 /* these are our global variables */
+static int sp[2];
+static libnet_t *lnh_link = NULL;
 static unsigned char src_hw[6];
+static libnet_t *lnh_raw4 = NULL;
 static uint32_t src_ip;
+static u_int16_t ip_id;
+static const u_int8_t ip_ttl = 64;
+static list *fragments = NULL;
 static list *sessions = NULL;
 static list *open_connections = NULL;
 static list *listeners = NULL;
-static int sp[2];
-static libnet_t *lnh_link = NULL;
-static libnet_t *lnh_raw4 = NULL;
-static u_int16_t ip_id;
-static const u_int8_t ip_ttl = 64;
 
 static int
 send_tcp(TCB *sess, int flags, u_char *data, uint32_t len)
@@ -1069,9 +1083,22 @@ static void
 process_icmp_packet(struct ip_pkt *ip)
 {
 	struct icmp_pkt icmp;
+	uint16_t csum;
+	int sum;
 
 	icmp.ip = ip->hdr;
 	icmp.hdr = (struct libnet_icmpv4_hdr *)ip->data;
+
+	csum = icmp.hdr->icmp_sum;
+	icmp.hdr->icmp_sum = 0;
+	sum = libnet_in_cksum((u_int16_t *)icmp.hdr,
+						  ntohs(ip->hdr->ip_len) - (ip->hdr->ip_hl << 2));
+	icmp.hdr->icmp_sum = LIBNET_CKSUM_CARRY(sum);
+	if (csum != icmp.hdr->icmp_sum) {
+		fprintf(stderr, "invalid icmp checksum (src %s)\n",
+				libnet_addr2name4(ip->hdr->ip_src.s_addr, LIBNET_DONT_RESOLVE));
+		return;
+	}
 
 	switch (icmp.hdr->icmp_type) {
 	case ICMP_ECHO:
@@ -1088,9 +1115,75 @@ process_icmp_packet(struct ip_pkt *ip)
 	}
 }
 
+static struct ip_frag *
+find_ip_frag(struct ip_pkt *pkt)
+{
+	list *l = fragments;
+	while (l) {
+		struct ip_frag *frag = l->data;
+		l = l->next;
+		if ((frag->ip_src == pkt->hdr->ip_src.s_addr) &&
+			(frag->ip_id == pkt->hdr->ip_id) &&
+			(frag->ip_p == pkt->hdr->ip_p))
+			return frag;
+	}
+	return NULL;
+}
+
+static void
+free_ip_frag(struct ip_frag *frag)
+{
+	if (!frag)
+		return;
+
+	fragments = list_remove(fragments, frag);
+	free(frag);
+}
+
+static void
+timeout_ip_frag(void *arg)
+{
+	struct ip_frag *frag = arg;
+	free_ip_frag(frag);
+}
+
+static struct ip_frag *
+add_ip_frag(struct ip_pkt *pkt)
+{
+	struct ip_frag *frag = find_ip_frag(pkt);
+	uint16_t offset;
+
+	if (!frag) {
+		frag = malloc(sizeof (struct ip_frag));
+		frag->ip_src = pkt->hdr->ip_src.s_addr;
+		frag->ip_id = pkt->hdr->ip_id;
+		frag->ip_p = pkt->hdr->ip_p;
+
+		frag->data_len = 0;
+		frag->data = NULL;
+		frag->timer = timer_start(pkt->hdr->ip_ttl * 1000,
+								  timeout_ip_frag, frag);
+
+		fragments = list_prepend(fragments, frag);
+	}
+
+	offset = (ntohs(pkt->hdr->ip_off) & IP_OFFMASK) << 3;
+
+	fprintf(stderr, "fragment, %s %d %d, MF %d, OFF %d, LEN %d\n",
+			libnet_addr2name4(frag->ip_src, LIBNET_DONT_RESOLVE),
+			frag->ip_id, frag->ip_p,
+			ntohs(pkt->hdr->ip_off) & IP_MF ? 1 : 0, offset,
+			ntohs(pkt->hdr->ip_len) - (pkt->hdr->ip_hl << 2));
+
+	/* XXX. return NULL if processing should stop; otherwise return the frag
+	 * that should be freed once the packet processing is done */
+	return NULL;
+}
+
 static void
 process_ip_packet(struct libnet_ethernet_hdr *enet, uint32_t len)
 {
+	struct ip_frag *frag = NULL;
 	struct ip_pkt ip;
 	uint16_t csum;
 	int sum;
@@ -1127,14 +1220,6 @@ process_ip_packet(struct libnet_ethernet_hdr *enet, uint32_t len)
 		return;
 	}
 
-	if (ip.hdr->ip_off & IP_MF) {
-		/* XXX we don't deal with fragmentation at all (and again, we don't tell
-		 * whoever we're talking to that we don't) */
-		fprintf(stderr, "fragmentation being used (src %s)\n",
-				libnet_addr2name4(ip.hdr->ip_src.s_addr, LIBNET_DONT_RESOLVE));
-		return;
-	}
-
 	if (len < (uint32_t)(LIBNET_ETH_H + (uint16_t)ntohs(ip.hdr->ip_len))) {
 		fprintf(stderr, "invalid ip_len (src %s)\n",
 				libnet_addr2name4(ip.hdr->ip_src.s_addr, LIBNET_DONT_RESOLVE));
@@ -1153,6 +1238,12 @@ process_ip_packet(struct libnet_ethernet_hdr *enet, uint32_t len)
 
 	ip.data = (u_char *)ip.hdr + (ip.hdr->ip_hl << 2);
 
+	if (ntohs(ip.hdr->ip_off) & (IP_MF|IP_OFFMASK)) {
+		frag = add_ip_frag(&ip);
+		if (frag == NULL)
+			return;
+	}
+
 	switch (ip.hdr->ip_p) {
 	case IPPROTO_TCP:
 		process_tcp_packet(&ip);
@@ -1169,6 +1260,8 @@ process_ip_packet(struct libnet_ethernet_hdr *enet, uint32_t len)
 												LIBNET_DONT_RESOLVE));
 		break;
 	}
+
+	free_ip_frag(frag);
 }
 
 static void
@@ -1255,6 +1348,66 @@ ping(char *host)
 	if (libnet_build_ipv4(LIBNET_IPV4_H + 64, IPTOS_LOWDELAY, ip_id++, 0,
 						  ip_ttl, IPPROTO_ICMP, 0, src_ip, dst_ip, NULL, 0,
 						  lnh_raw4, 0) == -1) {
+		fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
+		return;
+	}
+
+	if (libnet_write(lnh_raw4) == -1) {
+		fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
+	}
+}
+
+static void
+fping(char *host)
+{
+	uint32_t dst_ip;
+	struct libnet_icmpv4_hdr *echo;
+	u_char payload[64];
+	unsigned int i;
+	libnet_ptag_t tag;
+	int sum;
+
+	libnet_clear_packet(lnh_raw4);
+
+	dst_ip = libnet_name2addr4(lnh_raw4, host, LIBNET_RESOLVE);
+	if (dst_ip == 0xffffffff) {
+		fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
+		return;
+	}
+
+	for (i = 0; i < sizeof (payload) - LIBNET_ICMPV4_ECHO_H; i++)
+		payload[i + LIBNET_ICMPV4_ECHO_H] = i;
+
+	gettimeofday((struct timeval *)&payload[LIBNET_ICMPV4_ECHO_H], NULL);
+
+	echo = (struct libnet_icmpv4_hdr *)payload;
+	echo->icmp_type = ICMP_ECHO;
+	echo->icmp_code = 0;
+	echo->icmp_id = ntohs(0x42);
+	echo->icmp_seq = 0;
+
+	echo->icmp_sum = 0;
+	sum = libnet_in_cksum((u_int16_t *)echo, sizeof (payload));
+	echo->icmp_sum = LIBNET_CKSUM_CARRY(sum);
+
+	if ((tag = libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_ICMPV4_ECHO_H,
+								 IPTOS_LOWDELAY, ip_id, IP_MF, ip_ttl,
+								 IPPROTO_ICMP, 0, src_ip, dst_ip, payload,
+								 LIBNET_ICMPV4_ECHO_H, lnh_raw4, 0)) == -1) {
+		fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
+		return;
+	}
+
+	if (libnet_write(lnh_raw4) == -1) {
+		fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
+		return;
+	}
+
+	if (libnet_build_ipv4(LIBNET_IPV4_H + sizeof (payload) -
+							  LIBNET_ICMPV4_ECHO_H, IPTOS_LOWDELAY, ip_id++,
+						  LIBNET_ICMPV4_ECHO_H / 8, ip_ttl, IPPROTO_ICMP, 0,
+						  src_ip, dst_ip, &payload[LIBNET_ICMPV4_ECHO_H],
+						  64 - LIBNET_ICMPV4_ECHO_H, lnh_raw4, tag) == -1) {
 		fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
 		return;
 	}
@@ -1383,6 +1536,10 @@ process_input(void)
 		char *arg1;
 		arg1 = buf + strlen("ping ");
 		ping(arg1);
+	} else if (!strncasecmp(buf, "fping ", strlen("fping "))) {
+		char *arg1;
+		arg1 = buf + strlen("fping ");
+		fping(arg1);
 	} else if (!strncasecmp(buf, "sting ", strlen("sting "))) {
 		TCB *sess;
 		char *arg1, *arg2;
