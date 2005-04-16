@@ -278,16 +278,20 @@ typedef struct tcp_session {
 #define STING_DELAY 100
 } TCB;
 
+struct ip_frag_bit {
+	uint16_t offset;
+	uint16_t len;
+	int end;
+	uint8_t *data;
+};
+
 struct ip_frag {
 	uint32_t ip_src;
 	u_int16_t ip_id;
 	u_int8_t ip_p;
 	u_int8_t pad;
-	/* a data buffer */
+	list *bits;
 	uint8_t *data;
-	/* a header buffer (no options!) */
-	struct libnet_ipv4_hdr hdr;
-	uint32_t data_len;
 	struct timer *timer;
 };
 
@@ -1137,6 +1141,17 @@ free_ip_frag(struct ip_frag *frag)
 		return;
 
 	fragments = list_remove(fragments, frag);
+
+	while (frag->bits) {
+		struct ip_frag_bit *bit = frag->bits->data;
+		frag->bits = list_remove(frag->bits, bit);
+		free(bit->data);
+		free(bit);
+	}
+
+	if (frag->data)
+		free(frag->data);
+
 	free(frag);
 }
 
@@ -1144,14 +1159,81 @@ static void
 timeout_ip_frag(void *arg)
 {
 	struct ip_frag *frag = arg;
+	fprintf(stderr, "fragment %s %d %d timed out\n",
+			libnet_addr2name4(frag->ip_src, LIBNET_DONT_RESOLVE),
+			frag->ip_id, frag->ip_p);
+	/* we should be sending an ICMP message here but I don't care. odds are that
+	 * either the host that was sending us the fragmented packet was trying to
+	 * do something evil to us, or the network between us is a little wonky.
+	 * either way the ICMP message saying that the reassembly timed out will
+	 * probably not have any effect. */
 	free_ip_frag(frag);
+}
+
+static int
+frag_bit_cmp(const void *x, const void *y)
+{
+	const struct ip_frag_bit *a = x, *b = y;
+	return (a->offset - b->offset);
+}
+
+static struct ip_frag *
+reassemble_ip_frag(struct ip_frag *frag, struct ip_pkt *pkt)
+{
+	int cur = 0;
+	list *l = frag->bits;
+
+	while (l) {
+		struct ip_frag_bit *bit = l->data;
+		l = l->next;
+		/* if the offset is greater than our current pointer then return */
+		if (bit->offset > cur)
+			return NULL;
+		/* update our offset */
+		cur = bit->offset + bit->len;
+		/* if this isn't the end but there are no more bits return */
+		if (!bit->end && !l)
+			return NULL;
+		/* if this is the end then stop processing bits */
+		if (bit->end)
+			break;
+	}
+
+	/* at this point we have all the data we're told we're going to get and cur
+	 * is equal to the length of that data */
+	timer_cancel(frag->timer);
+	frag->timer = NULL;
+
+	frag->data = malloc(LIBNET_IPV4_H + cur);
+
+	l = frag->bits;
+	while (l) {
+		struct ip_frag_bit *bit = l->data;
+		l = l->next;
+		memcpy(&frag->data[bit->offset + LIBNET_IPV4_H], bit->data, bit->len);
+		if (bit->end)
+			break;
+	}
+
+	memcpy(frag->data, pkt->hdr, LIBNET_IPV4_H);
+	pkt->hdr = (struct libnet_ipv4_hdr *)frag->data;
+	pkt->hdr->ip_len = ntohs(LIBNET_IPV4_H + cur);
+	/* XXX we're supposed to support options, but eh */
+	pkt->hdr->ip_hl = (LIBNET_IPV4_H >> 2);
+	pkt->options = NULL;
+	pkt->data = (u_char *)pkt->hdr + LIBNET_IPV4_H;
+
+	return frag;
 }
 
 static struct ip_frag *
 add_ip_frag(struct ip_pkt *pkt)
 {
 	struct ip_frag *frag = find_ip_frag(pkt);
+	struct ip_frag_bit *bit;
 	uint16_t offset;
+	uint16_t len;
+	int more;
 
 	if (!frag) {
 		frag = malloc(sizeof (struct ip_frag));
@@ -1159,7 +1241,7 @@ add_ip_frag(struct ip_pkt *pkt)
 		frag->ip_id = pkt->hdr->ip_id;
 		frag->ip_p = pkt->hdr->ip_p;
 
-		frag->data_len = 0;
+		frag->bits = NULL;
 		frag->data = NULL;
 		frag->timer = timer_start(pkt->hdr->ip_ttl * 1000,
 								  timeout_ip_frag, frag);
@@ -1168,16 +1250,20 @@ add_ip_frag(struct ip_pkt *pkt)
 	}
 
 	offset = (ntohs(pkt->hdr->ip_off) & IP_OFFMASK) << 3;
+	len = ntohs(pkt->hdr->ip_len) - (pkt->hdr->ip_hl << 2);
+	more = ntohs(pkt->hdr->ip_off) & IP_MF ? 1 : 0;
 
-	fprintf(stderr, "fragment, %s %d %d, MF %d, OFF %d, LEN %d\n",
-			libnet_addr2name4(frag->ip_src, LIBNET_DONT_RESOLVE),
-			frag->ip_id, frag->ip_p,
-			ntohs(pkt->hdr->ip_off) & IP_MF ? 1 : 0, offset,
-			ntohs(pkt->hdr->ip_len) - (pkt->hdr->ip_hl << 2));
+	bit = malloc(sizeof (struct ip_frag_bit));
+	bit->offset = offset;
+	bit->len = len;
+	bit->end = !more;
+	bit->data = malloc(len);
+	memcpy(bit->data, pkt->data, len);
+	/* XXX we should also be copying and verifying options, but eh */
 
-	/* XXX. return NULL if processing should stop; otherwise return the frag
-	 * that should be freed once the packet processing is done */
-	return NULL;
+	frag->bits = list_insert_sorted(frag->bits, bit, frag_bit_cmp);
+
+	return reassemble_ip_frag(frag, pkt);
 }
 
 static void
