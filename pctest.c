@@ -21,7 +21,6 @@
  * TODO:
  *   IP:
  *     - IP options
- *     - IP fragments
  *     - precedence
  *     - Loopback
  *     - Talk to host
@@ -278,23 +277,6 @@ typedef struct tcp_session {
 #define STING_DELAY 100
 } TCB;
 
-struct ip_frag_bit {
-	uint16_t offset;
-	uint16_t len;
-	int end;
-	uint8_t *data;
-};
-
-struct ip_frag {
-	uint32_t ip_src;
-	u_int16_t ip_id;
-	u_int8_t ip_p;
-	u_int8_t pad;
-	list *bits;
-	uint8_t *data;
-	struct timer *timer;
-};
-
 /* this probably wasn't entirely necessary but it's convenient */
 struct arp {
 	struct libnet_ethernet_hdr enet;
@@ -328,13 +310,10 @@ struct tcp_pkt {
 
 /* these are our global variables */
 static int sp[2];
-static libnet_t *lnh_link = NULL;
-static unsigned char src_hw[6];
 static libnet_t *lnh_raw4 = NULL;
 static uint32_t src_ip;
 static u_int16_t ip_id;
 static const u_int8_t ip_ttl = 64;
-static list *fragments = NULL;
 static list *sessions = NULL;
 static list *open_connections = NULL;
 static list *listeners = NULL;
@@ -1119,6 +1098,26 @@ process_icmp_packet(struct ip_pkt *ip)
 	}
 }
 
+/* FRAGMENTS { */
+struct ip_frag_bit {
+	uint16_t offset;
+	uint16_t len;
+	int end;
+	uint8_t *data;
+};
+
+struct ip_frag {
+	uint32_t ip_src;
+	u_int16_t ip_id;
+	u_int8_t ip_p;
+	u_int8_t pad;
+	list *bits;
+	uint8_t *data;
+	struct timer *timer;
+};
+
+static list *fragments = NULL;
+
 static struct ip_frag *
 find_ip_frag(struct ip_pkt *pkt)
 {
@@ -1265,6 +1264,7 @@ add_ip_frag(struct ip_pkt *pkt)
 
 	return reassemble_ip_frag(frag, pkt);
 }
+/* } */
 
 static void
 process_ip_packet(struct libnet_ethernet_hdr *enet, uint32_t len)
@@ -1503,54 +1503,6 @@ fping(char *host)
 	}
 }
 
-static int
-nasty(char *host, uint16_t dst_prt)
-{
-	uint32_t dst_ip;
-	uint16_t src_prt;
-	uint32_t seqno;
-	/* since it's a string there's an implied NUL, so only seven bytes here */
-	u_int8_t opts[] = "\x02\x04\xff\xff\x00\x01\x01";
-
-	dst_ip = libnet_name2addr4(lnh_raw4, host, LIBNET_RESOLVE);
-	if (dst_ip == 0xffffffff) {
-		fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
-		return 1;
-	}
-
-	src_prt = libnet_get_prand(LIBNET_PRu16);
-	seqno = libnet_get_prand(LIBNET_PRu32);
-
-	libnet_clear_packet(lnh_raw4);
-
-	if (libnet_build_tcp_options(opts, sizeof (opts), lnh_raw4, 0) == -1) {
-		fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
-		return 1;
-	}
-
-	if (libnet_build_tcp(src_prt, dst_prt, seqno, 0,
-						 TH_SYN | TH_PUSH | TH_URG | TH_FIN, 0xffff, 0, 10,
-						 LIBNET_TCP_H + 2 * sizeof (opts), opts, sizeof (opts),
-						 lnh_raw4, 0) == -1) {
-		fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
-		return 1;
-	}
-
-	if (libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_TCP_H + 2 * sizeof (opts),
-						  IPTOS_LOWDELAY, ip_id++, 0, ip_ttl, IPPROTO_TCP, 0,
-						  src_ip, dst_ip, NULL, 0, lnh_raw4, 0) == -1) {
-		fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
-		return 1;
-	}
-
-	if (libnet_write(lnh_raw4) == -1) {
-		fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
-		return 1;
-	}
-
-	return 0;
-}
-
 /* maybe eventually there will be a third argument, so you can specify the port
  * to connect from */
 static TCB *
@@ -1641,15 +1593,6 @@ process_input(void)
 		sess->sting = 1;
 		/* by this time seqno is iss+1 but that's fine for our purposes */
 		sess->iss = sess->seqno;
-	} else if (!strncasecmp(buf, "nasty ", strlen("nasty "))) {
-		char *arg1, *arg2;
-		arg1 = buf + strlen("nasty ");
-		arg2 = strchr(arg1, ' ');
-		if (!arg2)
-			return;
-		*arg2++ = 0;
-
-		nasty(arg1, atoi(arg2));
 	} else if (!strncasecmp(buf, "connect ", strlen("connect "))) {
 		char *arg1, *arg2;
 		arg1 = buf + strlen("connect ");
@@ -1800,6 +1743,9 @@ control_main(void *arg __attribute__((__unused__)))
 }
 
 /* PCAP { */
+static libnet_t *lnh_link = NULL;
+static unsigned char src_hw[6];
+
 static int
 arp_reply(const unsigned char hw[6], uint32_t ip)
 {
