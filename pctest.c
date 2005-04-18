@@ -1,17 +1,19 @@
 /*
- * right now in the TCP bake off I get 35 points:
+ * right now in the TCP bake off I get 50 points:
  *
  * Featherweight Division:
  *   1 point for talking to myself
  *   1 point for saying something to myself
  *   1 point for gracefully ending the conversation
  *   2 points for repeating the above without reinitializing
+ *   5 points for a complete conversation via the testing gateway
  *
  * Middleweight Division:
  *   2 points for talking to someone else
  *   2 points for saying something to someone else
  *   2 points for gracefully ending the conversaion
  *   4 points for repeating the above without reinitializing
+ *   10 points for a complete conversation via the testing gateway
  *
  * Heavyweight Division:
  *   10 points for being able to talk to more than one other TCP at
@@ -32,7 +34,7 @@
  *     - congestion avoidance
  *     - Grow/shrink windows
  *     - retransmission/timers (Karn, Jacobson, exp. backoff, etc.)
- *     - Deal with lost received data
+ *     - Deal better with lost received data
  *
  *   General:
  *     - argv parsing (specify device, user to run as, etc.)
@@ -877,6 +879,16 @@ tcp_state_machine(TCB *sess, struct tcp_pkt *pkt)
 	 * doing their own thing */
 	if (tcp_check_ackno(sess, pkt))
 		return;
+
+	/* XXX check to see if we're missing any data. if we are then we should
+	 * queue the data that's been sent to us, but we don't. instead we drop the
+	 * new data and send an ack with what we think should have come next. then
+	 * when we receive the in-order data later, we'll need to re-request this
+	 * data as well. this is really inefficient. */
+	if (sess->ackno != ntohl(pkt->hdr->th_seq)) {
+		send_tcp(sess, TH_ACK, NULL, 0);
+		return;
+	}
 
 	tcp_handle_data(sess, pkt);
 
