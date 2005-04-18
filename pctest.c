@@ -23,7 +23,6 @@
  *     - IP options
  *     - precedence
  *     - Loopback
- *     - Talk to host
  *
  *   TCP:
  *     - TCP options
@@ -38,7 +37,6 @@
  *
  *   General:
  *     - argv parsing (specify device, user to run as, etc.)
- *     - convince the host we're running on that it can safely ignore us
  *
  *   Then there are the things done by a real TCP stack (as opposed to this
  *   toy), that aren't in the spec:
@@ -50,6 +48,7 @@
  */
 
 #include <libnet.h>
+#include <net/if_arp.h>
 #include <pcap.h>
 #include <pthread.h>
 #include <pwd.h>
@@ -1045,7 +1044,8 @@ process_icmp_echo_reply(struct icmp_pkt *icmp)
 
 	if (ntohs(icmp->ip->ip_len) != (icmp->ip->ip_hl << 2) + 64) {
 		fprintf(stderr, "improper echo reply (src %s)\n",
-				libnet_addr2name4(icmp->ip->ip_src.s_addr, LIBNET_RESOLVE));
+				libnet_addr2name4(icmp->ip->ip_src.s_addr,
+								  LIBNET_DONT_RESOLVE));
 		return;
 	}
 
@@ -1094,7 +1094,7 @@ process_icmp_packet(struct ip_pkt *ip)
 	default:
 		fprintf(stderr, "received unhandled icmp type %d (src %s)\n",
 				icmp.hdr->icmp_type,
-				libnet_addr2name4(ip->hdr->ip_src.s_addr, LIBNET_RESOLVE));
+				libnet_addr2name4(ip->hdr->ip_src.s_addr, LIBNET_DONT_RESOLVE));
 		break;
 	}
 }
@@ -1868,6 +1868,9 @@ main(int argc, char **argv)
 	struct passwd *pswd;
 	pthread_t thread;
 
+	struct arpreq req;
+	struct sockaddr_in *s_in;
+
 	char errbuf[LIBNET_ERRBUF_SIZE];
 	pcap_t *lph;
 
@@ -1913,6 +1916,26 @@ main(int argc, char **argv)
 	src_ip = libnet_name2addr4(lnh_raw4, argv[1], LIBNET_RESOLVE);
 	if (src_ip == (uint32_t)-1) {
 		fprintf(stderr, "invalid host name %s\n", argv[1]);
+		return 1;
+	}
+
+	/* so this is quite the hack. before doing anything else, we feed the host a
+	 * fake ethernet address (I certainly hope no device actually exists that
+	 * uses it!). then if the host wants to talk to us, it will send it out over
+	 * the wire. the packet will go nowhere, but pcap will see it and we'll be
+	 * able to process it. in this way we can talk to the host (but for some
+	 * reason that I haven't looked into, the host can ping us but we can't ping
+	 * the host). */
+	memset(&req, 0, sizeof (req));
+	req.arp_flags = ATF_PERM | ATF_COM;
+	s_in = (struct sockaddr_in *)&req.arp_pa;
+	s_in->sin_family = AF_INET;
+	s_in->sin_port = 0;
+	s_in->sin_addr.s_addr = src_ip;
+	req.arp_ha.sa_family = ARPHRD_ETHER;
+	memcpy(req.arp_ha.sa_data, "\x00\x00\x00\x00\x00\x01", 6);
+	if (ioctl(libnet_getfd(lnh_raw4), SIOCSARP, &req) < 0) {
+		perror("SIOCSARP");
 		return 1;
 	}
 
