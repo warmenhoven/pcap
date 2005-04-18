@@ -22,7 +22,6 @@
  *   IP:
  *     - IP options
  *     - precedence
- *     - Loopback
  *
  *   TCP:
  *     - TCP options
@@ -1527,10 +1526,6 @@ create_session(char *host, uint16_t port)
 		if ((sess = session_setup()) == NULL)
 			return NULL;
 
-		/* XXX we should have some check to see if sess->dst_ip ==
-		 * src_ip, so that we can detect when we're trying to send
-		 * packets to ourselves, because we won't be able to put those
-		 * packets out over the wire */
 		sess->dst_ip = libnet_name2addr4(lnh_raw4, host, LIBNET_RESOLVE);
 		if (sess->dst_ip == 0xffffffff) {
 			fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
