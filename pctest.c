@@ -1,33 +1,12 @@
 /*
- * right now in the TCP bake off I get 50 points:
- *
- * Featherweight Division:
- *   1 point for talking to myself
- *   1 point for saying something to myself
- *   1 point for gracefully ending the conversation
- *   2 points for repeating the above without reinitializing
- *   5 points for a complete conversation via the testing gateway
- *
- * Middleweight Division:
- *   2 points for talking to someone else
- *   2 points for saying something to someone else
- *   2 points for gracefully ending the conversaion
- *   4 points for repeating the above without reinitializing
- *   10 points for a complete conversation via the testing gateway
- *
- * Heavyweight Division:
- *   10 points for being able to talk to more than one other TCP at
- *      the same time
- *   10 points for correctly handling sequence number wraparound
- *
  * TODO:
  *   IP:
- *     - IP options
- *     - precedence
+ *     - IP options (security, source route, record route, timestamp)
+ *     - for some reason we can't ping the host, but it can ping us?
  *
  *   TCP:
- *     - TCP options
- *     - data in inital SYN
+ *     - TCP options (mss, sack, wscale, timestamp)
+ *     - "connection synchronization using data-carrying segments"
  *     - URG
  *     - Better initial seqno generation
  *     - slow start
@@ -35,14 +14,14 @@
  *     - Grow/shrink windows
  *     - retransmission/timers (Karn, Jacobson, exp. backoff, etc.)
  *     - Deal better with lost received data
+ *     - delayed/selective ACKs
+ *     - header prediction
  *
  *   General:
  *     - argv parsing (specify device, user to run as, etc.)
- *
- *   Then there are the things done by a real TCP stack (as opposed to this
- *   toy), that aren't in the spec:
- *    - delayed/selective ACKs
- *    - header prediction
+ *     - some way of guessing which IP address to use?
+ *     - make sure not using loopback device
+ *     - use link layer socket instead of raw socket
  *
  *   And finally, all of the evil things I'd like to do:
  *    - Increased control over remote window size
@@ -175,10 +154,9 @@ static struct timeval *
 timer_sleep_time(struct timeval *rtv)
 {
 	if (timers) {
-		/* we keep the timers in order sorted by when they're going to
-		 * expire (first to last), so taking the first on the list should
-		 * always be the first to expire and so we can use it to figure out
-		 * how long to tell select to sleep */
+		/* timers are sorted by when they're going to expire (first to last), so
+		 * taking the first on the list should always be the first to expire and
+		 * so we can use it to figure out how long to tell select to sleep */
 		struct timer *timer = timers->data;
 		struct timeval tv;
 
@@ -200,9 +178,8 @@ timer_process_pending(void)
 	struct timeval tv;
 
 	gettimeofday(&tv, NULL);
-	/* timers are sorted by when they expire. the first on the list will always
-	 * be the first that needs to get processed. after processing it, we remove
-	 * it from the list. if we come across one that doesn't need processing, all
+	/* we don't support periodic timers, and since timers are sorted by
+	 * expiration date, if we come across one that doesn't need processing, all
 	 * subsequent ones won't need processing, so we can return. */
 	while (timers) {
 		struct timer *timer = timers->data;
@@ -239,11 +216,11 @@ typedef struct tcp_session {
 
 	uint32_t state;
 
-	/* these describe the session. the src_ip is global. libnet_name2addr4
-	 * puts ip addresses in network byte order, so those will always be
-	 * that way. however, ports stored in the session will always be host
-	 * byte order, so when comparing against what comes off the wire, make
-	 * sure to do a proper translation */
+	/* these identify a unique session. the src_ip is global. libnet_name2addr4
+	 * puts ip addresses in network byte order, so those will always be that
+	 * way. however, ports stored in the session will always be host byte order,
+	 * so when comparing against what comes off the wire, make sure to do a
+	 * proper translation */
 	uint16_t src_prt;
 	uint16_t dst_prt;
 	uint32_t dst_ip;
@@ -279,7 +256,7 @@ typedef struct tcp_session {
 } TCB;
 
 /* this probably wasn't entirely necessary but it's convenient */
-struct arp {
+struct arp_pkt {
 	struct libnet_ethernet_hdr enet;
 	struct libnet_arp_hdr hdr __attribute__((__packed__));
 	/* everything from here down is IPv4 but that's all we need */
@@ -319,6 +296,7 @@ static list *sessions = NULL;
 static list *open_connections = NULL;
 static list *listeners = NULL;
 
+/* TCP UTIL { */
 static int
 send_tcp(TCB *sess, int flags, u_char *data, uint32_t len)
 {
@@ -410,8 +388,7 @@ find_session(uint32_t dst_ip, uint32_t dst_prt, uint32_t src_prt)
 
 	l = listeners;
 
-	/* TODO: we should be able to support listening for specific
-	 * hosts (or specific ports) */
+	/* we should be able to support listening for specific hosts and/or ports */
 	while (l) {
 		TCB *sess = l->data;
 		l = l->next;
@@ -423,7 +400,7 @@ find_session(uint32_t dst_ip, uint32_t dst_prt, uint32_t src_prt)
 	return NULL;
 }
 
-/* there are probably several problems with this. */
+/* XXX there are probably several problems with this. */
 static int
 get_port(uint32_t dst_ip, uint16_t dst_prt)
 {
@@ -523,6 +500,112 @@ remove_session(TCB *sess)
 	free(sess);
 }
 
+/* maybe eventually you can specify the port to connect from */
+static TCB *
+create_session(char *host, uint16_t port)
+{
+	TCB *sess;
+
+	if (host) {
+		if ((sess = session_setup()) == NULL)
+			return NULL;
+
+		sess->dst_ip = libnet_name2addr4(lnh_raw4, host, LIBNET_RESOLVE);
+		if (sess->dst_ip == 0xffffffff) {
+			fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
+			remove_session(sess);
+			return NULL;
+		}
+		sess->dst_prt = port;
+		sess->src_prt = get_port(sess->dst_ip, sess->dst_prt);
+
+		/* send the SYN, and we're off! */
+		send_tcp(sess, TH_SYN, NULL, 0);
+		sess->state = TCP_SYN_SENT;
+		printf("%u: %s (port %u)\n", sess->id, state_names[sess->state],
+			   sess->src_prt);
+		open_connections = list_prepend(open_connections, sess);
+	} else {
+		/* listening socket */
+		if ((sess = find_session(0, 0, port)) != NULL) {
+			fprintf(stderr, "id %d already listening on port %d\n",
+					sess->id, port);
+			return sess;
+		}
+		if ((sess = session_setup()) == NULL)
+			return NULL;
+
+		sess->dst_ip = 0;
+		sess->dst_prt = 0;
+		sess->src_prt = port;
+
+		sess->state = TCP_LISTEN;
+		printf("%u: %s\n", sess->id, state_names[sess->state]);
+		listeners = list_prepend(listeners, sess);
+	}
+
+	return sess;
+}
+/* } */
+
+/* STING { */
+static void
+sting(void *data)
+{
+	TCB *sess = data;
+
+	u_char str[] = STING_STRING;
+
+	sess->count++;
+	send_tcp(sess, TH_PUSH | TH_ACK, &str[sess->count], 1);
+
+	if (sess->count != STING_COUNT) {
+		sess->tmr = timer_start(STING_DELAY, sting, data);
+	} else {
+		/* so now we send the last byte */
+		sess->tmr = NULL;
+		sess->seqno = sess->iss;
+		send_tcp(sess, TH_PUSH | TH_ACK, &str[0], 1);
+		sess->seqno = sess->iss + STING_COUNT + 1;
+	}
+}
+
+static void
+sting_process(TCB *sess, struct tcp_pkt *pkt)
+{
+	u_char str[] = STING_STRING;
+
+	if (sess->state != TCP_ESTABLISHED) {
+		fprintf(stderr, "sting session stopping?\n");
+		timer_cancel(sess->tmr);
+		return;
+	}
+
+	if (ntohl(pkt->hdr->th_ack) == sess->iss) {
+		/* they're still waiting for our first byte */
+		sess->sting_acks++;
+	} else if (ntohl(pkt->hdr->th_ack) == sess->seqno) {
+		printf("sting to %s:\n",
+			   libnet_addr2name4(pkt->ip->ip_src.s_addr, LIBNET_DONT_RESOLVE));
+		printf("remote received %d/%d packets\n", STING_COUNT - sess->data_lost,
+			   STING_COUNT);
+		printf("we received %d/%d acks\n", sess->sting_acks,
+			   STING_COUNT - sess->data_lost);
+
+		send_tcp(sess, TH_RST | TH_ACK, NULL, 0);
+		remove_session(sess);
+	} else {
+		/* this indicates that they dropped something and need it resent */
+		sess->data_lost++;
+
+		sess->seqno = ntohl(pkt->hdr->th_ack);
+		send_tcp(sess, TH_PUSH | TH_ACK, &str[sess->seqno - sess->iss], 1);
+		sess->seqno = sess->iss + STING_COUNT + 1;
+	}
+}
+/* } */
+
+/* TCP SM { */
 static TCB *
 tcp_process_listen(TCB *sess, struct tcp_pkt *pkt)
 {
@@ -543,27 +626,6 @@ tcp_process_listen(TCB *sess, struct tcp_pkt *pkt)
 		 * but if you do, drop the segment, and return. */
 	}
 	return NULL;
-}
-
-static void
-sting(void *data)
-{
-	TCB *sess = data;
-
-	u_char str[] = STING_STRING;
-
-	sess->count++;
-	send_tcp(sess, TH_PUSH | TH_ACK, &str[sess->count], 1);
-
-	if (sess->count != STING_COUNT) {
-		sess->tmr = timer_start(STING_DELAY, sting, data);
-	} else {
-		/* so now we send the last byte */
-		sess->tmr = NULL;
-		sess->seqno = sess->iss;
-		send_tcp(sess, TH_PUSH | TH_ACK, &str[0], 1);
-		sess->seqno = sess->iss + STING_COUNT + 1;
-	}
 }
 
 static void
@@ -751,8 +813,8 @@ tcp_handle_fin(TCB *sess, struct tcp_pkt *pkt)
 
 	if ((sess->state == TCP_SYN_RECV) || (sess->state == TCP_ESTABLISHED)) {
 		send_tcp(sess, TH_FIN | TH_ACK, NULL, 0);
-		/* we send both the FIN and the ACK together, and move
-		 * right through CLOSE_WAIT to LAST_ACK */
+		/* we send both the FIN and the ACK together, and move right through
+		 * CLOSE_WAIT to LAST_ACK */
 		sess->state = TCP_LAST_ACK;
 		printf("%u: %s\n", sess->id, state_names[sess->state]);
 	} else if (sess->state == TCP_FIN_WAIT1) {
@@ -768,8 +830,9 @@ tcp_handle_fin(TCB *sess, struct tcp_pkt *pkt)
 		send_tcp(sess, TH_ACK, NULL, 0);
 		sess->state = TCP_TIME_WAIT;
 		printf("%u: %s\n", sess->id, state_names[sess->state]);
-		/* just like above, we should move to TIME_WAIT, but
-		 * we just assume everything went well */
+		/* we should stay in TIME_WAIT for 2 MSL, but if the ack is received
+		 * it's not necessary. if it's lost and they resend FIN we'll send RST,
+		 * which isn't what's expected but will do about the right thing */
 		remove_session(sess);
 	} else {
 		/* anyone else just stays in their state. TIME-WAIT, if it were
@@ -778,50 +841,12 @@ tcp_handle_fin(TCB *sess, struct tcp_pkt *pkt)
 }
 
 static void
-sting_process(TCB *sess, struct tcp_pkt *pkt)
-{
-	u_char str[] = STING_STRING;
-
-	if (sess->state != TCP_ESTABLISHED) {
-		fprintf(stderr, "sting session stopping?\n");
-		timer_cancel(sess->tmr);
-		return;
-	}
-
-	if (ntohl(pkt->hdr->th_ack) == sess->iss) {
-		/* they're still waiting for our first byte */
-		sess->sting_acks++;
-	} else if (ntohl(pkt->hdr->th_ack) == sess->seqno) {
-		printf("sting to %s:\n",
-			   libnet_addr2name4(pkt->ip->ip_src.s_addr, LIBNET_DONT_RESOLVE));
-		printf("remote received %d/%d packets\n", STING_COUNT - sess->data_lost,
-			   STING_COUNT);
-		printf("we received %d/%d acks\n", sess->sting_acks,
-			   STING_COUNT - sess->data_lost);
-
-		send_tcp(sess, TH_RST | TH_ACK, NULL, 0);
-		remove_session(sess);
-	} else {
-		/* this indicates that they dropped something and need it resent */
-		sess->data_lost++;
-
-		sess->seqno = ntohl(pkt->hdr->th_ack);
-		send_tcp(sess, TH_PUSH | TH_ACK, &str[sess->seqno - sess->iss], 1);
-		sess->seqno = sess->iss + STING_COUNT + 1;
-	}
-}
-
-static void
 tcp_state_machine(TCB *sess, struct tcp_pkt *pkt)
 {
 	/* here we can assume that the pkt is part of the session and for us */
 
-	/* XXX none of these things check security, precedence, or URG */
-
 	if (sess->state == TCP_LISTEN) {
 		sess = tcp_process_listen(sess, pkt);
-		/* XXX it is "perfectly legitimate" to have "connection synchronization
-		 * using data-carrying segments" but we don't handle that here. */
 		return;
 	}
 
@@ -833,17 +858,13 @@ tcp_state_machine(TCB *sess, struct tcp_pkt *pkt)
 
 	if (sess->state == TCP_SYN_SENT) {
 		tcp_process_syn_sent(sess, pkt);
-		/* XXX it is "perfectly legitimate" to have "connection synchronization
-		 * using data-carrying segments" but we don't handle that here. */
 		return;
 	}
 
 	/* at this point the state is not CLOSED, LISTEN, or SYN_SENT. also we can't
 	 * be in the CLOSE_WAIT state because we send the FIN with the ACK. also we
 	 * won't be in the TIME_WAIT state because we assume the other side received
-	 * our last ACK. even if it didn't, we'll be in LISTEN or CLOSED, and it
-	 * will get a RST, which is probably not what's expected, but should work
-	 * just as well. */
+	 * our last ACK. */
 
 	if (tcp_check_seqno(sess, pkt)) {
 		/* XXX should we be updating sess->unacked from hdr->th_ack here? */
@@ -884,7 +905,7 @@ tcp_state_machine(TCB *sess, struct tcp_pkt *pkt)
 	 * queue the data that's been sent to us, but we don't. instead we drop the
 	 * new data and send an ack with what we think should have come next. then
 	 * when we receive the in-order data later, we'll need to re-request this
-	 * data as well. this is really inefficient. */
+	 * data as well. this is really inefficient, but it works. */
 	if (sess->ackno != ntohl(pkt->hdr->th_seq)) {
 		send_tcp(sess, TH_ACK, NULL, 0);
 		return;
@@ -898,6 +919,7 @@ tcp_state_machine(TCB *sess, struct tcp_pkt *pkt)
 	if (sess->sting)
 		sting_process(sess, pkt);
 }
+/* } */
 
 static void
 process_tcp_packet(struct ip_pkt *ip)
@@ -1323,7 +1345,7 @@ process_ip_packet(struct libnet_ethernet_hdr *enet, uint32_t len)
 	 * ever want to support broadcast then we'll also have to change
 	 * init_pcap so that it gives us broadcast packets. if we ever want to
 	 * be really evil and do horrible things to other people's connections
-	 * then we'll have to modify this and init_pcap. */
+	 * then we'll have to modify this and init_pcap() below. */
 	if (ip.hdr->ip_dst.s_addr != src_ip) {
 		return;
 	}
@@ -1382,12 +1404,12 @@ process_packet(void)
 
 	int len;
 
-	/* XXX this section needs to be fixed, it assumes too much */
 	if (read(sp[1], &hdr, sizeof (hdr)) != sizeof (hdr))
 		return;
 	pkt = malloc(hdr.len);
 	if (!pkt)
 		return;
+	/* this read is probably okay but isn't exactly correct */
 	if ((len = read(sp[1], pkt, hdr.len)) < 0) {
 		free(pkt);
 		return;
@@ -1397,22 +1419,13 @@ process_packet(void)
 		return;
 	}
 
-#if 0
-	printf("\nPACKET:\n");
-	for (i = 0; i < hdr.len; i++) {
-		printf("%02x ", pkt[i]);
-		if ((i + 1) % 16 == 0)
-			printf("\n");
-	}
-	printf("\n\n");
-#endif
-
 	if (hdr.len < LIBNET_ETH_H) {
 		fprintf(stderr, "pcap packet too short!\n");
 		free(pkt);
 		return;
 	}
 
+	/* we assume everything pcap gives is is ethernet */
 	enet = (struct libnet_ethernet_hdr *)pkt;
 
 	switch (ntohs(enet->ether_type)) {
@@ -1527,54 +1540,6 @@ fping(char *host)
 	}
 }
 
-/* maybe eventually there will be a third argument, so you can specify the port
- * to connect from */
-static TCB *
-create_session(char *host, uint16_t port)
-{
-	TCB *sess;
-
-	if (host) {
-		if ((sess = session_setup()) == NULL)
-			return NULL;
-
-		sess->dst_ip = libnet_name2addr4(lnh_raw4, host, LIBNET_RESOLVE);
-		if (sess->dst_ip == 0xffffffff) {
-			fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
-			free(sess);
-			return NULL;
-		}
-		sess->dst_prt = port;
-		sess->src_prt = get_port(sess->dst_ip, sess->dst_prt);
-
-		/* send the SYN, and we're off! */
-		send_tcp(sess, TH_SYN, NULL, 0);
-		sess->state = TCP_SYN_SENT;
-		printf("%u: %s (port %u)\n", sess->id, state_names[sess->state],
-			   sess->src_prt);
-		open_connections = list_prepend(open_connections, sess);
-	} else {
-		/* listening socket */
-		if ((sess = find_session(0, 0, port)) != NULL) {
-			fprintf(stderr, "id %d already listening on port %d\n",
-					sess->id, port);
-			return sess;
-		}
-		if ((sess = session_setup()) == NULL)
-			return NULL;
-
-		sess->dst_ip = 0;
-		sess->dst_prt = 0;
-		sess->src_prt = port;
-
-		sess->state = TCP_LISTEN;
-		printf("%u: %s\n", sess->id, state_names[sess->state]);
-		listeners = list_prepend(listeners, sess);
-	}
-
-	return sess;
-}
-
 static void
 fake_timeout(void *arg __attribute__((__unused__)))
 {
@@ -1617,8 +1582,10 @@ process_input(void)
 		char *arg1, *arg2;
 		arg1 = buf + strlen("connect ");
 		arg2 = strchr(arg1, ' ');
-		if (!arg2)
+		if (!arg2) {
+			fprintf(stderr, "need to specify port to connect to\n");
 			return;
+		}
 		*arg2++ = 0;
 
 		create_session(arg1, atoi(arg2));
@@ -1630,8 +1597,10 @@ process_input(void)
 		char *arg1, *arg2;
 		arg1 = buf + strlen("write ");
 		arg2 = strchr(arg1, ' ');
-		if (!arg2)
+		if (!arg2) {
+			fprintf(stderr, "need to specify socket to write to\n");
 			return;
+		}
 		*arg2++ = 0;
 		id = atoi(arg1);
 
@@ -1728,7 +1697,8 @@ process_input(void)
 				   t->end.tv_usec);
 		}
 	} else if (!strcasecmp(buf, "quit")) {
-		/* XXX should send RST to all the sessions */
+		/* XXX should send RST to all the sessions, and remove the bogus arp
+		 * entry from the host */
 		exit(0);
 	}
 }
@@ -1754,8 +1724,6 @@ control_main(void *arg __attribute__((__unused__)))
 			process_input();
 
 		if (FD_ISSET(sp[1], &set))
-			/* we assume everything pcap gives is is IP, because we assume that
-			 * the pcap thread handles everything else itself */
 			process_packet();
 
 		timer_process_pending();
@@ -1810,12 +1778,11 @@ packet_main(u_char *user __attribute__((__unused__)),
 	const struct libnet_ethernet_hdr *enet =
 		(const struct libnet_ethernet_hdr *)pkt;
 	if (ntohs(enet->ether_type) == ETHERTYPE_ARP) {
-		/* since we're "faking" a client, we need to reply to arp
-		 * requests as that client. the problem is, we're using the MAC
-		 * address of the host, so if we get an arp from the host about
-		 * our client, we need to just ignore it. the host should deal
-		 * with this gracefully. (there has to be a better way.) */
-		const struct arp *arp = (const struct arp *)pkt;
+		/* since we're "faking" a client, we need to reply to arp requests as
+		 * that client. we shouldn't ever get an arp request from the host
+		 * because we set up a fake arp entry for ourselves, but we check to
+		 * make sure it's not from the host anyway. */
+		const struct arp_pkt *arp = (const struct arp_pkt *)pkt;
 		if (hdr->len < LIBNET_ETH_H + LIBNET_ARP_ETH_IP_H)
 			return;
 		if ((ntohs(arp->hdr.ar_hrd) == ARPHRD_ETHER) &&	/* ethernet*/
@@ -1825,7 +1792,7 @@ packet_main(u_char *user __attribute__((__unused__)),
 			memcmp(src_hw, arp->src_hw, 6))		/* not host */
 			arp_reply(arp->src_hw, arp->src_ip);
 	} else {
-		/* XXX should probably do some sort of sanity check before sending it
+		/* XXX we should probably do some sort of sanity check before sending it
 		 * off. do you trust pcap? */
 		write(sp[0], hdr, sizeof (struct pcap_pkthdr));
 		write(sp[0], pkt, hdr->len);
@@ -1854,8 +1821,7 @@ init_pcap(char *dev)
 	}
 
 	filter_line = malloc(4 + 5 + (4*4));
-	/* this filter line should give us everything we need (including arp
-	 * requests) */
+	/* this filter should give us everything we need (including arp requests) */
 	sprintf(filter_line, "dst host %s",
 			libnet_addr2name4(src_ip, LIBNET_DONT_RESOLVE));
 	pcap_compile(lph, &filter, filter_line, 0, net);
@@ -1897,29 +1863,23 @@ main(int argc, char **argv)
 
 	libnet_seed_prand(lnh_link);
 
-	/* setup of global variables */
 	memcpy(src_hw, libnet_get_hwaddr(lnh_link), 6);
 	ip_id = libnet_get_prand(LIBNET_PRu16);
 
+	/* please see RAWSOCKET_NON_SEQUITUR in libnet1 docs */
 	if (!(lnh_raw4 = libnet_init(LIBNET_RAW4, dev, errbuf))) {
 		fprintf(stderr, "%s\n", errbuf);
 		return 1;
 	}
 
-	/* you need to pick this IP address based on three characteristics:
+	/* you need to pick this IP address based on two characteristics:
 	 *
-	 * 1. it cannot be the same address as the host's address
-	 * 2. the address cannot already be in use by another computer (i.e.
-	 *    you can't pretend to be some other computer, only an imaginary
-	 *    computer)
-	 * 3. it needs to be on the same routing network (I don't know how else
-	 *    to say that) as the host. in most cases if the address is part of
-	 *    the same subnet as the host you should be fine.
+	 * 1. it cannot be in use by another computer (including the host)
+	 * 2. it needs to be in the same subnet as the host
 	 *
-	 * of course, if you remove the ip address from the host and just use
-	 * that address, then you shouldn't have to worry about any of that.
-	 * but then you'll have to modify this client to handle all the routing
-	 * details itself, and that's not fun. */
+	 * of course, you could remove the ip address from the host and just use
+	 * that address, but then you'll probably have to modify this client to
+	 * handle all the routing details itself, and that's not fun. */
 	src_ip = libnet_name2addr4(lnh_raw4, argv[1], LIBNET_RESOLVE);
 	if (src_ip == (uint32_t)-1) {
 		fprintf(stderr, "invalid host name %s\n", argv[1]);
@@ -1930,9 +1890,7 @@ main(int argc, char **argv)
 	 * fake ethernet address (I certainly hope no device actually exists that
 	 * uses it!). then if the host wants to talk to us, it will send it out over
 	 * the wire. the packet will go nowhere, but pcap will see it and we'll be
-	 * able to process it. in this way we can talk to the host (but for some
-	 * reason that I haven't looked into, the host can ping us but we can't ping
-	 * the host). */
+	 * able to process it. in this way we can talk to the host. */
 	memset(&req, 0, sizeof (req));
 	req.arp_flags = ATF_PERM | ATF_COM;
 	s_in = (struct sockaddr_in *)&req.arp_pa;
@@ -1950,8 +1908,7 @@ main(int argc, char **argv)
 		return 1;
 
 	/* now that we've created all of our sockets and opened up pcap, drop root
-	 * privileges and run as specified user (defaults to 'nobody'). right now
-	 * there's no way to specify it without changing the code though. */
+	 * privileges and run as specified user (which defaults to 'nobody'). */
 	pswd = getpwnam(user);
 	if (!pswd || setuid(pswd->pw_uid)) {
 		fprintf(stderr, "I ain't %s! (can't drop root privs)\n", user);
@@ -1972,14 +1929,12 @@ main(int argc, char **argv)
 	 * really an option because it increases the load and you may miss
 	 * certain things. there's really no difference between 4 and 5 either,
 	 * as long as the pcap thread (process) isn't processing the packets.
-	 * and since I've never really used threads for anything real before,
-	 * we'll use threads.
 	 *
 	 * I'm evil.
 	 *
 	 * even though this is a threaded program, I don't really consider it
 	 * "using threads" since the threads don't share variables, so there's
-	 * no need for locking. */
+	 * no need for locking. yay for avoiding headaches! */
 	socketpair(AF_UNIX, SOCK_STREAM, 0, sp);
 	pthread_create(&thread, NULL, control_main, NULL);
 	/* from now on, lnh_link is only allowed to be used by the pcap thread, and
