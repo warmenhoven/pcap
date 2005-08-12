@@ -30,7 +30,6 @@
 #include <libnet.h>
 #include <net/if_arp.h>
 #include <pcap.h>
-#include <pthread.h>
 #include <pwd.h>
 
 /* LIST { */
@@ -234,7 +233,7 @@ typedef struct tcp_session {
 	uint32_t unacked; /* aka SND.UNA */
 
 	/* I didn't actually start using Linux to get away from windows; I started
-	 * using it because I wanted to know about computing in general */
+	 * using it because I wanted to know more about computing in general */
 	uint32_t snd_win; /* aka SND.WND */
 	uint32_t rcv_win; /* aka RCV.WND */
 
@@ -254,17 +253,6 @@ typedef struct tcp_session {
 #define STING_COUNT 100
 #define STING_DELAY 100
 } TCB;
-
-/* this probably wasn't entirely necessary but it's convenient */
-struct arp_pkt {
-	struct libnet_ethernet_hdr enet;
-	struct libnet_arp_hdr hdr __attribute__((__packed__));
-	/* everything from here down is IPv4 but that's all we need */
-	unsigned char src_hw[6] __attribute__((__packed__));
-	uint32_t src_ip __attribute__((__packed__));
-	unsigned char dst_hw[6] __attribute__((__packed__));
-	uint32_t dst_ip __attribute__((__packed__));
-};
 
 struct ip_pkt {
 	struct libnet_ipv4_hdr *hdr;
@@ -287,7 +275,8 @@ struct tcp_pkt {
 };
 
 /* these are our global variables */
-static int sp[2];
+static libnet_t *lnh_link = NULL;
+static unsigned char src_hw[6];
 static libnet_t *lnh_raw4 = NULL;
 static uint32_t src_ip;
 static u_int16_t ip_id;
@@ -919,7 +908,6 @@ tcp_state_machine(TCB *sess, struct tcp_pkt *pkt)
 	if (sess->sting)
 		sting_process(sess, pkt);
 }
-/* } */
 
 static void
 process_tcp_packet(struct ip_pkt *ip)
@@ -986,12 +974,14 @@ process_tcp_packet(struct ip_pkt *ip)
 	/* this is where the real work is */
 	tcp_state_machine(sess, &tcp);
 }
+/* } */
 
+/* UDP { */
 static void
 process_udp_packet(struct ip_pkt *ip)
 {
 	/* that's right, we don't handle udp! when's the last time you used udp.
-	 * honestly. and don't tell me you actually use dns or ntp! or nfs. or
+	 * honestly. and don't tell me you actually use dns! or ntp. or nfs. or
 	 * smb. *shudder* */
 	unsigned int len;
 
@@ -1023,7 +1013,9 @@ process_udp_packet(struct ip_pkt *ip)
 		fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
 	}
 }
+/* } */
 
+/* ICMP { */
 static void
 icmp_echo_reply(struct icmp_pkt *icmp)
 {
@@ -1131,8 +1123,11 @@ process_icmp_packet(struct ip_pkt *ip)
 		break;
 	}
 }
+/* } */
 
-/* FRAGMENTS { */
+/* IP { */
+
+/*		FRAGMENTS { */
 struct ip_frag_bit {
 	uint16_t offset;
 	uint16_t len;
@@ -1308,7 +1303,7 @@ add_ip_frag(struct ip_pkt *pkt)
 
 	return reassemble_ip_frag(frag, pkt);
 }
-/* } */
+/*		} */
 
 static void
 process_ip_packet(struct libnet_ethernet_hdr *enet, uint32_t len)
@@ -1393,53 +1388,64 @@ process_ip_packet(struct libnet_ethernet_hdr *enet, uint32_t len)
 
 	free_ip_frag(frag);
 }
+/* } */
 
+/* ARP { */
+/* this probably wasn't entirely necessary but it's convenient */
+struct arp_pkt {
+	struct libnet_ethernet_hdr enet;
+	struct libnet_arp_hdr hdr;
+	/* everything from here down is IPv4 but that's all we need */
+	unsigned char src_hw[6];
+	uint32_t src_ip;
+	unsigned char dst_hw[6];
+	uint32_t dst_ip;
+} __attribute__ ((__packed__));
+
+/* since we're "faking" a client, we need to reply to arp requests as that
+ * client. we shouldn't ever get an arp request from the host because we set up
+ * a fake arp entry for ourselves, but we check to make sure it's not from the
+ * host anyway. */
 static void
-process_packet(void)
+process_arp_packet(struct libnet_ethernet_hdr *enet, uint32_t len)
 {
-	struct pcap_pkthdr hdr;
-	u_char *pkt;
+	struct arp_pkt *arp = (struct arp_pkt *)enet;
 
-	struct libnet_ethernet_hdr *enet;
+	if (len < LIBNET_ETH_H + LIBNET_ARP_ETH_IP_H)
+		return;
 
-	int len;
+	if ((ntohs(arp->hdr.ar_hrd) != ARPHRD_ETHER) ||	/* ethernet*/
+		(ntohs(arp->hdr.ar_pro) != ETHERTYPE_IP) ||	/* ipv4 */
+		(ntohs(arp->hdr.ar_op) != ARPOP_REQUEST) ||	/* request */
+		(arp->dst_ip != src_ip) ||					/* for us */
+		memcmp(src_hw, arp->src_hw, 6) == 0)		/* not host */
+		return;
 
-	if (read(sp[1], &hdr, sizeof (hdr)) != sizeof (hdr))
-		return;
-	pkt = malloc(hdr.len);
-	if (!pkt)
-		return;
-	/* this read is probably okay but isn't exactly correct */
-	if ((len = read(sp[1], pkt, hdr.len)) < 0) {
-		free(pkt);
-		return;
-	}
-	if ((unsigned int)len != hdr.len) {
-		free(pkt);
-		return;
-	}
+	printf("replying to arp from %s (%02x:%02x:%02x:%02x:%02x:%02x)\n",
+		   libnet_addr2name4(arp->src_ip, LIBNET_DONT_RESOLVE),
+		   arp->src_hw[0], arp->src_hw[1], arp->src_hw[2],
+		   arp->src_hw[3], arp->src_hw[4], arp->src_hw[5]);
 
-	if (hdr.len < LIBNET_ETH_H) {
-		fprintf(stderr, "pcap packet too short!\n");
-		free(pkt);
+	libnet_clear_packet(lnh_link);
+
+	if (libnet_build_arp(ARPHRD_ETHER, ETHERTYPE_IP, 6, 4, ARPOP_REPLY, src_hw,
+						 (u_char *)&src_ip, arp->src_hw, (u_char *)&arp->src_ip,
+						 NULL, 0, lnh_link, 0) == -1) {
+		fprintf(stderr, "%s", libnet_geterror(lnh_link));
 		return;
 	}
 
-	/* we assume everything pcap gives is is ethernet */
-	enet = (struct libnet_ethernet_hdr *)pkt;
-
-	switch (ntohs(enet->ether_type)) {
-	case ETHERTYPE_IP:
-		process_ip_packet(enet, hdr.len);
-		break;
-	default:
-		fprintf(stderr, "received unhandled ethernet type %d\n",
-				ntohs(enet->ether_type));
-		break;
+	if (libnet_autobuild_ethernet(arp->src_hw, ETHERTYPE_ARP, lnh_link) == -1) {
+		fprintf(stderr, "%s", libnet_geterror(lnh_link));
+		return;
 	}
 
-	free(pkt);
+	if (libnet_write(lnh_link) == -1) {
+		fprintf(stderr, "%s", libnet_geterror(lnh_link));
+		return;
+	}
 }
+/* } */
 
 /* INPUT { */
 static void
@@ -1480,6 +1486,7 @@ ping(char *host)
 	}
 }
 
+/* to send a fragmented ping packet, to test fragmentation */
 static void
 fping(char *host)
 {
@@ -1704,98 +1711,49 @@ process_input(void)
 }
 /* } */
 
-static void * __attribute__((__noreturn__))
-control_main(void *arg __attribute__((__unused__)))
-{
-	fd_set set;
-	struct timeval tv, *ptv;
-
-	while (1) {
-		FD_ZERO(&set);
-		FD_SET(0, &set);
-		FD_SET(sp[1], &set);
-
-		ptv = timer_sleep_time(&tv);
-
-		if (select(sp[1] + 1, &set, NULL, NULL, ptv) < 0)
-			exit(1);
-
-		if (FD_ISSET(0, &set))
-			process_input();
-
-		if (FD_ISSET(sp[1], &set))
-			process_packet();
-
-		timer_process_pending();
-	}
-}
-
 /* PCAP { */
-static libnet_t *lnh_link = NULL;
-static unsigned char src_hw[6];
-
-static int
-arp_reply(const unsigned char hw[6], uint32_t ip)
-{
-	unsigned char hwa[6];
-
-	printf("replying to arp from %s (%02x:%02x:%02x:%02x:%02x:%02x)\n",
-		   libnet_addr2name4(ip, LIBNET_DONT_RESOLVE),
-		   hw[0], hw[1], hw[2], hw[3], hw[4], hw[5]);
-
-	memcpy(hwa, hw, 6);
-
-	libnet_clear_packet(lnh_link);
-
-	if (libnet_build_arp(ARPHRD_ETHER, ETHERTYPE_IP, 6, 4, ARPOP_REPLY,
-						 src_hw, (u_char *)&src_ip, hwa, (u_char *)&ip,
-						 NULL, 0, lnh_link, 0) == -1) {
-		fprintf(stderr, "%s", libnet_geterror(lnh_link));
-		return 1;
-	}
-
-	if (libnet_autobuild_ethernet(hwa, ETHERTYPE_ARP, lnh_link) == -1) {
-		fprintf(stderr, "%s", libnet_geterror(lnh_link));
-		return 1;
-	}
-
-	if (libnet_write(lnh_link) == -1) {
-		fprintf(stderr, "%s", libnet_geterror(lnh_link));
-		return 1;
-	}
-
-	return 0;
-}
-
-/* 'main' is a misnomer since it's not really a "main" function, it's a
- * callback. pcap sucks. anyway, it can handle some things by itself but
- * anything that needs an understanding of state needs to be passed to the
- * control thread. */
 static void
-packet_main(u_char *user __attribute__((__unused__)),
-			const struct pcap_pkthdr *hdr, const u_char *pkt)
+process_packet(pcap_t *lph)
 {
-	const struct libnet_ethernet_hdr *enet =
-		(const struct libnet_ethernet_hdr *)pkt;
-	if (ntohs(enet->ether_type) == ETHERTYPE_ARP) {
-		/* since we're "faking" a client, we need to reply to arp requests as
-		 * that client. we shouldn't ever get an arp request from the host
-		 * because we set up a fake arp entry for ourselves, but we check to
-		 * make sure it's not from the host anyway. */
-		const struct arp_pkt *arp = (const struct arp_pkt *)pkt;
-		if (hdr->len < LIBNET_ETH_H + LIBNET_ARP_ETH_IP_H)
-			return;
-		if ((ntohs(arp->hdr.ar_hrd) == ARPHRD_ETHER) &&	/* ethernet*/
-			(ntohs(arp->hdr.ar_pro) == ETHERTYPE_IP) &&	/* ipv4 */
-			(ntohs(arp->hdr.ar_op) == ARPOP_REQUEST) &&	/* request */
-			(arp->dst_ip == src_ip) &&			/* for us */
-			memcmp(src_hw, arp->src_hw, 6))		/* not host */
-			arp_reply(arp->src_hw, arp->src_ip);
-	} else {
-		/* XXX we should probably do some sort of sanity check before sending it
-		 * off. do you trust pcap? */
-		write(sp[0], hdr, sizeof (struct pcap_pkthdr));
-		write(sp[0], pkt, hdr->len);
+	struct libnet_ethernet_hdr *enet;
+	struct pcap_pkthdr *hdr;
+	u_char *pkt;
+
+	/* we pretend pkt is a const here! that's probably pretty evil. in fact we
+	 * never actually modify the contents of the packet (or shouldn't!), but
+	 * not everything (ahem, libnet) uses const. rather than copy the data to
+	 * avoid const, and sprinkling const all over the place, we'll just avoid
+	 * the warning.
+	 */
+	if (pcap_next_ex(lph, &hdr, (const u_char **)&pkt) != 1) {
+		fprintf(stderr, "pcap_next fails!\n");
+		return;
+	}
+
+	if (hdr == NULL || pkt == NULL) {
+		fprintf(stderr, "pcap_next returns bad data!\n");
+		return;
+	}
+
+	if (hdr->len < LIBNET_ETH_H) {
+		fprintf(stderr, "pcap packet too short!\n");
+		return;
+	}
+
+	/* we assume everything pcap gives is is ethernet */
+	enet = (struct libnet_ethernet_hdr *)pkt;
+
+	switch (ntohs(enet->ether_type)) {
+	case ETHERTYPE_ARP:
+		process_arp_packet(enet, hdr->len);
+		break;
+	case ETHERTYPE_IP:
+		process_ip_packet(enet, hdr->len);
+		break;
+	default:
+		fprintf(stderr, "received unhandled ethernet type %d\n",
+				ntohs(enet->ether_type));
+		break;
 	}
 }
 
@@ -1839,7 +1797,9 @@ int
 main(int argc, char **argv)
 {
 	struct passwd *pswd;
-	pthread_t thread;
+
+	fd_set set;
+	struct timeval tv, *ptv;
 
 	struct arpreq req;
 	struct sockaddr_in *s_in;
@@ -1915,32 +1875,24 @@ main(int argc, char **argv)
 		return 1;
 	}
 
-	/* there are five (well, actually three) options if you want to have a
-	 * main loop other than pcap_loop:
-	 *
-	 * 1. parse packets from pcap_fileno yourself
-	 * 2. rewrite pcap
-	 * 3. call pcap_dispatch occasionally
-	 * 4. fork
-	 * 5. use threads
-	 *
-	 * 1 and 2 are more or less the same thing, and if using pcap is this
-	 * bad, I don't want to think about what hacking pcap is like. 3 isn't
-	 * really an option because it increases the load and you may miss
-	 * certain things. there's really no difference between 4 and 5 either,
-	 * as long as the pcap thread (process) isn't processing the packets.
-	 *
-	 * I'm evil.
-	 *
-	 * even though this is a threaded program, I don't really consider it
-	 * "using threads" since the threads don't share variables, so there's
-	 * no need for locking. yay for avoiding headaches! */
-	socketpair(AF_UNIX, SOCK_STREAM, 0, sp);
-	pthread_create(&thread, NULL, control_main, NULL);
-	/* from now on, lnh_link is only allowed to be used by the pcap thread, and
-	 * lnh_raw4 is only allowed to be used by the control thread */
+	while (1) {
+		FD_ZERO(&set);
+		FD_SET(0, &set);
+		FD_SET(pcap_fileno(lph), &set);
 
-	pcap_loop(lph, -1, packet_main, NULL);
+		ptv = timer_sleep_time(&tv);
+
+		if (select(pcap_fileno(lph) + 1, &set, NULL, NULL, ptv) < 0)
+			exit(1);
+
+		if (FD_ISSET(0, &set))
+			process_input();
+
+		if (FD_ISSET(pcap_fileno(lph), &set))
+			process_packet(lph);
+
+		timer_process_pending();
+	}
 
 	/* I don't think we'll ever get here, unless things go very wrong */
 	return 1;

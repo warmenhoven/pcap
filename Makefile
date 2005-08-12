@@ -35,7 +35,6 @@ NITPICKY_WARNINGS =	\
 			-Wmissing-prototypes \
 			-Wnested-externs \
 			-Wnonnull \
-			-Wpacked \
 			-Wpadded \
 			-Wparentheses \
 			-Wpointer-arith \
