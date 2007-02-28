@@ -1722,7 +1722,7 @@ process_packet(pcap_t *lph)
 	/* we pretend pkt is a const here! that's probably pretty evil. in fact we
 	 * never actually modify the contents of the packet (or shouldn't!), but
 	 * not everything (ahem, libnet) uses const. rather than copy the data to
-	 * avoid const, and sprinkling const all over the place, we'll just avoid
+	 * avoid const, or sprinkling const all over the place, we'll just avoid
 	 * the warning.
 	 */
 	if (pcap_next_ex(lph, &hdr, (const u_char **)&pkt) != 1) {
