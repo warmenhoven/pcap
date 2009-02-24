@@ -57,7 +57,9 @@ NITPICKY_WARNINGS +=	\
 			-Wunused \
 			-Wwrite-strings \
 			-pedantic \
-			-std=c99 \
+
+# libnet has an inline prototype
+#			-std=c99 \
 
 CFLAGS += $(NITPICKY_WARNINGS)
 endif
