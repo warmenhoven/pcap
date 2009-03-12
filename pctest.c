@@ -210,6 +210,12 @@ static const char *state_names[] = {
     "CLOSING",
 };
 
+struct pkt_q {
+    uint32_t seqno;
+    int len; /* -1 means this is the fin */
+    u_char *data;
+};
+
 typedef struct tcp_session {
     uint32_t id;    /* heh. a more appropriate name might be 'fd'. */
 
@@ -225,19 +231,17 @@ typedef struct tcp_session {
     uint32_t dst_ip;
 
     /* these are stored in host byte order mostly by default */
-    uint32_t seqno; /* aka SND.NXT */
+    uint32_t unacked; /* aka SND.UNA */
+    uint32_t seqno;   /* aka SND.NXT */
+    uint32_t snd_win; /* aka SND.WND */
     uint32_t iss;
-    uint32_t ackno; /* aka RCV.NXT */
+
+    uint32_t ackno;   /* aka RCV.NXT */
+    uint32_t rcv_win; /* aka RCV.WND */
     uint32_t irs;
 
-    uint32_t unacked; /* aka SND.UNA */
+    list *rx;
 
-    /* I didn't actually start using Linux to get away from windows; I started
-     * using it because I wanted to know more about computing in general */
-    uint32_t snd_win; /* aka SND.WND */
-    uint32_t rcv_win; /* aka RCV.WND */
-
-    struct timer *tmr;
     /* there's really a bunch of other stuff that I should be paying
      * attention to */
 
@@ -246,6 +250,7 @@ typedef struct tcp_session {
     int count;
     int sting_acks;
     int data_lost;
+    struct timer *tmr;
 #define STING_STRING "GET / HTTP/1.0\n" \
         "Accept: text/plain\nAccept: */*\n" \
         "User-Agent: Mozilla/4.0 " \
@@ -292,14 +297,14 @@ send_tcp(TCB *sess, int flags, u_char *data, uint32_t len)
     libnet_clear_packet(lnh_raw4);
 
     if (libnet_build_tcp(sess->src_prt, sess->dst_prt, sess->seqno, sess->ackno,
-                        flags, sess->rcv_win, 0, 0, LIBNET_TCP_H + len, data,
-                        len, lnh_raw4, 0) == -1) {
+                         flags, sess->rcv_win, 0, 0, LIBNET_TCP_H + len, data,
+                         len, lnh_raw4, 0) == -1) {
         fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
         return 1;
     }
     if (libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_TCP_H + len, IPTOS_RELIABILITY,
-                        ip_id++, 0, ip_ttl, IPPROTO_TCP, 0, src_ip,
-                        sess->dst_ip, NULL, 0, lnh_raw4, 0) == -1) {
+                          ip_id++, 0, ip_ttl, IPPROTO_TCP, 0, src_ip,
+                          sess->dst_ip, NULL, 0, lnh_raw4, 0) == -1) {
         fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
         return 1;
     }
@@ -334,15 +339,15 @@ send_rst(uint32_t state, struct tcp_pkt *tcp)
     libnet_clear_packet(lnh_raw4);
 
     if (libnet_build_tcp(ntohs(tcp->hdr->th_dport), ntohs(tcp->hdr->th_sport),
-                        ntohl(tcp->hdr->th_ack), ackno, cntrl, 0, 0, 0,
-                        LIBNET_TCP_H, NULL, 0, lnh_raw4, 0) == -1) {
+                         ntohl(tcp->hdr->th_ack), ackno, cntrl, 0, 0, 0,
+                         LIBNET_TCP_H, NULL, 0, lnh_raw4, 0) == -1) {
         fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
         return 1;
     }
 
     if (libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_TCP_H, IPTOS_LOWDELAY, ip_id++,
-                        0, ip_ttl, IPPROTO_TCP, 0, src_ip,
-                        tcp->ip->ip_src.s_addr, NULL, 0, lnh_raw4, 0) == -1) {
+                          0, ip_ttl, IPPROTO_TCP, 0, src_ip,
+                          tcp->ip->ip_src.s_addr, NULL, 0, lnh_raw4, 0) == -1) {
         fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
         return 1;
     }
@@ -439,9 +444,9 @@ session_setup(void)
     /* I hear I shouldn't use this function for anything real. oh well. */
     sess->seqno = libnet_get_prand(LIBNET_PRu32);
 
-    /* XXX at some point I'm going to have to consider what might happen if I
-     * want to do something like queuing the data until someone tells me they
-     * want to read it. at that point I may need to decrease this window */
+    /* XXX What you see is what you get. This is the only place the receive
+     * window is modified. Setting it to 0 makes most hosts annoyed. And who can
+     * blame them? The person they're talking to isn't listening to them. */
     sess->rcv_win = 0xffff;
 
     sess->id = get_next_sess_id();
@@ -475,6 +480,18 @@ accept_session(TCB *listener, struct tcp_pkt *pkt)
     return sess;
 }
 
+static void
+free_txrx_queues(TCB *sess)
+{
+    while (sess->rx) {
+        struct pkt_q *pq = sess->rx->data;
+        sess->rx = list_remove(sess->rx, pq);
+        if (pq->data)
+            free(pq->data);
+        free(pq);
+    }
+}
+
 /* after this function, sess is no longer valid (obviously) */
 static void
 remove_session(TCB *sess)
@@ -485,6 +502,7 @@ remove_session(TCB *sess)
         open_connections = list_remove(open_connections, sess);
     }
     sessions = list_remove(sessions, sess);
+    free_txrx_queues(sess);
     timer_cancel(sess->tmr);
     free(sess);
 }
@@ -512,7 +530,7 @@ create_session(char *host, uint16_t port)
         send_tcp(sess, TH_SYN, NULL, 0);
         sess->state = TCP_SYN_SENT;
         printf("%u: %s (port %u)\n", sess->id, state_names[sess->state],
-            sess->src_prt);
+               sess->src_prt);
         open_connections = list_prepend(open_connections, sess);
     } else {
         /* listening socket */
@@ -575,11 +593,11 @@ sting_process(TCB *sess, struct tcp_pkt *pkt)
         sess->sting_acks++;
     } else if (ntohl(pkt->hdr->th_ack) == sess->seqno) {
         printf("sting to %s:\n",
-            libnet_addr2name4(pkt->ip->ip_src.s_addr, LIBNET_DONT_RESOLVE));
+               libnet_addr2name4(pkt->ip->ip_src.s_addr, LIBNET_DONT_RESOLVE));
         printf("remote received %d/%d packets\n", STING_COUNT - sess->data_lost,
-            STING_COUNT);
+               STING_COUNT);
         printf("we received %d/%d acks\n", sess->sting_acks,
-            STING_COUNT - sess->data_lost);
+               STING_COUNT - sess->data_lost);
 
         send_tcp(sess, TH_RST | TH_ACK, NULL, 0);
         remove_session(sess);
@@ -723,8 +741,8 @@ static int
 tcp_check_ackno(TCB *sess, struct tcp_pkt *pkt)
 {
     uint32_t snduna = sess->unacked,
-            segack = ntohl(pkt->hdr->th_ack),
-            sndnxt = sess->seqno;
+             segack = ntohl(pkt->hdr->th_ack),
+             sndnxt = sess->seqno;
 
     if ((0 <= (int32_t)(segack - snduna)) &&
         (0 <= (int32_t)(sndnxt - segack))) {
@@ -760,28 +778,63 @@ tcp_check_ackno(TCB *sess, struct tcp_pkt *pkt)
     return 0;
 }
 
+static int
+pkt_q_cmp(const void *x, const void *y)
+{
+    /* this works because seqno is the first item */
+    return (*(const uint32_t *)x - *(const uint32_t *)y);
+}
+
 static void
-tcp_handle_data(TCB *sess, struct tcp_pkt *pkt)
+tcp_queue_packet(TCB *sess, struct tcp_pkt *pkt)
+{
+    uint32_t seqno = ntohl(pkt->hdr->th_seq);
+
+    /* if we're in closing then we got the FIN, don't queue anything */
+    if (sess->state == TCP_CLOSING) {
+        return;
+    }
+
+    if ((seqno + pkt->data_len > sess->ackno) &&
+        (pkt->data_len != 0)) {
+        /* add the data to the rx queue */
+        struct pkt_q *pq = calloc(1, sizeof (struct pkt_q));
+        pq->seqno = seqno;
+        pq->len = pkt->data_len;
+        pq->data = malloc(pkt->data_len);
+        memcpy(pq->data, pkt->data, pkt->data_len);
+        sess->rx = list_insert_sorted(sess->rx, pq, pkt_q_cmp);
+    }
+
+    if ((pkt->hdr->th_flags & TH_FIN) &&
+        (seqno + pkt->data_len + 1 > sess->ackno)) {
+        /* add the fin to the rx queue */
+        struct pkt_q *pq = calloc(1, sizeof (struct pkt_q));
+        pq->seqno = seqno + pkt->data_len;
+        pq->len = -1; /* FIN */
+        sess->rx = list_insert_sorted(sess->rx, pq, pkt_q_cmp);
+    }
+}
+
+static void
+tcp_handle_data(TCB *sess, u_char *data, unsigned int len)
 {
     unsigned int i;
 
-    if (sess->sting)
+    if (len == 0)
         return;
 
-    if (pkt->data_len == 0)
-        return;
+    printf("read %u: %u bytes\n", sess->id, len);
 
-    printf("read %u: %u bytes\n", sess->id, pkt->data_len);
-
-    for (i = 0; i < pkt->data_len; i++) {
-        printf("%02x ", pkt->data[i]);
+    for (i = 0; i < len; i++) {
+        printf("%02x ", data[i]);
         if (i && (i + 1) % 16 == 0)
             printf("\n");
     }
     printf("\n");
-    for (i = 0; i < pkt->data_len; i++) {
-        if (isprint(pkt->data[i]))
-            printf(" %c ", pkt->data[i]);
+    for (i = 0; i < len; i++) {
+        if (isprint(data[i]))
+            printf(" %c ", data[i]);
         else
             printf("   ");
         if (i && (i + 1) % 16 == 0)
@@ -789,21 +842,18 @@ tcp_handle_data(TCB *sess, struct tcp_pkt *pkt)
     }
     printf("\n");
 
-    /* XXX this is wrong */
-    sess->ackno += pkt->data_len;
-    send_tcp(sess, TH_ACK, NULL, 0);
+    sess->ackno += len;
 }
 
-static void
-tcp_handle_fin(TCB *sess, struct tcp_pkt *pkt)
+static int
+tcp_handle_fin(TCB *sess)
 {
-    /* XXX this is wrong */
     sess->ackno++;
 
     if ((sess->state == TCP_SYN_RECV) || (sess->state == TCP_ESTABLISHED)) {
-        send_tcp(sess, TH_FIN | TH_ACK, NULL, 0);
         /* we send both the FIN and the ACK together, and move right through
          * CLOSE_WAIT to LAST_ACK */
+        send_tcp(sess, TH_FIN | TH_ACK, NULL, 0);
         sess->state = TCP_LAST_ACK;
         printf("%u: %s\n", sess->id, state_names[sess->state]);
     } else if (sess->state == TCP_FIN_WAIT1) {
@@ -813,9 +863,6 @@ tcp_handle_fin(TCB *sess, struct tcp_pkt *pkt)
         printf("%u: %s\n", sess->id, state_names[sess->state]);
     } else if (sess->state == TCP_FIN_WAIT2) {
         /* we've got the FIN, send the ACK and we're done */
-        /* XXX if there's still data missing then we don't want to set ackno to
-         * pkt->hdr->th_seq + 1; we want to receive that data still */
-        sess->ackno = ntohl(pkt->hdr->th_seq) + 1;
         send_tcp(sess, TH_ACK, NULL, 0);
         sess->state = TCP_TIME_WAIT;
         printf("%u: %s\n", sess->id, state_names[sess->state]);
@@ -826,6 +873,59 @@ tcp_handle_fin(TCB *sess, struct tcp_pkt *pkt)
     } else {
         /* anyone else just stays in their state. TIME-WAIT, if it were
          * possible for us, would restart the 2 MSL time-wait timeout. */
+        return 1;
+    }
+
+    return 0;
+}
+
+static void
+tcp_drain_queue(TCB *sess)
+{
+    int send_ack = 0;
+
+    while (sess->rx) {
+        struct pkt_q *pq = sess->rx->data;
+        int offset, len;
+
+        /* we got here because we got a packet containing *something*, so send
+         * an ack no matter what. but sometimes we send an ack as part of
+         * handling fin, so don't necessarily do it here. just do it. */
+        send_ack = 1;
+
+        /* if it's not time to handle this yet, just break */
+        if (pq->seqno > sess->ackno) {
+            fprintf(stderr, "detected missed packet on %d\n", sess->id);
+            break;
+        }
+
+        /* if it's a FIN, handle it, free the list, and we're done */
+        if (pq->len == -1) {
+            /* what if pq->seqno < sess->ackno? in that case, we got a misplaced
+             * FIN? that seems like someone is trying to do something evil */
+            if (pq->seqno < sess->ackno) {
+                fprintf(stderr, "FIN again on %d!\n", sess->id);
+            }
+            /* free before handle because sess might not be valid after */
+            free_txrx_queues(sess);
+            send_ack = tcp_handle_fin(sess);
+            break;
+        }
+
+        /* now comes the fun part, reassembling the data */
+        offset = sess->ackno - pq->seqno;
+        len = pq->len - offset;
+        if (len > 0) {
+            tcp_handle_data(sess, pq->data + offset, len);
+        }
+        sess->rx = list_remove(sess->rx, pq);
+        if (pq->data)
+            free(pq->data);
+        free(pq);
+    }
+
+    if (send_ack) {
+        send_tcp(sess, TH_ACK, NULL, 0);
     }
 }
 
@@ -890,20 +990,9 @@ tcp_state_machine(TCB *sess, struct tcp_pkt *pkt)
     if (tcp_check_ackno(sess, pkt))
         return;
 
-    /* XXX check to see if we're missing any data. if we are then we should
-     * queue the data that's been sent to us, but we don't. instead we drop the
-     * new data and send an ack with what we think should have come next. then
-     * when we receive the in-order data later, we'll need to re-request this
-     * data as well. this is really inefficient, but it works. */
-    if (sess->ackno != ntohl(pkt->hdr->th_seq)) {
-        send_tcp(sess, TH_ACK, NULL, 0);
-        return;
-    }
+    tcp_queue_packet(sess, pkt);
 
-    tcp_handle_data(sess, pkt);
-
-    if (pkt->hdr->th_flags & TH_FIN)
-        tcp_handle_fin(sess, pkt);
+    tcp_drain_queue(sess);
 
     if (sess->sting)
         sting_process(sess, pkt);
@@ -948,7 +1037,7 @@ process_tcp_packet(struct ip_pkt *ip)
     }
 
     if (!(sess = find_session(ip->hdr->ip_src.s_addr, ntohs(tcp.hdr->th_sport),
-                            ntohs(tcp.hdr->th_dport)))) {
+                              ntohs(tcp.hdr->th_dport)))) {
         if (!(tcp.hdr->th_flags & TH_RST)) {
             /* if they're sending us a RST then we don't need to send RST back,
              * we can safely drop it. */
@@ -986,7 +1075,7 @@ process_udp_packet(struct ip_pkt *ip)
     unsigned int len;
 
     printf("rejecting udp (src %s)\n",
-        libnet_addr2name4(ip->hdr->ip_src.s_addr, LIBNET_DONT_RESOLVE));
+           libnet_addr2name4(ip->hdr->ip_src.s_addr, LIBNET_DONT_RESOLVE));
 
     len = (ip->hdr->ip_hl << 2) + 64;
     if (len > ntohs(ip->hdr->ip_len))
@@ -1002,9 +1091,9 @@ process_udp_packet(struct ip_pkt *ip)
     }
 
     if (libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_ICMPV4_UNREACH_H + len,
-                        0, ip_id++, 0, ip_ttl, IPPROTO_ICMP, 0,
-                        src_ip, ip->hdr->ip_src.s_addr,
-                        NULL, 0, lnh_raw4, 0) == -1) {
+                          0, ip_id++, 0, ip_ttl, IPPROTO_ICMP, 0,
+                          src_ip, ip->hdr->ip_src.s_addr,
+                          NULL, 0, lnh_raw4, 0) == -1) {
         fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
         return;
     }
@@ -1025,12 +1114,12 @@ icmp_echo_reply(struct icmp_pkt *icmp)
         (icmp->ip->ip_hl << 2) + LIBNET_ICMPV4_ECHO_H) {
         fprintf(stderr, "invalid icmp echo packet (src %s)\n",
                 libnet_addr2name4(icmp->ip->ip_src.s_addr,
-                                LIBNET_DONT_RESOLVE));
+                                  LIBNET_DONT_RESOLVE));
         return;
     }
 
     printf("being pinged (src %s)\n",
-        libnet_addr2name4(icmp->ip->ip_src.s_addr, LIBNET_DONT_RESOLVE));
+           libnet_addr2name4(icmp->ip->ip_src.s_addr, LIBNET_DONT_RESOLVE));
 
     len = ntohs(icmp->ip->ip_len) - (icmp->ip->ip_hl << 2) -
         LIBNET_ICMPV4_ECHO_H;
@@ -1070,7 +1159,7 @@ process_icmp_echo_reply(struct icmp_pkt *icmp)
     if (ntohs(icmp->ip->ip_len) != (icmp->ip->ip_hl << 2) + 64) {
         fprintf(stderr, "improper echo reply (src %s)\n",
                 libnet_addr2name4(icmp->ip->ip_src.s_addr,
-                                LIBNET_DONT_RESOLVE));
+                                  LIBNET_DONT_RESOLVE));
         return;
     }
 
@@ -1083,9 +1172,9 @@ process_icmp_echo_reply(struct icmp_pkt *icmp)
 
     timersub(&tv, (struct timeval *)(icmp->hdr->icmp_data), &diff);
     printf("received ping response from %s (%ld.%.03ld ms)\n",
-        libnet_addr2name4(icmp->ip->ip_src.s_addr, LIBNET_RESOLVE),
-        (diff.tv_sec * 1000) + (diff.tv_usec / 1000),
-        diff.tv_usec % 1000);
+           libnet_addr2name4(icmp->ip->ip_src.s_addr, LIBNET_RESOLVE),
+           (diff.tv_sec * 1000) + (diff.tv_usec / 1000),
+           diff.tv_usec % 1000);
 }
 
 static void
@@ -1101,7 +1190,7 @@ process_icmp_packet(struct ip_pkt *ip)
     csum = icmp.hdr->icmp_sum;
     icmp.hdr->icmp_sum = 0;
     sum = libnet_in_cksum((u_int16_t *)icmp.hdr,
-                        ntohs(ip->hdr->ip_len) - (ip->hdr->ip_hl << 2));
+                          ntohs(ip->hdr->ip_len) - (ip->hdr->ip_hl << 2));
     icmp.hdr->icmp_sum = LIBNET_CKSUM_CARRY(sum);
     if (csum != icmp.hdr->icmp_sum) {
         fprintf(stderr, "invalid icmp checksum (src %s)\n",
@@ -1417,14 +1506,14 @@ process_arp_packet(struct libnet_ethernet_hdr *enet, uint32_t len)
     if ((ntohs(arp->hdr.ar_hrd) != ARPHRD_ETHER) ||    /* ethernet*/
         (ntohs(arp->hdr.ar_pro) != ETHERTYPE_IP) ||    /* ipv4 */
         (ntohs(arp->hdr.ar_op) != ARPOP_REQUEST) ||    /* request */
-        (arp->dst_ip != src_ip) ||                    /* for us */
-        memcmp(src_hw, arp->src_hw, 6) == 0)        /* not host */
+        (arp->dst_ip != src_ip) ||                     /* for us */
+        memcmp(src_hw, arp->src_hw, 6) == 0)           /* not host */
         return;
 
     printf("replying to arp from %s (%02x:%02x:%02x:%02x:%02x:%02x)\n",
-        libnet_addr2name4(arp->src_ip, LIBNET_DONT_RESOLVE),
-        arp->src_hw[0], arp->src_hw[1], arp->src_hw[2],
-        arp->src_hw[3], arp->src_hw[4], arp->src_hw[5]);
+           libnet_addr2name4(arp->src_ip, LIBNET_DONT_RESOLVE),
+           arp->src_hw[0], arp->src_hw[1], arp->src_hw[2],
+           arp->src_hw[3], arp->src_hw[4], arp->src_hw[5]);
 
     libnet_clear_packet(lnh_link);
 
@@ -1475,8 +1564,8 @@ ping(char *host)
     }
 
     if (libnet_build_ipv4(LIBNET_IPV4_H + 64, IPTOS_LOWDELAY, ip_id++, 0,
-                        ip_ttl, IPPROTO_ICMP, 0, src_ip, dst_ip, NULL, 0,
-                        lnh_raw4, 0) == -1) {
+                          ip_ttl, IPPROTO_ICMP, 0, src_ip, dst_ip, NULL, 0,
+                          lnh_raw4, 0) == -1) {
         fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
         return;
     }
@@ -1535,9 +1624,9 @@ fping(char *host)
 
     if (libnet_build_ipv4(LIBNET_IPV4_H + sizeof (payload) -
                             LIBNET_ICMPV4_ECHO_H, IPTOS_LOWDELAY, ip_id++,
-                        LIBNET_ICMPV4_ECHO_H / 8, ip_ttl, IPPROTO_ICMP, 0,
-                        src_ip, dst_ip, &payload[LIBNET_ICMPV4_ECHO_H],
-                        64 - LIBNET_ICMPV4_ECHO_H, lnh_raw4, tag) == -1) {
+                          LIBNET_ICMPV4_ECHO_H / 8, ip_ttl, IPPROTO_ICMP, 0,
+                          src_ip, dst_ip, &payload[LIBNET_ICMPV4_ECHO_H],
+                          64 - LIBNET_ICMPV4_ECHO_H, lnh_raw4, tag) == -1) {
         fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
         return;
     }
@@ -1641,6 +1730,58 @@ process_input(void)
         }
         if (!l)
             printf("couldn't find %u\n", id);
+    } else if (!strncasecmp(buf, "fragw ", strlen("fragw "))) {
+        list *l = sessions;
+        unsigned int id;
+        char *arg1, *arg2;
+        arg1 = buf + strlen("fragw ");
+        arg2 = strchr(arg1, ' ');
+        if (!arg2) {
+            fprintf(stderr, "need to specify socket to write to\n");
+            return;
+        }
+        *arg2++ = 0;
+        if (strlen(arg2) < 8) {
+            fprintf(stderr, "Need more data to send bizarre write\n");
+            return;
+        }
+        id = atoi(arg1);
+
+        while (l) {
+            TCB *sess = l->data;
+
+            if (sess->id > id) {
+                l = NULL;
+                break;
+            }
+
+            if (sess->id < id) {
+                l = l->next;
+                continue;
+            }
+
+            if (sess->sting) {
+                fprintf(stderr, "can't write to sting session!\n");
+                break;
+            }
+
+            if ((sess->state == TCP_ESTABLISHED) ||
+                /* it's not possible for us to be in CLOSE_WAIT but we check it
+                 * anyway, just to be pedantic */
+                (sess->state == TCP_CLOSE_WAIT)) {
+                uint32_t orig_seqno = sess->seqno, post_seqno;
+                sess->seqno += 4;
+                send_tcp(sess, TH_PUSH | TH_ACK, (u_char *)arg2 + 4, strlen(arg2) - 4);
+                post_seqno = sess->seqno;
+                usleep(600);
+                sess->seqno = orig_seqno;
+                send_tcp(sess, TH_PUSH | TH_ACK, (u_char *)arg2, 8);
+                sess->seqno = post_seqno;
+            }
+            break;
+        }
+        if (!l)
+            printf("couldn't find %u\n", id);
     } else if (!strncasecmp(buf, "close ", strlen("close "))) {
         list *l = sessions;
         unsigned int id = atoi(buf + strlen("close "));
@@ -1665,9 +1806,7 @@ process_input(void)
                     sess->state == TCP_SYN_RECV) {
                 send_tcp(sess, TH_FIN | TH_ACK, NULL, 0);
                 sess->state = TCP_FIN_WAIT1;
-                printf("%u: %s\n",
-                    sess->id,
-                    state_names[sess->state]);
+                printf("%u: %s\n", sess->id, state_names[sess->state]);
             }
             break;
         }
@@ -1677,13 +1816,22 @@ process_input(void)
         list *l = sessions;
 
         while (l) {
+            char sting_string[100];
             TCB *sess = l->data;
             l = l->next;
 
-            printf("id %d: port %d with %s:%d state %s\n",
-                sess->id, sess->src_prt,
-                libnet_addr2name4(sess->dst_ip, LIBNET_DONT_RESOLVE),
-                sess->dst_prt, state_names[sess->state]);
+            if (sess->sting) {
+                sprintf(sting_string, " (stinging, %d/%d sent)",
+                        sess->count, STING_COUNT);
+            } else {
+                sting_string[0] = '\0';
+            }
+
+            printf("id %d: port %d with %s:%d state %s%s\n",
+                   sess->id, sess->src_prt,
+                   libnet_addr2name4(sess->dst_ip, LIBNET_DONT_RESOLVE),
+                   sess->dst_prt, state_names[sess->state],
+                   sting_string);
         }
     } else if (!strncasecmp(buf, "timer ", strlen("timer "))) {
         struct timeval tv;
@@ -1701,7 +1849,7 @@ process_input(void)
             struct timer *t = l->data;
             l = l->next;
             printf("timer to expire at %ld.%06ld\n", t->end.tv_sec,
-                t->end.tv_usec);
+                   t->end.tv_usec);
         }
     } else if (!strcasecmp(buf, "quit")) {
         /* XXX should send RST to all the sessions, and remove the bogus arp
@@ -1740,7 +1888,7 @@ process_packet(pcap_t *lph)
         return;
     }
 
-    /* we assume everything pcap gives is is ethernet */
+    /* we assume everything pcap gives us is ethernet */
     enet = (struct libnet_ethernet_hdr *)pkt;
 
     switch (ntohs(enet->ether_type)) {
