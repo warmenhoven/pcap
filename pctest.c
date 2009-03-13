@@ -3,6 +3,10 @@
  *   IP:
  *     - IP options (security, source route, record route, timestamp)
  *     - for some reason we can't ping the host, but it can ping us?
+ *     - traceroute
+ *
+ *   UDP:
+ *     - maybe, if we do dhcp
  *
  *   TCP:
  *     - TCP options (mss, sack, wscale, timestamp)
@@ -11,15 +15,16 @@
  *     - Better initial seqno generation
  *     - slow start
  *     - congestion avoidance
+ *     - tx queue (that obeys remote window size)
  *     - Grow/shrink windows
  *     - retransmission/timers (Karn, Jacobson, exp. backoff, etc.)
- *     - Deal better with lost received data
  *     - delayed/selective ACKs
  *     - header prediction
  *
  *   General:
  *     - argv parsing (specify device, user to run as, etc.)
- *     - some way of guessing which IP address to use?
+ *     - better CLI (history would be nice, at least)
+ *     - some way of guessing which IP address to use (dhcp?)
  *     - make sure not using loopback device
  *     - use link layer socket instead of raw socket
  *
@@ -851,10 +856,11 @@ tcp_handle_fin(TCB *sess)
     sess->ackno++;
 
     if ((sess->state == TCP_SYN_RECV) || (sess->state == TCP_ESTABLISHED)) {
-        /* we send both the FIN and the ACK together, and move right through
-         * CLOSE_WAIT to LAST_ACK */
-        send_tcp(sess, TH_FIN | TH_ACK, NULL, 0);
-        sess->state = TCP_LAST_ACK;
+        /* some stacks send both the FIN and the ACK together, and move right
+         * through CLOSE_WAIT to LAST_ACK. not us! we'll sit in CLOSE_WAIT
+         * until the user tells us to close. */
+        send_tcp(sess, TH_ACK, NULL, 0);
+        sess->state = TCP_CLOSE_WAIT;
         printf("%u: %s\n", sess->id, state_names[sess->state]);
     } else if (sess->state == TCP_FIN_WAIT1) {
         /* ACK the FIN, wait for our ACK */
@@ -950,10 +956,9 @@ tcp_state_machine(TCB *sess, struct tcp_pkt *pkt)
         return;
     }
 
-    /* at this point the state is not CLOSED, LISTEN, or SYN_SENT. also we can't
-     * be in the CLOSE_WAIT state because we send the FIN with the ACK. also we
-     * won't be in the TIME_WAIT state because we assume the other side received
-     * our last ACK. */
+    /* at this point the state is not CLOSED, LISTEN, or SYN_SENT. also we won't
+     * be in the TIME_WAIT state because we assume the other side received our
+     * last ACK. */
 
     if (tcp_check_seqno(sess, pkt)) {
         /* XXX should we be updating sess->unacked from hdr->th_ack here? */
@@ -984,11 +989,17 @@ tcp_state_machine(TCB *sess, struct tcp_pkt *pkt)
         return;
     }
 
-    /* at this point we're either ESTABLISHED, FIN_WAIT (1 or 2), or CLOSING.
-     * all of these "Do the same processing as for the ESTABLISHED state" before
-     * doing their own thing */
+    /* at this point we're either ESTABLISHED, FIN_WAIT (1 or 2), CLOSE_WAIT, or
+     * CLOSING. all of these "Do the same processing as for the ESTABLISHED
+     * state" before doing their own thing */
     if (tcp_check_ackno(sess, pkt))
         return;
+
+    if (sess->state == TCP_CLOSE_WAIT) {
+        /* receiving data or FIN is either invalid or ignored, so we can stop
+         * processing now. XXX should we send an ACK? */
+        return;
+    }
 
     tcp_queue_packet(sess, pkt);
 
@@ -1025,8 +1036,9 @@ process_tcp_packet(struct ip_pkt *ip)
     sum += libnet_in_cksum((u_int16_t *)&tcp.hdr->th_sport, len);
     tcp.hdr->th_sum = LIBNET_CKSUM_CARRY(sum);
     if (csum != tcp.hdr->th_sum) {
-        fprintf(stderr, "checksum mismatch in TCP header (src %s)!\n",
-                libnet_addr2name4(ip->hdr->ip_src.s_addr, LIBNET_DONT_RESOLVE));
+        fprintf(stderr, "checksum mismatch in TCP header (src %s), was %x, should be %x!\n",
+                libnet_addr2name4(ip->hdr->ip_src.s_addr, LIBNET_DONT_RESOLVE),
+                csum, tcp.hdr->th_sum);
         return;
     }
 
@@ -1718,10 +1730,7 @@ process_input(void)
                 break;
             }
 
-            if ((sess->state == TCP_ESTABLISHED) ||
-                /* it's not possible for us to be in CLOSE_WAIT but we check it
-                 * anyway, just to be pedantic */
-                (sess->state == TCP_CLOSE_WAIT)) {
+            if ((sess->state == TCP_ESTABLISHED) || (sess->state == TCP_CLOSE_WAIT)) {
                 send_tcp(sess, TH_PUSH | TH_ACK, (u_char *)arg2, strlen(arg2));
                 /* XXX should add it to the send queue in case we need to
                  * retransmit. in that case we should also set a timer. */
@@ -1765,10 +1774,7 @@ process_input(void)
                 break;
             }
 
-            if ((sess->state == TCP_ESTABLISHED) ||
-                /* it's not possible for us to be in CLOSE_WAIT but we check it
-                 * anyway, just to be pedantic */
-                (sess->state == TCP_CLOSE_WAIT)) {
+            if ((sess->state == TCP_ESTABLISHED) || (sess->state == TCP_CLOSE_WAIT)) {
                 uint32_t orig_seqno = sess->seqno, post_seqno;
                 sess->seqno += 4;
                 send_tcp(sess, TH_PUSH | TH_ACK, (u_char *)arg2 + 4, strlen(arg2) - 4);
@@ -1806,6 +1812,10 @@ process_input(void)
                     sess->state == TCP_SYN_RECV) {
                 send_tcp(sess, TH_FIN | TH_ACK, NULL, 0);
                 sess->state = TCP_FIN_WAIT1;
+                printf("%u: %s\n", sess->id, state_names[sess->state]);
+            } else if (sess->state == TCP_CLOSE_WAIT) {
+                send_tcp(sess, TH_FIN | TH_ACK, NULL, 0);
+                sess->state = TCP_LAST_ACK;
                 printf("%u: %s\n", sess->id, state_names[sess->state]);
             }
             break;
@@ -1988,7 +1998,7 @@ main(int argc, char **argv)
      * of course, you could remove the ip address from the host and just use
      * that address, but then you'll probably have to modify this client to
      * handle all the routing details itself, and that's not fun. */
-    src_ip = libnet_name2addr4(lnh_raw4, argv[1], LIBNET_RESOLVE);
+    src_ip = libnet_name2addr4(lnh_link, argv[1], LIBNET_RESOLVE);
     if (src_ip == (uint32_t)-1) {
         fprintf(stderr, "invalid host name %s\n", argv[1]);
         return 1;
@@ -2007,7 +2017,7 @@ main(int argc, char **argv)
     s_in->sin_addr.s_addr = src_ip;
     req.arp_ha.sa_family = ARPHRD_ETHER;
     memcpy(req.arp_ha.sa_data, "\x00\x00\x00\x00\x00\x01", 6);
-    if (ioctl(libnet_getfd(lnh_raw4), SIOCSARP, &req) < 0) {
+    if (ioctl(libnet_getfd(lnh_link), SIOCSARP, &req) < 0) {
         perror("SIOCSARP");
         return 1;
     }
