@@ -1768,80 +1768,6 @@ ping(char *host)
     send_ethernet(dst_ip, 0);
 }
 
-/* to send a fragmented ping packet, to test fragmentation */
-static void
-fping(char *host)
-{
-    uint32_t dst_ip;
-    struct libnet_icmpv4_hdr *echo;
-    u_char payload[64];
-    unsigned int i;
-    libnet_ptag_t tag;
-    int sum;
-    static libnet_t *lnh_raw4 = NULL;
-
-    /* XXX should convert this to use link socket, but methinks there's a bug in
-     * this code that gets corrected when using raw sockets.... */
-    if (lnh_raw4 == NULL) {
-        char errbuf[LIBNET_ERRBUF_SIZE];
-        /* please see RAWSOCKET_NON_SEQUITUR in libnet1 docs: "whenever complete
-         * control over the IP header is desired, use the link layer API." */
-        if (!(lnh_raw4 = libnet_init(LIBNET_RAW4, NULL, errbuf))) {
-            fprintf(stderr, "%s\n", errbuf);
-            return;
-        }
-    }
-
-    libnet_clear_packet(lnh_raw4);
-
-    dst_ip = libnet_name2addr4(lnh_raw4, host, LIBNET_RESOLVE);
-    if (dst_ip == 0xffffffff) {
-        fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
-        return;
-    }
-
-    for (i = 0; i < sizeof (payload) - LIBNET_ICMPV4_ECHO_H; i++)
-        payload[i + LIBNET_ICMPV4_ECHO_H] = i;
-
-    gettimeofday((struct timeval *)&payload[LIBNET_ICMPV4_ECHO_H], NULL);
-
-    echo = (struct libnet_icmpv4_hdr *)payload;
-    echo->icmp_type = ICMP_ECHO;
-    echo->icmp_code = 0;
-    echo->icmp_id = ntohs(0x42);
-    echo->icmp_seq = 0;
-
-    echo->icmp_sum = 0;
-    sum = libnet_in_cksum((u_int16_t *)echo, sizeof (payload));
-    echo->icmp_sum = LIBNET_CKSUM_CARRY(sum);
-
-    if ((tag = libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_ICMPV4_ECHO_H,
-                                 IPTOS_LOWDELAY, ip_id, IP_MF, ip_ttl,
-                                 IPPROTO_ICMP, 0, src_ip, dst_ip, payload,
-                                 LIBNET_ICMPV4_ECHO_H, lnh_raw4, 0)) == -1) {
-        fprintf(stderr, "%s", libnet_geterror(lnh_link));
-        return;
-    }
-
-    if (libnet_write(lnh_raw4) == -1) {
-        fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
-        return;
-    }
-
-    if (libnet_build_ipv4(LIBNET_IPV4_H + sizeof (payload) -
-                            LIBNET_ICMPV4_ECHO_H, IPTOS_LOWDELAY, ip_id++,
-                          LIBNET_ICMPV4_ECHO_H / 8, ip_ttl, IPPROTO_ICMP, 0,
-                          src_ip, dst_ip, &payload[LIBNET_ICMPV4_ECHO_H],
-                          64 - LIBNET_ICMPV4_ECHO_H, lnh_raw4, tag) == -1) {
-        fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
-        return;
-    }
-
-    if (libnet_write(lnh_raw4) == -1) {
-        fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
-    }
-}
-
 static void
 fake_timeout(void *arg __attribute__((__unused__)))
 {
@@ -1861,10 +1787,6 @@ process_input(void)
         char *arg1;
         arg1 = buf + strlen("ping ");
         ping(arg1);
-    } else if (!strncasecmp(buf, "fping ", strlen("fping "))) {
-        char *arg1;
-        arg1 = buf + strlen("fping ");
-        fping(arg1);
     } else if (!strncasecmp(buf, "sting ", strlen("sting "))) {
         TCB *sess;
         char *arg1, *arg2;
