@@ -26,7 +26,6 @@
  *     - better CLI (history would be nice, at least)
  *     - some way of guessing which IP address to use (dhcp?)
  *     - make sure not using loopback device
- *     - use link layer socket instead of raw socket
  *
  *   And finally, all of the evil things I'd like to do:
  *    - Increased control over remote window size
@@ -200,6 +199,265 @@ timer_process_pending(void)
 }
 /* } */
 
+/* these are our global variables */
+static libnet_t *lnh_link = NULL;
+static unsigned char src_hw[6];
+static uint32_t src_ip;
+static u_int16_t ip_id;
+static const u_int8_t ip_ttl = 64;
+static list *sessions = NULL;
+static list *open_connections = NULL;
+static list *listeners = NULL;
+
+/* ARP { */
+struct arp_ent {
+    uint32_t ip; /* network byte order */
+    unsigned char hw[6];
+} __attribute__ ((__packed__));
+
+static list *arp_cache = NULL;
+
+/* this probably wasn't entirely necessary but it's convenient */
+struct arp_pkt {
+    struct libnet_ethernet_hdr enet;
+    struct libnet_arp_hdr hdr;
+    /* everything from here down is IPv4 but that's all we need */
+    unsigned char src_hw[6];
+    uint32_t src_ip;
+    unsigned char dst_hw[6];
+    uint32_t dst_ip;
+} __attribute__ ((__packed__));
+
+static void
+cache_arp(struct arp_pkt *arp)
+{
+    list *l = arp_cache;
+    struct arp_ent *ent;
+
+    while (l) {
+        ent = l->data;
+        if (ent->ip == arp->src_ip) {
+            if (memcmp(ent->hw, arp->src_hw, 6)) {
+                printf("HW addr for %s changed\n",
+                       libnet_addr2name4(arp->src_ip, LIBNET_DONT_RESOLVE));
+                memcpy(ent->hw, arp->src_hw, 6);
+            }
+            return;
+        }
+        l = l->next;
+    }
+
+    /* didn't find it */
+    printf("caching arp for %s\n",
+           libnet_addr2name4(arp->src_ip, LIBNET_DONT_RESOLVE));
+
+    ent = malloc(sizeof (struct arp_ent));
+    ent->ip = arp->src_ip;
+    memcpy(ent->hw, arp->src_hw, 6);
+    arp_cache = list_prepend(arp_cache, ent);
+}
+
+static unsigned char *
+arp_lookup(uint32_t ip)
+{
+    list *l = arp_cache;
+    while (l) {
+        struct arp_ent *ent = l->data;
+        l = l->next;
+        if (ent->ip == ip) {
+            return ent->hw;
+        }
+    }
+    return NULL;
+}
+
+/* since we're "faking" a client, we need to reply to arp requests as that
+ * client. we shouldn't ever get an arp request from the host because we set up
+ * a fake arp entry for ourselves, but we check to make sure it's not from the
+ * host anyway. */
+static void
+arp_reply(struct arp_pkt *arp)
+{
+    printf("replying to arp from %s (%02x:%02x:%02x:%02x:%02x:%02x)\n",
+           libnet_addr2name4(arp->src_ip, LIBNET_DONT_RESOLVE),
+           arp->src_hw[0], arp->src_hw[1], arp->src_hw[2],
+           arp->src_hw[3], arp->src_hw[4], arp->src_hw[5]);
+
+    libnet_clear_packet(lnh_link);
+
+    if (libnet_build_arp(ARPHRD_ETHER, ETHERTYPE_IP, 6, 4, ARPOP_REPLY, src_hw,
+                         (u_char *)&src_ip, arp->src_hw, (u_char *)&arp->src_ip,
+                         NULL, 0, lnh_link, 0) == -1) {
+        fprintf(stderr, "%s", libnet_geterror(lnh_link));
+        return;
+    }
+
+    if (libnet_autobuild_ethernet(arp->src_hw, ETHERTYPE_ARP, lnh_link) == -1) {
+        fprintf(stderr, "%s", libnet_geterror(lnh_link));
+        return;
+    }
+
+    if (libnet_write(lnh_link) == -1) {
+        fprintf(stderr, "%s", libnet_geterror(lnh_link));
+        return;
+    }
+}
+
+static void
+process_arp_packet(struct libnet_ethernet_hdr *enet, uint32_t len)
+{
+    struct arp_pkt *arp = (struct arp_pkt *)enet;
+
+    if (len < LIBNET_ETH_H + LIBNET_ARP_ETH_IP_H)
+        return;
+
+    if ((ntohs(arp->hdr.ar_hrd) != ARPHRD_ETHER) ||    /* ethernet*/
+        (ntohs(arp->hdr.ar_pro) != ETHERTYPE_IP) ||    /* ipv4 */
+        (arp->dst_ip != src_ip) ||                     /* for us */
+        memcmp(src_hw, arp->src_hw, 6) == 0)           /* not host */
+        return;
+
+    cache_arp(arp);
+
+    if (ntohs(arp->hdr.ar_op) == ARPOP_REQUEST) {
+        arp_reply(arp);
+    }
+}
+
+static void
+arp_request(uint32_t dst_ip)
+{
+    u_int8_t hw[6];
+
+    printf("sending arp request for %s\n",
+           libnet_addr2name4(dst_ip, LIBNET_DONT_RESOLVE));
+
+    libnet_clear_packet(lnh_link);
+
+    memset(hw, 0, 6);
+    if (libnet_build_arp(ARPHRD_ETHER, ETHERTYPE_IP, 6, 4, ARPOP_REQUEST, src_hw,
+                         (u_char *)&src_ip, hw, (u_char *)&dst_ip,
+                         NULL, 0, lnh_link, 0) == -1) {
+        fprintf(stderr, "%s", libnet_geterror(lnh_link));
+        return;
+    }
+
+    memset(hw, 0xFF, 6);
+    if (libnet_autobuild_ethernet(hw, ETHERTYPE_ARP, lnh_link) == -1) {
+        fprintf(stderr, "%s", libnet_geterror(lnh_link));
+        return;
+    }
+
+    if (libnet_write(lnh_link) == -1) {
+        fprintf(stderr, "%s", libnet_geterror(lnh_link));
+        return;
+    }
+}
+/* } */
+
+/* ROUTING { */
+struct route_row {
+    uint32_t dest; /* network byte order */
+    uint32_t mask; /* network byte order */
+    uint32_t gw;   /* network byte order */
+};
+
+static list *routing_table = NULL;
+
+static int
+route_cmp(const void *x, const void *y)
+{
+    const struct route_row *a = x, *b = y;
+    /* the bigger (i.e. more specific) mask should come first */
+    if (a->mask > b->mask) {
+        return -1;
+    } else if (a->mask < b->mask) {
+        return 1;
+    } else {
+        /* otherwise, just sort by destination */
+        return a->dest - b->dest;
+    }
+}
+
+static void
+route_add(uint32_t dest, uint32_t mask, uint32_t gw)
+{
+    struct route_row *rt;
+
+    /* should we validate our input? well, probably. */
+    uint32_t bit = 1 << 31, hmask = ntohl(mask), i = 1;
+    while (bit) {
+        if ((hmask & bit) == 0) {
+            i = 0;
+        } else if (i != 1) {
+            fprintf(stderr, "invalid mask %08x\n", hmask);
+            return;
+        }
+        bit >>= 1;
+    }
+    if ((dest & ~mask) != 0) {
+        fprintf(stderr, "invalid dest/mask pair\n");
+        return;
+    }
+
+    rt = malloc(sizeof (struct route_row));
+    rt->dest = dest;
+    rt->mask = mask;
+    rt->gw = gw;
+    routing_table = list_insert_sorted(routing_table, rt, route_cmp);
+
+    if (dest == 0 && mask == 0) {
+        /* if it's the default gateway, get its mac now */
+        arp_request(gw);
+    }
+}
+
+static libnet_ptag_t
+send_ethernet(uint32_t dst_ip, libnet_ptag_t ptag)
+{
+    list *l = routing_table;
+
+    while (l) {
+        struct route_row *rt = l->data;
+        unsigned char *dst_hw;
+
+        l = l->next;
+
+        if ((dst_ip & rt->mask) != rt->dest) {
+            continue;
+        }
+
+        if (rt->gw != 0) {
+            dst_ip = rt->gw;
+        }
+
+        dst_hw = arp_lookup(dst_ip);
+        if (dst_hw == NULL) {
+            arp_request(dst_ip);
+            return -1;
+        }
+
+        ptag = libnet_build_ethernet(dst_hw, src_hw, ETHERTYPE_IP,
+                                     NULL, 0, lnh_link, ptag);
+        if (ptag == -1) {
+            fprintf(stderr, "%s", libnet_geterror(lnh_link));
+            return -1;
+        }
+
+        if (libnet_write(lnh_link) == -1) {
+            fprintf(stderr, "%s", libnet_geterror(lnh_link));
+            return -1;
+        }
+
+        return ptag;
+    }
+
+    fprintf(stderr, "no route to host %s\n",
+            libnet_addr2name4(dst_ip, LIBNET_DONT_RESOLVE));
+    return -1;
+}
+/* } */
+
 static const char *state_names[] = {
     "UNKNOWN",
     "ESTABLISHED",
@@ -284,38 +542,26 @@ struct tcp_pkt {
     uint32_t data_len;
 };
 
-/* these are our global variables */
-static libnet_t *lnh_link = NULL;
-static unsigned char src_hw[6];
-static libnet_t *lnh_raw4 = NULL;
-static uint32_t src_ip;
-static u_int16_t ip_id;
-static const u_int8_t ip_ttl = 64;
-static list *sessions = NULL;
-static list *open_connections = NULL;
-static list *listeners = NULL;
-
 /* TCP UTIL { */
 static int
 send_tcp(TCB *sess, int flags, u_char *data, uint32_t len)
 {
-    libnet_clear_packet(lnh_raw4);
+    libnet_clear_packet(lnh_link);
 
     if (libnet_build_tcp(sess->src_prt, sess->dst_prt, sess->seqno, sess->ackno,
                          flags, sess->rcv_win, 0, 0, LIBNET_TCP_H + len, data,
-                         len, lnh_raw4, 0) == -1) {
-        fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
+                         len, lnh_link, 0) == -1) {
+        fprintf(stderr, "%s", libnet_geterror(lnh_link));
         return 1;
     }
     if (libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_TCP_H + len, IPTOS_RELIABILITY,
                           ip_id++, 0, ip_ttl, IPPROTO_TCP, 0, src_ip,
-                          sess->dst_ip, NULL, 0, lnh_raw4, 0) == -1) {
-        fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
+                          sess->dst_ip, NULL, 0, lnh_link, 0) == -1) {
+        fprintf(stderr, "%s", libnet_geterror(lnh_link));
         return 1;
     }
 
-    if (libnet_write(lnh_raw4) == -1) {
-        fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
+    if (send_ethernet(sess->dst_ip, 0) == -1) {
         return 1;
     }
 
@@ -341,24 +587,23 @@ send_rst(uint32_t state, struct tcp_pkt *tcp)
     else
         ackno = 0;
 
-    libnet_clear_packet(lnh_raw4);
+    libnet_clear_packet(lnh_link);
 
     if (libnet_build_tcp(ntohs(tcp->hdr->th_dport), ntohs(tcp->hdr->th_sport),
                          ntohl(tcp->hdr->th_ack), ackno, cntrl, 0, 0, 0,
-                         LIBNET_TCP_H, NULL, 0, lnh_raw4, 0) == -1) {
-        fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
+                         LIBNET_TCP_H, NULL, 0, lnh_link, 0) == -1) {
+        fprintf(stderr, "%s", libnet_geterror(lnh_link));
         return 1;
     }
 
     if (libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_TCP_H, IPTOS_LOWDELAY, ip_id++,
                           0, ip_ttl, IPPROTO_TCP, 0, src_ip,
-                          tcp->ip->ip_src.s_addr, NULL, 0, lnh_raw4, 0) == -1) {
-        fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
+                          tcp->ip->ip_src.s_addr, NULL, 0, lnh_link, 0) == -1) {
+        fprintf(stderr, "%s", libnet_geterror(lnh_link));
         return 1;
     }
 
-    if (libnet_write(lnh_raw4) == -1) {
-        fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
+    if (send_ethernet(tcp->ip->ip_src.s_addr, 0) == -1) {
         return 1;
     }
 
@@ -522,9 +767,9 @@ create_session(char *host, uint16_t port)
         if ((sess = session_setup()) == NULL)
             return NULL;
 
-        sess->dst_ip = libnet_name2addr4(lnh_raw4, host, LIBNET_RESOLVE);
+        sess->dst_ip = libnet_name2addr4(lnh_link, host, LIBNET_RESOLVE);
         if (sess->dst_ip == 0xffffffff) {
-            fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
+            fprintf(stderr, "%s", libnet_geterror(lnh_link));
             remove_session(sess);
             return NULL;
         }
@@ -1093,26 +1338,24 @@ process_udp_packet(struct ip_pkt *ip)
     if (len > ntohs(ip->hdr->ip_len))
         len = ntohs(ip->hdr->ip_len);
 
-    libnet_clear_packet(lnh_raw4);
+    libnet_clear_packet(lnh_link);
 
     if (libnet_build_icmpv4_unreach(ICMP_UNREACH, ICMP_UNREACH_PORT, 0,
                                     (u_int8_t *)ip->hdr, len,
-                                    lnh_raw4, 0) == -1) {
-        fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
+                                    lnh_link, 0) == -1) {
+        fprintf(stderr, "%s", libnet_geterror(lnh_link));
         return;
     }
 
     if (libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_ICMPV4_UNREACH_H + len,
                           0, ip_id++, 0, ip_ttl, IPPROTO_ICMP, 0,
                           src_ip, ip->hdr->ip_src.s_addr,
-                          NULL, 0, lnh_raw4, 0) == -1) {
-        fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
+                          NULL, 0, lnh_link, 0) == -1) {
+        fprintf(stderr, "%s", libnet_geterror(lnh_link));
         return;
     }
 
-    if (libnet_write(lnh_raw4) == -1) {
-        fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
-    }
+    send_ethernet(ip->hdr->ip_src.s_addr, 0);
 }
 /* } */
 
@@ -1136,28 +1379,26 @@ icmp_echo_reply(struct icmp_pkt *icmp)
     len = ntohs(icmp->ip->ip_len) - (icmp->ip->ip_hl << 2) -
         LIBNET_ICMPV4_ECHO_H;
 
-    libnet_clear_packet(lnh_raw4);
+    libnet_clear_packet(lnh_link);
 
     if (libnet_build_icmpv4_echo(ICMP_ECHOREPLY, 0, 0,
                                  ntohs(icmp->hdr->icmp_id),
                                  ntohs(icmp->hdr->icmp_seq),
                                  (u_int8_t *)icmp->hdr->icmp_data, len,
-                                 lnh_raw4, 0) == -1) {
-        fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
+                                 lnh_link, 0) == -1) {
+        fprintf(stderr, "%s", libnet_geterror(lnh_link));
         return;
     }
 
     if (libnet_build_ipv4(LIBNET_IPV4_H + LIBNET_ICMPV4_ECHO_H + len,
                         icmp->ip->ip_tos, ip_id++, 0, ip_ttl, IPPROTO_ICMP, 0,
                         src_ip, icmp->ip->ip_src.s_addr,
-                        NULL, 0, lnh_raw4, 0) == -1) {
-        fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
+                        NULL, 0, lnh_link, 0) == -1) {
+        fprintf(stderr, "%s", libnet_geterror(lnh_link));
         return;
     }
 
-    if (libnet_write(lnh_raw4) == -1) {
-        fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
-    }
+    send_ethernet(icmp->ip->ip_src.s_addr, 0);
 }
 
 static void
@@ -1491,63 +1732,6 @@ process_ip_packet(struct libnet_ethernet_hdr *enet, uint32_t len)
 }
 /* } */
 
-/* ARP { */
-/* this probably wasn't entirely necessary but it's convenient */
-struct arp_pkt {
-    struct libnet_ethernet_hdr enet;
-    struct libnet_arp_hdr hdr;
-    /* everything from here down is IPv4 but that's all we need */
-    unsigned char src_hw[6];
-    uint32_t src_ip;
-    unsigned char dst_hw[6];
-    uint32_t dst_ip;
-} __attribute__ ((__packed__));
-
-/* since we're "faking" a client, we need to reply to arp requests as that
- * client. we shouldn't ever get an arp request from the host because we set up
- * a fake arp entry for ourselves, but we check to make sure it's not from the
- * host anyway. */
-static void
-process_arp_packet(struct libnet_ethernet_hdr *enet, uint32_t len)
-{
-    struct arp_pkt *arp = (struct arp_pkt *)enet;
-
-    if (len < LIBNET_ETH_H + LIBNET_ARP_ETH_IP_H)
-        return;
-
-    if ((ntohs(arp->hdr.ar_hrd) != ARPHRD_ETHER) ||    /* ethernet*/
-        (ntohs(arp->hdr.ar_pro) != ETHERTYPE_IP) ||    /* ipv4 */
-        (ntohs(arp->hdr.ar_op) != ARPOP_REQUEST) ||    /* request */
-        (arp->dst_ip != src_ip) ||                     /* for us */
-        memcmp(src_hw, arp->src_hw, 6) == 0)           /* not host */
-        return;
-
-    printf("replying to arp from %s (%02x:%02x:%02x:%02x:%02x:%02x)\n",
-           libnet_addr2name4(arp->src_ip, LIBNET_DONT_RESOLVE),
-           arp->src_hw[0], arp->src_hw[1], arp->src_hw[2],
-           arp->src_hw[3], arp->src_hw[4], arp->src_hw[5]);
-
-    libnet_clear_packet(lnh_link);
-
-    if (libnet_build_arp(ARPHRD_ETHER, ETHERTYPE_IP, 6, 4, ARPOP_REPLY, src_hw,
-                         (u_char *)&src_ip, arp->src_hw, (u_char *)&arp->src_ip,
-                         NULL, 0, lnh_link, 0) == -1) {
-        fprintf(stderr, "%s", libnet_geterror(lnh_link));
-        return;
-    }
-
-    if (libnet_autobuild_ethernet(arp->src_hw, ETHERTYPE_ARP, lnh_link) == -1) {
-        fprintf(stderr, "%s", libnet_geterror(lnh_link));
-        return;
-    }
-
-    if (libnet_write(lnh_link) == -1) {
-        fprintf(stderr, "%s", libnet_geterror(lnh_link));
-        return;
-    }
-}
-/* } */
-
 /* INPUT { */
 static void
 ping(char *host)
@@ -1556,11 +1740,9 @@ ping(char *host)
     u_char payload[64 - LIBNET_ICMPV4_ECHO_H];
     unsigned int i;
 
-    libnet_clear_packet(lnh_raw4);
-
-    dst_ip = libnet_name2addr4(lnh_raw4, host, LIBNET_RESOLVE);
+    dst_ip = libnet_name2addr4(lnh_link, host, LIBNET_RESOLVE);
     if (dst_ip == 0xffffffff) {
-        fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
+        fprintf(stderr, "%s", libnet_geterror(lnh_link));
         return;
     }
 
@@ -1569,22 +1751,22 @@ ping(char *host)
 
     gettimeofday((struct timeval *)&payload[0], NULL);
 
+    libnet_clear_packet(lnh_link);
+
     if (libnet_build_icmpv4_echo(ICMP_ECHO, 0, 0, 0x42, 0, payload,
-                                 sizeof (payload), lnh_raw4, 0) == -1) {
-        fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
+                                 sizeof (payload), lnh_link, 0) == -1) {
+        fprintf(stderr, "%s", libnet_geterror(lnh_link));
         return;
     }
 
     if (libnet_build_ipv4(LIBNET_IPV4_H + 64, IPTOS_LOWDELAY, ip_id++, 0,
                           ip_ttl, IPPROTO_ICMP, 0, src_ip, dst_ip, NULL, 0,
-                          lnh_raw4, 0) == -1) {
-        fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
+                          lnh_link, 0) == -1) {
+        fprintf(stderr, "%s", libnet_geterror(lnh_link));
         return;
     }
 
-    if (libnet_write(lnh_raw4) == -1) {
-        fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
-    }
+    send_ethernet(dst_ip, 0);
 }
 
 /* to send a fragmented ping packet, to test fragmentation */
@@ -1597,6 +1779,19 @@ fping(char *host)
     unsigned int i;
     libnet_ptag_t tag;
     int sum;
+    static libnet_t *lnh_raw4 = NULL;
+
+    /* XXX should convert this to use link socket, but methinks there's a bug in
+     * this code that gets corrected when using raw sockets.... */
+    if (lnh_raw4 == NULL) {
+        char errbuf[LIBNET_ERRBUF_SIZE];
+        /* please see RAWSOCKET_NON_SEQUITUR in libnet1 docs: "whenever complete
+         * control over the IP header is desired, use the link layer API." */
+        if (!(lnh_raw4 = libnet_init(LIBNET_RAW4, NULL, errbuf))) {
+            fprintf(stderr, "%s\n", errbuf);
+            return;
+        }
+    }
 
     libnet_clear_packet(lnh_raw4);
 
@@ -1625,7 +1820,7 @@ fping(char *host)
                                  IPTOS_LOWDELAY, ip_id, IP_MF, ip_ttl,
                                  IPPROTO_ICMP, 0, src_ip, dst_ip, payload,
                                  LIBNET_ICMPV4_ECHO_H, lnh_raw4, 0)) == -1) {
-        fprintf(stderr, "%s", libnet_geterror(lnh_raw4));
+        fprintf(stderr, "%s", libnet_geterror(lnh_link));
         return;
     }
 
@@ -1861,9 +2056,36 @@ process_input(void)
             printf("timer to expire at %ld.%06ld\n", t->end.tv_sec,
                    t->end.tv_usec);
         }
+    } else if (!strcasecmp(buf, "arp")) {
+        list *l = arp_cache;
+        printf("%-20s%s\n", "Address", "HWaddress");
+        while (l) {
+            struct arp_ent *ent = l->data;
+            l = l->next;
+            printf("%-20s%02x:%02x:%02x:%02x:%02x:%02x\n",
+                   libnet_addr2name4(ent->ip, LIBNET_DONT_RESOLVE),
+                   ent->hw[0], ent->hw[1],
+                   ent->hw[2], ent->hw[3],
+                   ent->hw[4], ent->hw[5]);
+        }
+    } else if (!strcasecmp(buf, "route")) {
+        list *l = routing_table;
+        printf("%-16s%-16s%s\n", "Destination", "Gateway", "Genmask");
+        while (l) {
+            struct route_row *rt = l->data;
+            l = l->next;
+            printf("%-16s%-16s%s\n",
+                   libnet_addr2name4(rt->dest, LIBNET_DONT_RESOLVE),
+                   libnet_addr2name4(rt->gw, LIBNET_DONT_RESOLVE),
+                   libnet_addr2name4(rt->mask, LIBNET_DONT_RESOLVE));
+        }
+    } else if (!strcasecmp(buf, "setup")) {
+        /* XXX this should be replaced with the host's routing table */
+        route_add(0x0038640A, 0x00FCFFFF, 0);
+        route_add(0, 0, 0x0138640A);
     } else if (!strcasecmp(buf, "quit")) {
         /* XXX should send RST to all the sessions, and remove the bogus arp
-         * entry from the host */
+         * entry from the host, though that required root, which we dropped */
         exit(0);
     }
 }
@@ -1983,12 +2205,6 @@ main(int argc, char **argv)
 
     memcpy(src_hw, libnet_get_hwaddr(lnh_link), 6);
     ip_id = libnet_get_prand(LIBNET_PRu16);
-
-    /* please see RAWSOCKET_NON_SEQUITUR in libnet1 docs */
-    if (!(lnh_raw4 = libnet_init(LIBNET_RAW4, dev, errbuf))) {
-        fprintf(stderr, "%s\n", errbuf);
-        return 1;
-    }
 
     /* you need to pick this IP address based on two characteristics:
      *
