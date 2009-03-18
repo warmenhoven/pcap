@@ -2,7 +2,6 @@
  * TODO:
  *   IP:
  *     - IP options (security, source route, record route, timestamp)
- *     - for some reason we can't ping the host, but it can ping us?
  *     - traceroute
  *
  *   UDP:
@@ -26,6 +25,7 @@
  *     - better CLI (history would be nice, at least)
  *     - some way of guessing which IP address to use (dhcp?)
  *     - make sure not using loopback device
+ *     - we can't talk to the host at all since moving to a link layer socket
  *
  *   And finally, all of the evil things I'd like to do:
  *    - Increased control over remote window size
@@ -229,18 +229,18 @@ struct arp_pkt {
 } __attribute__ ((__packed__));
 
 static void
-cache_arp(struct arp_pkt *arp)
+cache_arp(uint32_t ip, unsigned char *hw)
 {
     list *l = arp_cache;
     struct arp_ent *ent;
 
     while (l) {
         ent = l->data;
-        if (ent->ip == arp->src_ip) {
-            if (memcmp(ent->hw, arp->src_hw, 6)) {
+        if (ent->ip == ip) {
+            if (memcmp(ent->hw, hw, 6)) {
                 printf("HW addr for %s changed\n",
-                       libnet_addr2name4(arp->src_ip, LIBNET_DONT_RESOLVE));
-                memcpy(ent->hw, arp->src_hw, 6);
+                       libnet_addr2name4(ip, LIBNET_DONT_RESOLVE));
+                memcpy(ent->hw, hw, 6);
             }
             return;
         }
@@ -248,12 +248,11 @@ cache_arp(struct arp_pkt *arp)
     }
 
     /* didn't find it */
-    printf("caching arp for %s\n",
-           libnet_addr2name4(arp->src_ip, LIBNET_DONT_RESOLVE));
+    printf("caching arp for %s\n", libnet_addr2name4(ip, LIBNET_DONT_RESOLVE));
 
     ent = malloc(sizeof (struct arp_ent));
-    ent->ip = arp->src_ip;
-    memcpy(ent->hw, arp->src_hw, 6);
+    ent->ip = ip;
+    memcpy(ent->hw, hw, 6);
     arp_cache = list_prepend(arp_cache, ent);
 }
 
@@ -317,7 +316,7 @@ process_arp_packet(struct libnet_ethernet_hdr *enet, uint32_t len)
         memcmp(src_hw, arp->src_hw, 6) == 0)           /* not host */
         return;
 
-    cache_arp(arp);
+    cache_arp(arp->src_ip, arp->src_hw);
 
     if (ntohs(arp->hdr.ar_op) == ARPOP_REQUEST) {
         arp_reply(arp);
@@ -2222,9 +2221,9 @@ main(int argc, char **argv)
 
     /* so this is quite the hack. before doing anything else, we feed the host a
      * fake ethernet address (I certainly hope no device actually exists that
-     * uses it!). then if the host wants to talk to us, it will send it out over
-     * the wire. the packet will go nowhere, but pcap will see it and we'll be
-     * able to process it. in this way we can talk to the host. */
+     * uses it!). that way the host will not send an arp request when it
+     * receives a packet that's meant for us. alternatively, we could just
+     * ignore the arp request. */
     memset(&req, 0, sizeof (req));
     req.arp_flags = ATF_PERM | ATF_COM;
     s_in = (struct sockaddr_in *)&req.arp_pa;
