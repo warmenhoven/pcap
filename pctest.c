@@ -2089,7 +2089,7 @@ init_pcap(char *dev)
 
     if (pcap_setfilter(lph, &filter) == -1) {
         fprintf(stderr, "%s\n", errbuf);
-        return 1;
+        return NULL;
     }
 
     pcap_freecode(&filter);
