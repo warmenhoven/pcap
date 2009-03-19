@@ -7,6 +7,9 @@
  *   UDP:
  *     - maybe, if we do dhcp
  *
+ *   DHCP:
+ *     - would require changing the pcap filter line
+ *
  *   TCP:
  *     - TCP options (mss, sack, wscale, timestamp)
  *     - "connection synchronization using data-carrying segments"
@@ -202,7 +205,7 @@ timer_process_pending(void)
 /* these are our global variables */
 static libnet_t *lnh_link = NULL;
 static unsigned char src_hw[6];
-static uint32_t src_ip;
+static uint32_t src_ip = 0;
 static u_int16_t ip_id;
 static const u_int8_t ip_ttl = 64;
 static list *sessions = NULL;
@@ -378,7 +381,7 @@ route_cmp(const void *x, const void *y)
     }
 }
 
-static void
+static int
 route_add(uint32_t dest, uint32_t mask, uint32_t gw)
 {
     struct route_row *rt;
@@ -390,13 +393,13 @@ route_add(uint32_t dest, uint32_t mask, uint32_t gw)
             i = 0;
         } else if (i != 1) {
             fprintf(stderr, "invalid mask %08x\n", hmask);
-            return;
+            return 1;
         }
         bit >>= 1;
     }
     if ((dest & ~mask) != 0) {
         fprintf(stderr, "invalid dest/mask pair\n");
-        return;
+        return 1;
     }
 
     rt = malloc(sizeof (struct route_row));
@@ -409,6 +412,8 @@ route_add(uint32_t dest, uint32_t mask, uint32_t gw)
         /* if it's the default gateway, get its mac now */
         arp_request(gw);
     }
+
+    return 0;
 }
 
 static libnet_ptag_t
@@ -2000,10 +2005,6 @@ process_input(void)
                    libnet_addr2name4(rt->gw, LIBNET_DONT_RESOLVE),
                    libnet_addr2name4(rt->mask, LIBNET_DONT_RESOLVE));
         }
-    } else if (!strcasecmp(buf, "setup")) {
-        /* XXX this should be replaced with the host's routing table */
-        route_add(0x0038640A, 0x00FCFFFF, 0);
-        route_add(0, 0, 0x0138640A);
     } else if (!strcasecmp(buf, "quit")) {
         /* XXX should send RST to all the sessions, and remove the bogus arp
          * entry from the host, though that required root, which we dropped */
@@ -2088,8 +2089,11 @@ init_pcap(char *dev)
 
     if (pcap_setfilter(lph, &filter) == -1) {
         fprintf(stderr, "%s\n", errbuf);
-        return NULL;
+        return 1;
     }
+
+    pcap_freecode(&filter);
+
     return lph;
 }
 /* } */
@@ -2111,11 +2115,6 @@ main(int argc, char **argv)
     const char *user = "nobody";
     char *dev = NULL;
 
-    if (argc < 2) {
-        printf("Usage: %s <ip>\n", argv[0]);
-        return 1;
-    }
-
     if (!(lnh_link = libnet_init(LIBNET_LINK, dev, errbuf))) {
         fprintf(stderr, "%s\n", errbuf);
         return 1;
@@ -2127,17 +2126,51 @@ main(int argc, char **argv)
     memcpy(src_hw, libnet_get_hwaddr(lnh_link), 6);
     ip_id = libnet_get_prand(LIBNET_PRu16);
 
-    /* you need to pick this IP address based on two characteristics:
-     *
-     * 1. it cannot be in use by another computer (including the host)
-     * 2. it needs to be in the same subnet as the host
-     *
-     * of course, you could remove the ip address from the host and just use
-     * that address, but then you'll probably have to modify this client to
-     * handle all the routing details itself, and that's not fun. */
-    src_ip = libnet_name2addr4(lnh_link, argv[1], LIBNET_RESOLVE);
-    if (src_ip == (uint32_t)-1) {
-        fprintf(stderr, "invalid host name %s\n", argv[1]);
+    if (argc < 2) {
+        printf("Usage: %s <ip mask gw | dhcp>\n", argv[0]);
+        return 1;
+    } else if (!strcasecmp(argv[1], "dhcp")) {
+        printf("DHCP is not supported yet.\n");
+        return 1;
+    } else if (argc == 4) {
+        uint32_t ip, mask, gw;
+        /* you need to pick this IP address based on two characteristics:
+         *
+         * 1. it cannot be in use by another computer (including the host)
+         * 2. it needs to be in the same subnet as the host
+         *
+         * of course, you could remove the ip address from the host and just use
+         * that address, but then you'll probably have to modify this client to
+         * handle all the routing details itself, and that's not fun. */
+        ip = libnet_name2addr4(lnh_link, argv[1], LIBNET_RESOLVE);
+        if (ip == (uint32_t)-1) {
+            fprintf(stderr, "invalid host name %s\n", argv[1]);
+            return 1;
+        }
+
+        if (!(lph = init_pcap(dev)))
+            return 1;
+
+        mask = libnet_name2addr4(lnh_link, argv[2], LIBNET_DONT_RESOLVE);
+        if (mask == (uint32_t)-1) {
+            fprintf(stderr, "invalid mask %s\n", argv[2]);
+            return 1;
+        }
+
+        gw = libnet_name2addr4(lnh_link, argv[3], LIBNET_RESOLVE);
+        if (gw == (uint32_t)-1 || ((gw & mask) != (ip & mask))) {
+            fprintf(stderr, "invalid gateway %s\n", argv[3]);
+            return 1;
+        }
+
+        if (route_add(ip & mask, mask, 0)) {
+            return 1;
+        }
+        if (route_add(0, 0, gw)) {
+            return 1;
+        }
+    } else {
+        printf("Usage: %s <ip mask gw | dhcp>\n", argv[0]);
         return 1;
     }
 
@@ -2145,7 +2178,9 @@ main(int argc, char **argv)
      * fake ethernet address (I certainly hope no device actually exists that
      * uses it!). that way the host will not send an arp request when it
      * receives a packet that's meant for us. alternatively, we could just
-     * ignore the arp request. */
+     * ignore the arp request. one nice thing about this though is that the host
+     * will tell us when the ip address supplied by the user is invalid. */
+    /* XXX need to do something different for DHCP */
     memset(&req, 0, sizeof (req));
     req.arp_flags = ATF_PERM | ATF_COM;
     s_in = (struct sockaddr_in *)&req.arp_pa;
@@ -2158,9 +2193,6 @@ main(int argc, char **argv)
         perror("SIOCSARP");
         return 1;
     }
-
-    if (!(lph = init_pcap(dev)))
-        return 1;
 
     /* now that we've created all of our sockets and opened up pcap, drop root
      * privileges and run as specified user (which defaults to 'nobody'). */
