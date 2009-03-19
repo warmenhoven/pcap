@@ -35,7 +35,6 @@
  */
 
 #include <libnet.h>
-#include <net/if_arp.h>
 #include <pcap.h>
 #include <pwd.h>
 
@@ -2106,9 +2105,6 @@ main(int argc, char **argv)
     fd_set set;
     struct timeval tv, *ptv;
 
-    struct arpreq req;
-    struct sockaddr_in *s_in;
-
     char errbuf[LIBNET_ERRBUF_SIZE];
     pcap_t *lph;
 
@@ -2133,7 +2129,7 @@ main(int argc, char **argv)
         printf("DHCP is not supported yet.\n");
         return 1;
     } else if (argc == 4) {
-        uint32_t ip, mask, gw;
+        uint32_t mask, gw;
         /* you need to pick this IP address based on two characteristics:
          *
          * 1. it cannot be in use by another computer (including the host)
@@ -2142,8 +2138,8 @@ main(int argc, char **argv)
          * of course, you could remove the ip address from the host and just use
          * that address, but then you'll probably have to modify this client to
          * handle all the routing details itself, and that's not fun. */
-        ip = libnet_name2addr4(lnh_link, argv[1], LIBNET_RESOLVE);
-        if (ip == (uint32_t)-1) {
+        src_ip = libnet_name2addr4(lnh_link, argv[1], LIBNET_RESOLVE);
+        if (src_ip == (uint32_t)-1) {
             fprintf(stderr, "invalid host name %s\n", argv[1]);
             return 1;
         }
@@ -2158,12 +2154,12 @@ main(int argc, char **argv)
         }
 
         gw = libnet_name2addr4(lnh_link, argv[3], LIBNET_RESOLVE);
-        if (gw == (uint32_t)-1 || ((gw & mask) != (ip & mask))) {
+        if (gw == (uint32_t)-1 || ((gw & mask) != (src_ip & mask))) {
             fprintf(stderr, "invalid gateway %s\n", argv[3]);
             return 1;
         }
 
-        if (route_add(ip & mask, mask, 0)) {
+        if (route_add(src_ip & mask, mask, 0)) {
             return 1;
         }
         if (route_add(0, 0, gw)) {
@@ -2171,26 +2167,6 @@ main(int argc, char **argv)
         }
     } else {
         printf("Usage: %s <ip mask gw | dhcp>\n", argv[0]);
-        return 1;
-    }
-
-    /* so this is quite the hack. before doing anything else, we feed the host a
-     * fake ethernet address (I certainly hope no device actually exists that
-     * uses it!). that way the host will not send an arp request when it
-     * receives a packet that's meant for us. alternatively, we could just
-     * ignore the arp request. one nice thing about this though is that the host
-     * will tell us when the ip address supplied by the user is invalid. */
-    /* XXX need to do something different for DHCP */
-    memset(&req, 0, sizeof (req));
-    req.arp_flags = ATF_PERM | ATF_COM;
-    s_in = (struct sockaddr_in *)&req.arp_pa;
-    s_in->sin_family = AF_INET;
-    s_in->sin_port = 0;
-    s_in->sin_addr.s_addr = src_ip;
-    req.arp_ha.sa_family = ARPHRD_ETHER;
-    memcpy(req.arp_ha.sa_data, "\x00\x00\x00\x00\x00\x01", 6);
-    if (ioctl(libnet_getfd(lnh_link), SIOCSARP, &req) < 0) {
-        perror("SIOCSARP");
         return 1;
     }
 
