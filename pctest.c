@@ -1944,11 +1944,21 @@ process_input(void)
             printf("couldn't find %u\n", id);
     } else if (!strcasecmp(buf, "netstat")) {
         list *l = sessions;
-
+        printf("%-5s%-22s%-22s%s\n",
+               "ID", "Local Address", "Foreign Address", "State");
         while (l) {
             char sting_string[100];
+            char local[23], foreign[23];
             TCB *sess = l->data;
             l = l->next;
+
+            sprintf(local, "%s:%d",
+                    libnet_addr2name4(src_ip, LIBNET_DONT_RESOLVE),
+                    sess->src_prt);
+
+            sprintf(foreign, "%s:%d",
+                    libnet_addr2name4(sess->dst_ip, LIBNET_DONT_RESOLVE),
+                    sess->dst_prt);
 
             if (sess->sting) {
                 sprintf(sting_string, " (stinging, %d/%d sent)",
@@ -1957,10 +1967,8 @@ process_input(void)
                 sting_string[0] = '\0';
             }
 
-            printf("id %d: port %d with %s:%d state %s%s\n",
-                   sess->id, sess->src_prt,
-                   libnet_addr2name4(sess->dst_ip, LIBNET_DONT_RESOLVE),
-                   sess->dst_prt, state_names[sess->state],
+            printf("%-5d%-22s%-22s%-12s%s\n",
+                   sess->id, local, foreign, state_names[sess->state],
                    sting_string);
         }
     } else if (!strncasecmp(buf, "timer ", strlen("timer "))) {
@@ -2019,6 +2027,7 @@ process_packet(pcap_t *lph)
     struct libnet_ethernet_hdr *enet;
     struct pcap_pkthdr *hdr;
     u_char *pkt;
+    int rc;
 
     /* we pretend pkt is a const here! that's probably pretty evil. in fact we
      * never actually modify the contents of the packet (or shouldn't!), but
@@ -2026,8 +2035,8 @@ process_packet(pcap_t *lph)
      * avoid const, or sprinkling const all over the place, we'll just avoid
      * the warning.
      */
-    if (pcap_next_ex(lph, &hdr, (const u_char **)&pkt) != 1) {
-        fprintf(stderr, "pcap_next fails!\n");
+    if ((rc = pcap_next_ex(lph, &hdr, (const u_char **)&pkt)) != 1) {
+        fprintf(stderr, "pcap_next fails, rc=%d, %s!\n", rc, pcap_geterr(lph));
         return;
     }
 
@@ -2058,115 +2067,79 @@ process_packet(pcap_t *lph)
     }
 }
 
-static pcap_t *
-init_pcap(char *dev)
+static int
+init_pcap(pcap_t *lph, uint32_t ip, uint32_t net)
 {
     char errbuf[PCAP_ERRBUF_SIZE];
-    pcap_t *lph;
-
-    bpf_u_int32 net;
-    bpf_u_int32 mask;
     char *filter_line;
     struct bpf_program filter;
-
-    if (!(lph = pcap_open_live(dev, BUFSIZ, 0, 0, errbuf))) {
-        fprintf(stderr, "%s\n", errbuf);
-        return NULL;
-    }
-
-    if (pcap_lookupnet(dev, &net, &mask, errbuf) == -1) {
-        fprintf(stderr, "%s\n", errbuf);
-        return NULL;
-    }
 
     filter_line = malloc(4 + 5 + (4*4));
     /* this filter should give us everything we need (including arp requests) */
     sprintf(filter_line, "dst host %s",
-            libnet_addr2name4(src_ip, LIBNET_DONT_RESOLVE));
+            libnet_addr2name4(ip, LIBNET_DONT_RESOLVE));
     pcap_compile(lph, &filter, filter_line, 0, net);
     free(filter_line);
 
     if (pcap_setfilter(lph, &filter) == -1) {
         fprintf(stderr, "%s\n", errbuf);
-        return NULL;
+        return 1;
     }
 
     pcap_freecode(&filter);
 
-    return lph;
+    return 0;
 }
 /* } */
 
 int
 main(int argc, char **argv)
 {
-    struct passwd *pswd;
+    uint32_t mask, gw;
 
-    fd_set set;
-    struct timeval tv, *ptv;
-
-    char errbuf[LIBNET_ERRBUF_SIZE];
+    char net_errbuf[LIBNET_ERRBUF_SIZE];
+    char pcap_errbuf[PCAP_ERRBUF_SIZE];
     pcap_t *lph;
-
-    const char *user = "nobody";
     char *dev = NULL;
 
-    if (!(lnh_link = libnet_init(LIBNET_LINK, dev, errbuf))) {
-        fprintf(stderr, "%s\n", errbuf);
+    const char *user = "nobody";
+    struct passwd *pswd;
+
+    if (argc != 4) {
+        printf("Usage: %s ip mask gw\n", argv[0]);
         return 1;
     }
+
+    if (!(lnh_link = libnet_init(LIBNET_LINK, NULL, net_errbuf))) {
+        fprintf(stderr, "%s\n", net_errbuf);
+        return 1;
+    }
+
+    /* you need to pick this IP address based on two characteristics:
+     *
+     * 1. it cannot be in use by another computer (including the host)
+     * 2. it needs to be in the same subnet as the host
+     */
+    src_ip = libnet_name2addr4(lnh_link, argv[1], LIBNET_RESOLVE);
+    if (src_ip == (uint32_t)-1) {
+        fprintf(stderr, "invalid host name %s\n", argv[1]);
+        return 1;
+    }
+    mask = libnet_name2addr4(lnh_link, argv[2], LIBNET_DONT_RESOLVE);
+    if (mask == (uint32_t)-1) {
+        fprintf(stderr, "invalid mask %s\n", argv[2]);
+        return 1;
+    }
+    gw = libnet_name2addr4(lnh_link, argv[3], LIBNET_RESOLVE);
+    if (gw == (uint32_t)-1 || ((gw & mask) != (src_ip & mask))) {
+        fprintf(stderr, "invalid gateway %s\n", argv[3]);
+        return 1;
+    }
+
     dev = (char *)libnet_getdevice(lnh_link);
 
-    libnet_seed_prand(lnh_link);
-
-    memcpy(src_hw, libnet_get_hwaddr(lnh_link), 6);
-    ip_id = libnet_get_prand(LIBNET_PRu16);
-
-    if (argc < 2) {
-        printf("Usage: %s <ip mask gw | dhcp>\n", argv[0]);
-        return 1;
-    } else if (!strcasecmp(argv[1], "dhcp")) {
-        printf("DHCP is not supported yet.\n");
-        return 1;
-    } else if (argc == 4) {
-        uint32_t mask, gw;
-        /* you need to pick this IP address based on two characteristics:
-         *
-         * 1. it cannot be in use by another computer (including the host)
-         * 2. it needs to be in the same subnet as the host
-         *
-         * of course, you could remove the ip address from the host and just use
-         * that address, but then you'll probably have to modify this client to
-         * handle all the routing details itself, and that's not fun. */
-        src_ip = libnet_name2addr4(lnh_link, argv[1], LIBNET_RESOLVE);
-        if (src_ip == (uint32_t)-1) {
-            fprintf(stderr, "invalid host name %s\n", argv[1]);
-            return 1;
-        }
-
-        if (!(lph = init_pcap(dev)))
-            return 1;
-
-        mask = libnet_name2addr4(lnh_link, argv[2], LIBNET_DONT_RESOLVE);
-        if (mask == (uint32_t)-1) {
-            fprintf(stderr, "invalid mask %s\n", argv[2]);
-            return 1;
-        }
-
-        gw = libnet_name2addr4(lnh_link, argv[3], LIBNET_RESOLVE);
-        if (gw == (uint32_t)-1 || ((gw & mask) != (src_ip & mask))) {
-            fprintf(stderr, "invalid gateway %s\n", argv[3]);
-            return 1;
-        }
-
-        if (route_add(src_ip & mask, mask, 0)) {
-            return 1;
-        }
-        if (route_add(0, 0, gw)) {
-            return 1;
-        }
-    } else {
-        printf("Usage: %s <ip mask gw | dhcp>\n", argv[0]);
+    if (!(lph = pcap_open_live(dev, BUFSIZ, 0, 0, pcap_errbuf))) {
+        fprintf(stderr, "%s\n", pcap_errbuf);
         return 1;
     }
 
@@ -2178,7 +2151,24 @@ main(int argc, char **argv)
         return 1;
     }
 
+    if (init_pcap(lph, src_ip, src_ip & mask))
+        return 1;
+
+    memcpy(src_hw, libnet_get_hwaddr(lnh_link), 6);
+    libnet_seed_prand(lnh_link);
+    ip_id = libnet_get_prand(LIBNET_PRu16);
+
+    if (route_add(src_ip & mask, mask, 0)) {
+        return 1;
+    }
+    if (route_add(0, 0, gw)) {
+        return 1;
+    }
+
     while (1) {
+        fd_set set;
+        struct timeval tv, *ptv;
+
         FD_ZERO(&set);
         FD_SET(0, &set);
         FD_SET(pcap_fileno(lph), &set);
