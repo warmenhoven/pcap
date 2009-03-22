@@ -203,6 +203,7 @@ timer_process_pending(void)
 
 /* these are our global variables */
 static libnet_t *lnh_link = NULL;
+static pcap_t *lph;
 static unsigned char src_hw[6];
 static uint32_t src_ip = 0;
 static u_int16_t ip_id;
@@ -249,7 +250,6 @@ cache_arp(uint32_t ip, unsigned char *hw)
         l = l->next;
     }
 
-    /* didn't find it */
     printf("caching arp for %s\n", libnet_addr2name4(ip, LIBNET_DONT_RESOLVE));
 
     ent = malloc(sizeof (struct arp_ent));
@@ -273,16 +273,14 @@ arp_lookup(uint32_t ip)
 }
 
 /* since we're "faking" a client, we need to reply to arp requests as that
- * client. we shouldn't ever get an arp request from the host because we set up
- * a fake arp entry for ourselves, but we check to make sure it's not from the
- * host anyway. */
+ * client. we need to make sure that we don't send arp replies to the host,
+ * because that will just confuse it. sending arp requests to it also confuses
+ * it, but at least it doesn't do anything. */
 static void
 arp_reply(struct arp_pkt *arp)
 {
-    printf("replying to arp from %s (%02x:%02x:%02x:%02x:%02x:%02x)\n",
-           libnet_addr2name4(arp->src_ip, LIBNET_DONT_RESOLVE),
-           arp->src_hw[0], arp->src_hw[1], arp->src_hw[2],
-           arp->src_hw[3], arp->src_hw[4], arp->src_hw[5]);
+    printf("replying to arp from %s\n",
+           libnet_addr2name4(arp->src_ip, LIBNET_DONT_RESOLVE));
 
     libnet_clear_packet(lnh_link);
 
@@ -357,12 +355,12 @@ arp_request(uint32_t dst_ip)
 /* } */
 
 /* ROUTING { */
+/* everything here is network byte order */
 struct route_row {
-    uint32_t dest; /* network byte order */
-    uint32_t mask; /* network byte order */
-    uint32_t gw;   /* network byte order */
+    uint32_t dest;
+    uint32_t mask;
+    uint32_t gw;
 };
-
 static list *routing_table = NULL;
 
 static int
@@ -408,7 +406,9 @@ route_add(uint32_t dest, uint32_t mask, uint32_t gw)
     routing_table = list_insert_sorted(routing_table, rt, route_cmp);
 
     if (dest == 0 && mask == 0) {
-        /* if it's the default gateway, get its mac now */
+        /* if it's the default gateway, get its mac now. we're likely going to
+         * have to eventually anyway. also, it's a handy way of seeing
+         * immediately whether the setup is at least somewhat correct. */
         arp_request(gw);
     }
 
@@ -422,22 +422,27 @@ send_ethernet(uint32_t dst_ip, libnet_ptag_t ptag)
 
     while (l) {
         struct route_row *rt = l->data;
-        unsigned char *dst_hw;
+        unsigned char *dst_hw, broadcast[6];
 
         l = l->next;
 
-        if ((dst_ip & rt->mask) != rt->dest) {
+        if ((dst_ip != 0) && ((dst_ip & rt->mask) != rt->dest)) {
             continue;
         }
 
-        if (rt->gw != 0) {
-            dst_ip = rt->gw;
-        }
+        if ((dst_ip == 0) || ((dst_ip & ~rt->mask) == ~rt->mask)) {
+            memset(broadcast, 0xff, 6);
+            dst_hw = broadcast;
+        } else {
+            if (rt->gw != 0) {
+                dst_ip = rt->gw;
+            }
 
-        dst_hw = arp_lookup(dst_ip);
-        if (dst_hw == NULL) {
-            arp_request(dst_ip);
-            return -1;
+            dst_hw = arp_lookup(dst_ip);
+            if (dst_hw == NULL) {
+                arp_request(dst_ip);
+                return -1;
+            }
         }
 
         ptag = libnet_build_ethernet(dst_hw, src_hw, ETHERTYPE_IP,
@@ -577,8 +582,10 @@ send_tcp(TCB *sess, int flags, u_char *data, uint32_t len)
     return 0;
 }
 
-/* yeah, I probably should figure out some way of reusing send_tcp instead of
- * just copying it. but eh. it probably isn't an issue. at least not often. */
+/* eventually send_tcp is going to do nice things like queuing the data to be
+ * sent and setting timers so it can retry if it hasn't been ack'd, so it makes
+ * sense to have a separate function just for sending a RST. or at least, that's
+ * what I keep telling myself. */
 static int
 send_rst(uint32_t state, struct tcp_pkt *tcp)
 {
@@ -635,7 +642,7 @@ find_session(uint32_t dst_ip, uint32_t dst_prt, uint32_t src_prt)
 
     l = listeners;
 
-    /* we should be able to support listening for specific hosts and/or ports */
+    /* TODO: we should support listening for specific hosts and/or ports */
     while (l) {
         TCB *sess = l->data;
         l = l->next;
@@ -760,7 +767,7 @@ remove_session(TCB *sess)
     free(sess);
 }
 
-/* maybe eventually you can specify the port to connect from */
+/* TODO: maybe eventually you can specify the port to connect from */
 static TCB *
 create_session(char *host, uint16_t port)
 {
@@ -946,7 +953,6 @@ tcp_check_seqno(TCB *sess, struct tcp_pkt *pkt)
             return 0;
         }
     } else if (sess->rcv_win != 0) {
-        /* if there's data and our window is 0 then it's unacceptable */
         if (((0 <= (int32_t)(segseq - rcvnxt)) &&
              (0 < (int32_t)(rcvnxt + sess->rcv_win - segseq))) ||
             ((0 <= (int32_t)(segseq + len - 1 - rcvnxt)) &&
@@ -954,6 +960,7 @@ tcp_check_seqno(TCB *sess, struct tcp_pkt *pkt)
             return 0;
         }
     }
+    /* if there's data and our window is 0 then it's unacceptable */
     return 1;
 }
 
@@ -1314,7 +1321,7 @@ process_tcp_packet(struct ip_pkt *ip)
     }
 
     tcp.tcp_options = (u_char *)tcp.hdr + LIBNET_TCP_H;
-    /* XXX we don't actually do anything with the options, but eh */
+    /* TODO: we don't actually do anything with the options, but eh */
 
     tcp.data = (u_char *)&tcp.hdr->th_sport + (tcp.hdr->th_off << 2);
     tcp.data_len = ntohs(ip->hdr->ip_len) - (ip->hdr->ip_hl << 2) -
@@ -1595,7 +1602,7 @@ reassemble_ip_frag(struct ip_frag *frag, struct ip_pkt *pkt)
     memcpy(frag->data, pkt->hdr, LIBNET_IPV4_H);
     pkt->hdr = (struct libnet_ipv4_hdr *)frag->data;
     pkt->hdr->ip_len = ntohs(LIBNET_IPV4_H + cur);
-    /* XXX we're supposed to support options, but eh */
+    /* TODO: we're supposed to support options, but eh */
     pkt->hdr->ip_hl = (LIBNET_IPV4_H >> 2);
     pkt->options = NULL;
     pkt->data = (u_char *)pkt->hdr + LIBNET_IPV4_H;
@@ -1704,7 +1711,7 @@ process_ip_packet(struct libnet_ethernet_hdr *enet, uint32_t len)
      * ip_hl isn't invalid, so we can use those for validation from now on */
 
     ip.options = (u_char *)ip.hdr + LIBNET_IPV4_H;
-    /* XXX we don't actually do anything with the options, but eh */
+    /* TODO: we don't actually do anything with the options, but eh */
 
     ip.data = (u_char *)ip.hdr + (ip.hdr->ip_hl << 2);
 
@@ -2022,7 +2029,7 @@ process_input(void)
 
 /* PCAP { */
 static void
-process_packet(pcap_t *lph)
+process_packet(void)
 {
     struct libnet_ethernet_hdr *enet;
     struct pcap_pkthdr *hdr;
@@ -2068,7 +2075,7 @@ process_packet(pcap_t *lph)
 }
 
 static int
-init_pcap(pcap_t *lph, uint32_t ip, uint32_t net)
+init_pcap(uint32_t ip, uint32_t net)
 {
     char errbuf[PCAP_ERRBUF_SIZE];
     char *filter_line;
@@ -2092,28 +2099,21 @@ init_pcap(pcap_t *lph, uint32_t ip, uint32_t net)
 }
 /* } */
 
-int
-main(int argc, char **argv)
+static int
+setup_dhcp(void)
 {
+    fprintf(stderr, "not currently supported\n");
+    return 1;
+}
+
+static int
+setup_static(char **argv)
+{
+    char pcap_errbuf[PCAP_ERRBUF_SIZE];
+    char *dev;
     uint32_t mask, gw;
 
-    char net_errbuf[LIBNET_ERRBUF_SIZE];
-    char pcap_errbuf[PCAP_ERRBUF_SIZE];
-    pcap_t *lph;
-    char *dev = NULL;
-
-    const char *user = "nobody";
-    struct passwd *pswd;
-
-    if (argc != 4) {
-        printf("Usage: %s ip mask gw\n", argv[0]);
-        return 1;
-    }
-
-    if (!(lnh_link = libnet_init(LIBNET_LINK, NULL, net_errbuf))) {
-        fprintf(stderr, "%s\n", net_errbuf);
-        return 1;
-    }
+    dev = (char *)libnet_getdevice(lnh_link);
 
     /* you need to pick this IP address based on two characteristics:
      *
@@ -2136,11 +2136,51 @@ main(int argc, char **argv)
         return 1;
     }
 
-    dev = (char *)libnet_getdevice(lnh_link);
-
     if (!(lph = pcap_open_live(dev, BUFSIZ, 0, 0, pcap_errbuf))) {
         fprintf(stderr, "%s\n", pcap_errbuf);
         return 1;
+    }
+    if (init_pcap(src_ip, src_ip & mask))
+        return 1;
+
+    if (route_add(src_ip & mask, mask, 0)) {
+        return 1;
+    }
+    if (route_add(0, 0, gw)) {
+        return 1;
+    }
+
+    return 0;
+}
+
+int
+main(int argc, char **argv)
+{
+    char net_errbuf[LIBNET_ERRBUF_SIZE];
+
+    const char *user = "nobody";
+    struct passwd *pswd;
+
+    if (!(argc == 2 && !strcasecmp(argv[1], "dhcp")) && argc != 4) {
+        printf("Usage: %s <ip mask gw | dhcp>\n", argv[0]);
+        return 1;
+    }
+
+    if (!(lnh_link = libnet_init(LIBNET_LINK, NULL, net_errbuf))) {
+        fprintf(stderr, "%s\n", net_errbuf);
+        return 1;
+    }
+
+    memcpy(src_hw, libnet_get_hwaddr(lnh_link), 6);
+    libnet_seed_prand(lnh_link);
+    ip_id = libnet_get_prand(LIBNET_PRu16);
+
+    if (argc == 2 && !strcasecmp(argv[1], "dhcp")) {
+        if (setup_dhcp())
+            return 1;
+    } else {
+        if (setup_static(argv))
+            return 1;
     }
 
     /* now that we've created all of our sockets and opened up pcap, drop root
@@ -2148,20 +2188,6 @@ main(int argc, char **argv)
     pswd = getpwnam(user);
     if (!pswd || setuid(pswd->pw_uid)) {
         fprintf(stderr, "I ain't %s! (can't drop root privs)\n", user);
-        return 1;
-    }
-
-    if (init_pcap(lph, src_ip, src_ip & mask))
-        return 1;
-
-    memcpy(src_hw, libnet_get_hwaddr(lnh_link), 6);
-    libnet_seed_prand(lnh_link);
-    ip_id = libnet_get_prand(LIBNET_PRu16);
-
-    if (route_add(src_ip & mask, mask, 0)) {
-        return 1;
-    }
-    if (route_add(0, 0, gw)) {
         return 1;
     }
 
@@ -2182,7 +2208,7 @@ main(int argc, char **argv)
             process_input();
 
         if (FD_ISSET(pcap_fileno(lph), &set))
-            process_packet(lph);
+            process_packet();
 
         timer_process_pending();
     }
