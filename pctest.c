@@ -28,6 +28,7 @@
  */
 
 #include <libnet.h>
+#include <net/if_arp.h>
 #include <pcap.h>
 #include <pwd.h>
 
@@ -535,6 +536,7 @@ struct ip_pkt {
     struct libnet_ipv4_hdr *hdr;
     u_char *options;
     u_char *data;
+    int from_host;
 };
 
 struct icmp_pkt {
@@ -1293,18 +1295,20 @@ process_tcp_packet(struct ip_pkt *ip)
     tcp.ip_options = ip->options;
     tcp.hdr = (struct libnet_tcp_hdr *)ip->data;
 
-    csum = tcp.hdr->th_sum;
-    tcp.hdr->th_sum = 0;
-    sum = libnet_in_cksum((u_int16_t *)&ip->hdr->ip_src, 8);
-    len = ntohs(ip->hdr->ip_len) - (ip->hdr->ip_hl << 2);
-    sum += ntohs(IPPROTO_TCP + len);
-    sum += libnet_in_cksum((u_int16_t *)tcp.hdr, len);
-    tcp.hdr->th_sum = LIBNET_CKSUM_CARRY(sum);
-    if (csum != tcp.hdr->th_sum) {
-        fprintf(stderr, "checksum mismatch in TCP header (src %s), was %x, should be %x!\n",
-                libnet_addr2name4(ip->hdr->ip_src.s_addr, LIBNET_DONT_RESOLVE),
-                csum, tcp.hdr->th_sum);
-        return;
+    if (!ip->from_host) {
+        csum = tcp.hdr->th_sum;
+        tcp.hdr->th_sum = 0;
+        sum = libnet_in_cksum((u_int16_t *)&ip->hdr->ip_src, 8);
+        len = ntohs(ip->hdr->ip_len) - (ip->hdr->ip_hl << 2);
+        sum += ntohs(IPPROTO_TCP + len);
+        sum += libnet_in_cksum((u_int16_t *)tcp.hdr, len);
+        tcp.hdr->th_sum = LIBNET_CKSUM_CARRY(sum);
+        if (csum != tcp.hdr->th_sum) {
+            fprintf(stderr, "checksum mismatch in TCP header (src %s), was %x, should be %x!\n",
+                    libnet_addr2name4(ip->hdr->ip_src.s_addr, LIBNET_DONT_RESOLVE),
+                    csum, tcp.hdr->th_sum);
+            return;
+        }
     }
 
     if ((tcp.hdr->th_off << 2) < LIBNET_TCP_H) {
@@ -1403,7 +1407,7 @@ process_dhcp_packet(struct ip_pkt *ip)
     dhcp_hdr = (struct libnet_dhcpv4_hdr *)(ip->data + LIBNET_UDP_H);
 
     if (dhcp_xid == 0 || dhcp_xid != ntohl(dhcp_hdr->dhcp_xid)) {
-        /* we don't need no stinking packets */
+        /* sigh. too bad we can't filter these out more easily. */
         return;
     }
 
@@ -1468,6 +1472,8 @@ setup_static(char **argv)
 {
     char pcap_errbuf[PCAP_ERRBUF_SIZE];
     char *dev;
+    struct arpreq req;
+    struct sockaddr_in *s_in;
     uint32_t mask, gw;
 
     dev = (char *)libnet_getdevice(lnh_link);
@@ -1493,6 +1499,29 @@ setup_static(char **argv)
         fprintf(stderr, "invalid gateway %s\n", argv[3]);
         return 1;
     }
+
+#if 0
+    /* disabling this for now as sending responses back to the host doesn't
+     * work, so why bother feeding it bogus information if we're not going to
+     * get anything out of it? just to be mean? */
+    /* so this is quite the hack. before doing anything else, we feed the host a
+     * fake ethernet address (I certainly hope no device actually exists that
+     * uses it!). then if the host wants to talk to us, it will send it out over
+     * the wire. the packet will go nowhere, but pcap will see it and we'll be
+     * able to process it. in this way we can talk to the host. */
+    memset(&req, 0, sizeof (req));
+    req.arp_flags = ATF_PERM | ATF_COM;
+    s_in = (struct sockaddr_in *)&req.arp_pa;
+    s_in->sin_family = AF_INET;
+    s_in->sin_port = 0;
+    s_in->sin_addr.s_addr = src_ip;
+    req.arp_ha.sa_family = ARPHRD_ETHER;
+    memcpy(req.arp_ha.sa_data, "\x00\x00\x00\x00\x00\x01", 6);
+    if (ioctl(libnet_getfd(lnh_link), SIOCSARP, &req) < 0) {
+        perror("SIOCSARP");
+        return 1;
+    }
+#endif
 
     if (!(lph = pcap_open_live(dev, BUFSIZ, 0, 0, pcap_errbuf))) {
         fprintf(stderr, "%s\n", pcap_errbuf);
@@ -1528,7 +1557,7 @@ process_udp_packet(struct ip_pkt *ip)
 
     udp_hdr = (struct libnet_udp_hdr *)ip->data;
 
-    if (udp_hdr->uh_sum != 0) {
+    if (!ip->from_host && udp_hdr->uh_sum != 0) {
         csum = udp_hdr->uh_sum;
         udp_hdr->uh_sum = 0;
         sum = libnet_in_cksum((u_int16_t *)&ip->hdr->ip_src, 8);
@@ -1898,13 +1927,18 @@ process_ip_packet(struct libnet_ethernet_hdr *enet, uint32_t len)
         return;
     }
 
-    csum = ip.hdr->ip_sum;
-    ip.hdr->ip_sum = 0;
-    sum = libnet_in_cksum((u_int16_t *)ip.hdr, ip.hdr->ip_hl << 2);
-    ip.hdr->ip_sum = LIBNET_CKSUM_CARRY(sum);
-    if (csum != ip.hdr->ip_sum) {
-        fprintf(stderr, "checksum mismatch in IP header!\n");
-        return;
+    if (!memcmp(enet->ether_shost, src_hw, ETHER_ADDR_LEN)) {
+        ip.from_host = 1;
+    } else {
+        ip.from_host = 0;
+        csum = ip.hdr->ip_sum;
+        ip.hdr->ip_sum = 0;
+        sum = libnet_in_cksum((u_int16_t *)ip.hdr, ip.hdr->ip_hl << 2);
+        ip.hdr->ip_sum = LIBNET_CKSUM_CARRY(sum);
+        if (csum != ip.hdr->ip_sum) {
+            fprintf(stderr, "checksum mismatch in IP header!\n");
+            return;
+        }
     }
 
     if (len < (uint32_t)(LIBNET_ETH_H + (uint16_t)ntohs(ip.hdr->ip_len))) {
