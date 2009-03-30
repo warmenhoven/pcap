@@ -272,21 +272,21 @@ arp_lookup(uint32_t ip)
  * because that will just confuse it. sending arp requests to it also confuses
  * it, but at least it doesn't do anything. */
 static void
-arp_reply(struct arp_pkt *arp)
+arp_reply(uint32_t dst_ip, u_int8_t *dst_hw)
 {
     printf("replying to arp from %s\n",
-           libnet_addr2name4(arp->src_ip, LIBNET_DONT_RESOLVE));
+           libnet_addr2name4(dst_ip, LIBNET_DONT_RESOLVE));
 
     libnet_clear_packet(lnh_link);
 
     if (libnet_build_arp(ARPHRD_ETHER, ETHERTYPE_IP, ETHER_ADDR_LEN, 4,
-                         ARPOP_REPLY, src_hw, (u_char *)&src_ip, arp->src_hw,
-                         (u_char *)&arp->src_ip, NULL, 0, lnh_link, 0) == -1) {
+                         ARPOP_REPLY, src_hw, (u_char *)&src_ip, dst_hw,
+                         (u_char *)&dst_ip, NULL, 0, lnh_link, 0) == -1) {
         fprintf(stderr, "%s", libnet_geterror(lnh_link));
         return;
     }
 
-    if (libnet_autobuild_ethernet(arp->src_hw, ETHERTYPE_ARP, lnh_link) == -1) {
+    if (libnet_autobuild_ethernet(dst_hw, ETHERTYPE_ARP, lnh_link) == -1) {
         fprintf(stderr, "%s", libnet_geterror(lnh_link));
         return;
     }
@@ -314,7 +314,7 @@ process_arp_packet(struct libnet_ethernet_hdr *enet, uint32_t len)
     cache_arp(arp->src_ip, arp->src_hw);
 
     if (ntohs(arp->hdr.ar_op) == ARPOP_REQUEST) {
-        arp_reply(arp);
+        arp_reply(arp->src_ip, arp->src_hw);
     }
 }
 
@@ -420,6 +420,8 @@ send_ethernet(uint32_t dst_ip)
 
     if (dst_ip == 0 || dst_ip == 0xFFFFFFFF || dst_ip == bcast_ip) {
         dst_hw = broadcast;
+    } else if (dst_ip == src_ip) {
+        dst_hw = src_hw;
     }
 
     while (dst_hw == NULL && l) {
@@ -1361,7 +1363,6 @@ init_pcap(uint32_t ip, uint32_t net)
             src_hw[3], src_hw[4], src_hw[5]);
 
     /* what is it that we want here?
-     *
      * - broadcast ethernet packets, but only IP or ARP
      * - IP and ARP packets for our IP, if we have one
      * - for DHCP, UDP port 68 packets for src_hw
@@ -1390,68 +1391,83 @@ init_pcap(uint32_t ip, uint32_t net)
     return 0;
 }
 
+typedef enum {
+    DHCP_UNKNOWN,
+    DHCP_INIT,
+    DHCP_SELECTING,
+    DHCP_REQUESTING,
+    DHCP_BOUND,
+    DHCP_RENEWING,
+    DHCP_REBINDING
+} dhcp_state;
+
+static const char *dhcp_state_names[] = {
+    "UNKNOWN",
+    "INIT",
+    "SELECTING",
+    "REQUESTING",
+    "BOUND",
+    "RENEWING",
+    "REBINDING"
+};
+
+static dhcp_state dhcp_st = 0;
 static uint32_t dhcp_xid = 0;
 
-static void
-process_dhcp_packet(struct ip_pkt *ip)
-{
-    struct libnet_udp_hdr *udp_hdr;
-    struct libnet_dhcpv4_hdr *dhcp_hdr;
-
-    udp_hdr = (struct libnet_udp_hdr *)ip->data;
-    if (udp_hdr->uh_ulen < sizeof (struct libnet_dhcpv4_hdr)) {
-        fprintf(stderr, "invalid dhcp packet length\n");
-        return;
-    }
-
-    dhcp_hdr = (struct libnet_dhcpv4_hdr *)(ip->data + LIBNET_UDP_H);
-
-    if (dhcp_xid == 0 || dhcp_xid != ntohl(dhcp_hdr->dhcp_xid)) {
-        /* sigh. too bad we can't filter these out more easily. */
-        return;
-    }
-
-    printf("got a dhcp message for us! too bad we didn't do anything with it.\n");
-}
+static uint32_t dhcp_srv = 0;
+static uint32_t dhcp_cli = 0;
+static uint32_t dhcp_bcast = 0;
+static uint32_t dhcp_mask = 0;
+static uint32_t dhcp_rt = 0;
+static uint32_t dhcp_renew = 0;
+static uint32_t dhcp_rebind = 0;
+/* XXX dhcp should use timers after sending packets, in case the packet being
+ * sent or the response packet is dropped. also it should set timers for
+ * renewing and rebinding after the address is bound. */
 
 static int
-setup_dhcp(void)
+send_dhcp(u_int8_t msgtype, uint32_t c_addr, uint32_t s_addr)
 {
-    char pcap_errbuf[PCAP_ERRBUF_SIZE];
-    char *dev;
-    u_int8_t options[4];
+    u_int8_t options[50];
     u_int16_t len;
-
-    dev = (char *)libnet_getdevice(lnh_link);
-
-    if (!(lph = pcap_open_live(dev, BUFSIZ, 0, 0, pcap_errbuf))) {
-        fprintf(stderr, "%s\n", pcap_errbuf);
-        return 1;
-    }
-    if (init_pcap(0, 0))
-        return 1;
-
-    if (dhcp_xid == 0) {
-        dhcp_xid = libnet_get_prand(LIBNET_PRu32);
-    }
+    int i;
 
     libnet_clear_packet(lnh_link);
 
-    options[0] = LIBNET_DHCP_MESSAGETYPE;
-    options[1] = 1;
-    options[2] = LIBNET_DHCP_MSGDISCOVER;
-    options[3] = LIBNET_DHCP_END;
+    i = 0;
+    options[i++] = LIBNET_DHCP_MESSAGETYPE;
+    options[i++] = 1;
+    options[i++] = msgtype;
+    if (s_addr != 0) {
+        options[i++] = LIBNET_DHCP_SERVIDENT;
+        options[i++] = 4;
+        memcpy(&options[i], &s_addr, 4);
+        i += 4;
+    }
+    if (c_addr != 0) {
+        options[i++] = LIBNET_DHCP_DISCOVERADDR;
+        options[i++] = 4;
+        memcpy(&options[i], &c_addr, 4);
+        i+= 4;
+    }
+    options[i++] = LIBNET_DHCP_PARAMREQUEST;
+    options[i++] = 4;
+    options[i++] = LIBNET_DHCP_STATICROUTE;   /* 0x21 */
+    options[i++] = LIBNET_DHCP_BROADCASTADDR; /* 0x1c */
+    options[i++] = LIBNET_DHCP_SUBNETMASK;    /* 0x01 */
+    options[i++] = LIBNET_DHCP_ROUTER;        /* 0x03 */
+    options[i++] = LIBNET_DHCP_END;
 
     if (libnet_build_dhcpv4(LIBNET_DHCP_REQUEST, ARPHRD_ETHER, ETHER_ADDR_LEN,
                             0, dhcp_xid, 0, 0,
                             0, 0, 0, 0, src_hw,
-                            NULL, NULL, options, sizeof (options),
+                            NULL, NULL, options, i,
                             lnh_link, 0) == -1) {
         fprintf(stderr, "%s", libnet_geterror(lnh_link));
         return 1;
     }
 
-    len = LIBNET_UDP_H + LIBNET_DHCPV4_H + sizeof (options);
+    len = LIBNET_UDP_H + LIBNET_DHCPV4_H + i;
     if (libnet_build_udp(68, 67, len, 0, NULL, 0, lnh_link, 0) == -1) {
         fprintf(stderr, "%s", libnet_geterror(lnh_link));
         return 1;
@@ -1467,13 +1483,220 @@ setup_dhcp(void)
     return send_ethernet(0xFFFFFFFF);
 }
 
+static void
+process_dhcp_packet(struct ip_pkt *ip)
+{
+    struct libnet_udp_hdr *udp_hdr;
+    struct libnet_dhcpv4_hdr *dhcp_hdr;
+    u_char *ptr;
+    u_char type = 0;
+    uint32_t srv, cli, bcast, mask, rt, renew, rebind;
+
+    udp_hdr = (struct libnet_udp_hdr *)ip->data;
+    if (ntohs(udp_hdr->uh_ulen) <= LIBNET_UDP_H + LIBNET_DHCPV4_H) {
+        fprintf(stderr, "invalid dhcp packet length\n");
+        return;
+    }
+
+    udp_hdr = (struct libnet_udp_hdr *)ip->data;
+    dhcp_hdr = (struct libnet_dhcpv4_hdr *)(ip->data + LIBNET_UDP_H);
+
+    if (dhcp_xid == 0 || dhcp_xid != ntohl(dhcp_hdr->dhcp_xid)) {
+        /* sigh. too bad we can't filter these out more easily. */
+        return;
+    }
+
+    ptr = ip->data + LIBNET_UDP_H + LIBNET_DHCPV4_H;
+    while (*ptr != LIBNET_DHCP_END) {
+        if ((ptr + 1 - ip->data > ntohs(udp_hdr->uh_ulen)) ||
+            (ptr + 2 + *(ptr + 1) - ip->data > ntohs(udp_hdr->uh_ulen))) {
+            fprintf(stderr, "invalid dhcp packet options\n");
+            return;
+        }
+
+        switch (*ptr) {
+        case LIBNET_DHCP_MESSAGETYPE:
+            if (*(ptr + 1) != 1) {
+                fprintf(stderr, "unexpected dhcp messagetype length %d\n",
+                        *(ptr + 1));
+                return;
+            }
+            cli = dhcp_hdr->dhcp_yip;
+            type = *(ptr + 2);
+            ptr += 3;
+            break;
+        case LIBNET_DHCP_SERVIDENT:
+            if (*(ptr + 1) != 4) {
+                fprintf(stderr, "unexpected dhcp servident length %d\n",
+                        *(ptr + 1));
+                return;
+            }
+            srv = *((uint32_t *)(ptr + 2));
+            ptr += 6;
+            break;
+        case LIBNET_DHCP_BROADCASTADDR:
+            if (*(ptr + 1) != 4) {
+                fprintf(stderr, "unexpected dhcp bcastaddr length %d\n",
+                        *(ptr + 1));
+                return;
+            }
+            bcast = *((uint32_t *)(ptr + 2));
+            ptr += 6;
+            break;
+        case LIBNET_DHCP_SUBNETMASK:
+            if (*(ptr + 1) != 4) {
+                fprintf(stderr, "unexpected dhcp subnet length %d\n",
+                        *(ptr + 1));
+                return;
+            }
+            mask = *((uint32_t *)(ptr + 2));
+            ptr += 6;
+            break;
+        case LIBNET_DHCP_ROUTER:
+            if (*(ptr + 1) != 4) {
+                fprintf(stderr, "unexpected dhcp router length %d\n",
+                        *(ptr + 1));
+                return;
+            }
+            rt = *((uint32_t *)(ptr + 2));
+            ptr += 6;
+            break;
+        case LIBNET_DHCP_RENEWTIME:
+            if (*(ptr + 1) != 4) {
+                fprintf(stderr, "unexpected dhcp renewtime length %d\n",
+                        *(ptr + 1));
+                return;
+            }
+            renew = *((uint32_t *)(ptr + 2));
+            ptr += 6;
+            break;
+        case LIBNET_DHCP_REBINDTIME:
+            if (*(ptr + 1) != 4) {
+                fprintf(stderr, "unexpected dhcp rebindtime length %d\n",
+                        *(ptr + 1));
+                return;
+            }
+            rebind = *((uint32_t *)(ptr + 2));
+            ptr += 6;
+            break;
+        default:
+            ptr += 1 + 1 + *(ptr + 1);
+            break;
+        }
+    }
+
+    if (type != LIBNET_DHCP_MSGOFFER &&
+        type != LIBNET_DHCP_MSGACK &&
+        type != LIBNET_DHCP_MSGNACK) {
+        fprintf(stderr, "invalid message type %d\n", type);
+        return;
+    }
+
+    if (dhcp_st == DHCP_SELECTING) {
+        if (type != LIBNET_DHCP_MSGOFFER) {
+            return;
+        }
+
+        /* XXX should send arp to make sure address is not already taken */
+
+        if (send_dhcp(LIBNET_DHCP_MSGREQUEST, cli, srv)) {
+            return;
+        }
+
+        dhcp_st = DHCP_REQUESTING;
+        printf("DHCP: %s %s from %s\n", dhcp_state_names[dhcp_st],
+               libnet_addr2name4(cli, LIBNET_DONT_RESOLVE),
+               libnet_addr2name4(srv, LIBNET_DONT_RESOLVE));
+
+        dhcp_srv = srv;
+        dhcp_cli = cli;
+        dhcp_bcast = bcast;
+        dhcp_mask = mask;
+        dhcp_rt = rt;
+        dhcp_renew = renew;
+        dhcp_rebind = rebind;
+    } else if (dhcp_st == DHCP_REQUESTING) {
+        if (type == LIBNET_DHCP_MSGOFFER) {
+            /* eh, just ignore. you don't really care. */
+            return;
+        }
+        if (srv != dhcp_srv) {
+            /* don't pay attention to servers other than ours */
+            return;
+        }
+        if (type == LIBNET_DHCP_MSGNACK) {
+            /* XXX should go back to INIT, send DISCOVER, go to SELECTING */
+            fprintf(stderr, "got NACK while REQUESTING, esta no bueno\n");
+            exit(1);
+        }
+
+        src_ip = dhcp_cli;
+        bcast_ip = dhcp_bcast;
+
+        if (init_pcap(src_ip, src_ip & dhcp_mask)) {
+            fprintf(stderr, "can't refilter pcap\n");
+            exit(1);
+        }
+
+        if (route_add(src_ip & mask, mask, 0)) {
+            exit(1);
+        }
+        if (route_add(0, 0, dhcp_rt)) {
+            exit(1);
+        }
+
+        dhcp_st = DHCP_BOUND;
+        printf("DHCP: %s to %s\n", dhcp_state_names[dhcp_st],
+               libnet_addr2name4(src_ip, LIBNET_DONT_RESOLVE));
+
+        /* XXX should send broadcast arp reply */
+    } else if (dhcp_st == DHCP_BOUND) {
+        /* just discard */
+    } else if (dhcp_st == DHCP_RENEWING) {
+    } else if (dhcp_st == DHCP_REBINDING) {
+    } else {
+        fprintf(stderr, "invalid DHCP state %s\n", dhcp_state_names[dhcp_st]);
+        return;
+    }
+}
+
+static int
+setup_dhcp(void)
+{
+    char pcap_errbuf[PCAP_ERRBUF_SIZE];
+    char *dev;
+
+    /* XXX should try to bind port 68 on the host, to make sure it's not doing
+     * DHCP as well, since we're using its MAC address. what would happen if
+     * there were two DHCP clients on the same MAC address? */
+
+    dev = (char *)libnet_getdevice(lnh_link);
+
+    if (!(lph = pcap_open_live(dev, BUFSIZ, 0, 0, pcap_errbuf))) {
+        fprintf(stderr, "%s\n", pcap_errbuf);
+        return 1;
+    }
+    if (init_pcap(0, 0))
+        return 1;
+
+    if (dhcp_xid == 0) {
+        dhcp_xid = libnet_get_prand(LIBNET_PRu32);
+    }
+
+    if (send_dhcp(LIBNET_DHCP_MSGDISCOVER, 0, 0)) {
+        return 1;
+    }
+
+    dhcp_st = DHCP_SELECTING;
+    printf("DHCP: %s\n", dhcp_state_names[dhcp_st]);
+    return 0;
+}
+
 static int
 setup_static(char **argv)
 {
     char pcap_errbuf[PCAP_ERRBUF_SIZE];
     char *dev;
-    struct arpreq req;
-    struct sockaddr_in *s_in;
     uint32_t mask, gw;
 
     dev = (char *)libnet_getdevice(lnh_link);
@@ -1501,6 +1724,8 @@ setup_static(char **argv)
     }
 
 #if 0
+    struct arpreq req;
+    struct sockaddr_in *s_in;
     /* disabling this for now as sending responses back to the host doesn't
      * work, so why bother feeding it bogus information if we're not going to
      * get anything out of it? just to be mean? */
@@ -1573,7 +1798,8 @@ process_udp_packet(struct ip_pkt *ip)
         }
     }
 
-    if (udp_hdr->uh_ulen < LIBNET_UDP_H) {
+    if ((udp_hdr->uh_ulen < LIBNET_UDP_H) ||
+        (ntohs(ip->hdr->ip_len) < (ip->hdr->ip_hl << 2) + ntohs(udp_hdr->uh_ulen))) {
         fprintf(stderr, "invalid UDP header (src %s)!\n",
                 libnet_addr2name4(ip->hdr->ip_src.s_addr, LIBNET_DONT_RESOLVE));
         return;
@@ -2114,8 +2340,8 @@ process_input(void)
             return;
         }
         *arg2++ = 0;
-
         create_session(arg1, atoi(arg2));
+        *(--arg2) = ' ';
     } else if (!strncasecmp(buf, "listen ", strlen("listen "))) {
         create_session(NULL, atoi(buf + strlen("listen ")));
     } else if (!strncasecmp(buf, "write ", strlen("write "))) {
@@ -2179,7 +2405,7 @@ process_input(void)
                 sess->state == TCP_SYN_SENT) {
                 remove_session(sess);
             } else if (sess->state == TCP_ESTABLISHED ||
-                    sess->state == TCP_SYN_RECV) {
+                       sess->state == TCP_SYN_RECV) {
                 send_tcp(sess, TH_FIN | TH_ACK, NULL, 0);
                 sess->state = TCP_FIN_WAIT1;
                 printf("%u: %s\n", sess->id, state_names[sess->state]);
@@ -2192,6 +2418,24 @@ process_input(void)
         }
         if (!l)
             printf("couldn't find %u\n", id);
+    } else if (!strcasecmp(buf, "closeall")) {
+        list *l = sessions;
+        while (l) {
+            TCB *sess = l->data;
+            l = l->next;
+            if (sess->state == TCP_SYN_SENT) {
+                remove_session(sess);
+            } else if (sess->state == TCP_ESTABLISHED ||
+                       sess->state == TCP_SYN_RECV) {
+                send_tcp(sess, TH_FIN | TH_ACK, NULL, 0);
+                sess->state = TCP_FIN_WAIT1;
+                printf("%u: %s\n", sess->id, state_names[sess->state]);
+            } else if (sess->state == TCP_CLOSE_WAIT) {
+                send_tcp(sess, TH_FIN | TH_ACK, NULL, 0);
+                sess->state = TCP_LAST_ACK;
+                printf("%u: %s\n", sess->id, state_names[sess->state]);
+            }
+        }
     } else if (!strcasecmp(buf, "netstat")) {
         list *l = sessions;
         printf("%-5s%-22s%-22s%s\n",
@@ -2263,8 +2507,7 @@ process_input(void)
                    t->end.tv_usec);
         }
     } else if (!strcasecmp(buf, "quit")) {
-        /* XXX should send RST to all the sessions, and remove the bogus arp
-         * entry from the host, though that required root, which we dropped */
+        /* XXX should send RST to all the sessions and send DHCPRELEASE */
         exit(0);
     }
 }
