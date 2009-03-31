@@ -18,19 +18,19 @@
  *     - header prediction
  *
  *   General:
- *     - argv parsing (specify device, user to run as, etc.)
- *     - better CLI (history would be nice, at least)
  *     - make sure not using loopback device
- *     - we can't talk to the host at all since moving to a link layer socket
+ *     - better CLI (history would be nice, at least, maybe in color)
+ *     - would be nice if we could drop root privs again (dhcp setting
+ *       host arp late and possibly changing long after we start running,
+ *       and wanting to remove it when quitting, makes that difficult)
  *
  *   And finally, all of the evil things I'd like to do:
- *    - Increased control over remote window size
+ *     - Increased control over remote window size
  */
 
 #include <libnet.h>
 #include <net/if_arp.h>
 #include <pcap.h>
-#include <pwd.h>
 
 /* LIST { */
 typedef struct _list {
@@ -200,7 +200,9 @@ static libnet_t *lnh_link = NULL;
 static pcap_t *lph;
 static unsigned char src_hw[ETHER_ADDR_LEN];
 static uint32_t src_ip = 0;
+static uint32_t src_mask = 0;
 static uint32_t bcast_ip = 0;
+static uint32_t host_ip = 0;
 static u_int16_t ip_id;
 static const u_int8_t ip_ttl = 64;
 static list *sessions = NULL;
@@ -414,7 +416,7 @@ static int
 send_ethernet(uint32_t dst_ip)
 {
     list *l = routing_table;
-    unsigned char *dst_hw = NULL, broadcast[ETHER_ADDR_LEN];
+    unsigned char *dst_hw = NULL, *snd_hw = src_hw, broadcast[ETHER_ADDR_LEN];
 
     memset(broadcast, 0xff, ETHER_ADDR_LEN);
 
@@ -438,6 +440,13 @@ send_ethernet(uint32_t dst_ip)
         } else {
             if (rt->gw != 0) {
                 dst_ip = rt->gw;
+            } else if (dst_ip == host_ip) {
+                /* the outbound side of the talk-to-the-host hack. if we're
+                 * sending to the host, send as broadcast to the default
+                 * gateway. this is really ugly, and confusing since it'll make
+                 * the packet show up in tcpdump twice */
+                snd_hw = broadcast;
+                continue;
             }
 
             dst_hw = arp_lookup(dst_ip);
@@ -454,7 +463,7 @@ send_ethernet(uint32_t dst_ip)
         return -1;
     }
 
-    if (libnet_build_ethernet(dst_hw, src_hw, ETHERTYPE_IP,
+    if (libnet_build_ethernet(dst_hw, snd_hw, ETHERTYPE_IP,
                               NULL, 0, lnh_link, 0) == -1) {
 
         fprintf(stderr, "%s", libnet_geterror(lnh_link));
@@ -1391,6 +1400,55 @@ init_pcap(uint32_t ip, uint32_t net)
     return 0;
 }
 
+static int
+setup_host_arp(void)
+{
+    struct arpreq req;
+    struct sockaddr_in *s_in;
+
+    /* so this is quite the hack. before doing anything else, we feed the host a
+     * fake ethernet address (I certainly hope no device actually exists that
+     * uses it!). then if the host wants to talk to us, it will send it out over
+     * the wire. the packet will go nowhere, but pcap will see it and we'll be
+     * able to process it. in this way the host can talk to us. */
+    memset(&req, 0, sizeof (req));
+    req.arp_flags = ATF_PERM | ATF_COM;
+    s_in = (struct sockaddr_in *)&req.arp_pa;
+    s_in->sin_family = AF_INET;
+    s_in->sin_port = 0;
+    s_in->sin_addr.s_addr = src_ip;
+    req.arp_ha.sa_family = ARPHRD_ETHER;
+    memset(req.arp_ha.sa_data, 0x01, ETHER_ADDR_LEN);
+    if (ioctl(libnet_getfd(lnh_link), SIOCSARP, &req) < 0) {
+        perror("SIOCSARP");
+        return 1;
+    }
+
+    return 0;
+}
+
+static int
+remove_host_arp(void)
+{
+    struct arpreq req;
+    struct sockaddr_in *s_in;
+
+    memset(&req, 0, sizeof (req));
+    req.arp_flags = ATF_PERM | ATF_COM;
+    s_in = (struct sockaddr_in *)&req.arp_pa;
+    s_in->sin_family = AF_INET;
+    s_in->sin_port = 0;
+    s_in->sin_addr.s_addr = src_ip;
+    req.arp_ha.sa_family = ARPHRD_ETHER;
+    memset(req.arp_ha.sa_data, 0x01, ETHER_ADDR_LEN);
+    if (ioctl(libnet_getfd(lnh_link), SIOCDARP, &req) < 0) {
+        perror("SIOCSARP");
+        return 1;
+    }
+
+    return 0;
+}
+
 typedef enum {
     DHCP_UNKNOWN,
     DHCP_INIT,
@@ -1631,7 +1689,19 @@ process_dhcp_packet(struct ip_pkt *ip)
         }
 
         src_ip = dhcp_cli;
-        bcast_ip = dhcp_bcast;
+        src_mask = dhcp_mask;
+        if (dhcp_bcast == 0)
+            bcast_ip = src_ip | ~src_mask;
+        else
+            bcast_ip = dhcp_bcast;
+
+        dhcp_st = DHCP_BOUND;
+        printf("DHCP: %s to %s\n", dhcp_state_names[dhcp_st],
+               libnet_addr2name4(src_ip, LIBNET_DONT_RESOLVE));
+
+        if (setup_host_arp()) {
+            exit(1);
+        }
 
         if (init_pcap(src_ip, src_ip & dhcp_mask)) {
             fprintf(stderr, "can't refilter pcap\n");
@@ -1644,10 +1714,6 @@ process_dhcp_packet(struct ip_pkt *ip)
         if (route_add(0, 0, dhcp_rt)) {
             exit(1);
         }
-
-        dhcp_st = DHCP_BOUND;
-        printf("DHCP: %s to %s\n", dhcp_state_names[dhcp_st],
-               libnet_addr2name4(src_ip, LIBNET_DONT_RESOLVE));
 
         /* XXX should send broadcast arp reply */
     } else if (dhcp_st == DHCP_BOUND) {
@@ -1697,7 +1763,7 @@ setup_static(char **argv)
 {
     char pcap_errbuf[PCAP_ERRBUF_SIZE];
     char *dev;
-    uint32_t mask, gw;
+    uint32_t gw;
 
     dev = (char *)libnet_getdevice(lnh_link);
 
@@ -1711,51 +1777,29 @@ setup_static(char **argv)
         fprintf(stderr, "invalid host name %s\n", argv[1]);
         return 1;
     }
-    mask = libnet_name2addr4(lnh_link, argv[2], LIBNET_DONT_RESOLVE);
-    if (mask == (uint32_t)-1) {
+    src_mask = libnet_name2addr4(lnh_link, argv[2], LIBNET_DONT_RESOLVE);
+    if (src_mask == (uint32_t)-1) {
         fprintf(stderr, "invalid mask %s\n", argv[2]);
         return 1;
     }
-    bcast_ip = src_ip | ~mask;
+    bcast_ip = src_ip | ~src_mask;
     gw = libnet_name2addr4(lnh_link, argv[3], LIBNET_RESOLVE);
-    if (gw == (uint32_t)-1 || ((gw & mask) != (src_ip & mask))) {
+    if (gw == (uint32_t)-1 || ((gw & src_mask) != (src_ip & src_mask))) {
         fprintf(stderr, "invalid gateway %s\n", argv[3]);
         return 1;
     }
 
-#if 0
-    struct arpreq req;
-    struct sockaddr_in *s_in;
-    /* disabling this for now as sending responses back to the host doesn't
-     * work, so why bother feeding it bogus information if we're not going to
-     * get anything out of it? just to be mean? */
-    /* so this is quite the hack. before doing anything else, we feed the host a
-     * fake ethernet address (I certainly hope no device actually exists that
-     * uses it!). then if the host wants to talk to us, it will send it out over
-     * the wire. the packet will go nowhere, but pcap will see it and we'll be
-     * able to process it. in this way we can talk to the host. */
-    memset(&req, 0, sizeof (req));
-    req.arp_flags = ATF_PERM | ATF_COM;
-    s_in = (struct sockaddr_in *)&req.arp_pa;
-    s_in->sin_family = AF_INET;
-    s_in->sin_port = 0;
-    s_in->sin_addr.s_addr = src_ip;
-    req.arp_ha.sa_family = ARPHRD_ETHER;
-    memcpy(req.arp_ha.sa_data, "\x00\x00\x00\x00\x00\x01", 6);
-    if (ioctl(libnet_getfd(lnh_link), SIOCSARP, &req) < 0) {
-        perror("SIOCSARP");
+    if (setup_host_arp())
         return 1;
-    }
-#endif
 
     if (!(lph = pcap_open_live(dev, BUFSIZ, 0, 0, pcap_errbuf))) {
         fprintf(stderr, "%s\n", pcap_errbuf);
         return 1;
     }
-    if (init_pcap(src_ip, src_ip & mask))
+    if (init_pcap(src_ip, src_ip & src_mask))
         return 1;
 
-    if (route_add(src_ip & mask, mask, 0)) {
+    if (route_add(src_ip & src_mask, src_mask, 0)) {
         return 1;
     }
     if (route_add(0, 0, gw)) {
@@ -2153,7 +2197,8 @@ process_ip_packet(struct libnet_ethernet_hdr *enet, uint32_t len)
         return;
     }
 
-    if (!memcmp(enet->ether_shost, src_hw, ETHER_ADDR_LEN)) {
+    if (!memcmp(enet->ether_shost, src_hw, ETHER_ADDR_LEN) &&
+        ip.hdr->ip_src.s_addr == host_ip) {
         ip.from_host = 1;
     } else {
         ip.from_host = 0;
@@ -2436,6 +2481,16 @@ process_input(void)
                 printf("%u: %s\n", sess->id, state_names[sess->state]);
             }
         }
+    } else if (!strcasecmp(buf, "ifconfig")) {
+        printf("pct0\tLink encap:Ethernet  HWaddr %02x:%02x:%02x:%02x:%02x:%02x\n",
+               src_hw[0], src_hw[1], src_hw[2], 
+               src_hw[3], src_hw[4], src_hw[5]);
+        printf("\tinet addr:%s  ",
+               libnet_addr2name4(src_ip, LIBNET_DONT_RESOLVE));
+        printf("Bcast:%s  ",
+               libnet_addr2name4(bcast_ip, LIBNET_DONT_RESOLVE));
+        printf("Mask:%s\n",
+               libnet_addr2name4(src_mask, LIBNET_DONT_RESOLVE));
     } else if (!strcasecmp(buf, "netstat")) {
         list *l = sessions;
         printf("%-5s%-22s%-22s%s\n",
@@ -2508,6 +2563,7 @@ process_input(void)
         }
     } else if (!strcasecmp(buf, "quit")) {
         /* XXX should send RST to all the sessions and send DHCPRELEASE */
+        remove_host_arp();
         exit(0);
     }
 }
@@ -2517,9 +2573,7 @@ int
 main(int argc, char **argv)
 {
     char net_errbuf[LIBNET_ERRBUF_SIZE];
-
-    const char *user = "nobody";
-    struct passwd *pswd;
+    struct ifreq ifr;
 
     if (argc != 4 && (argc != 2 || strcasecmp(argv[1], "dhcp"))) {
         printf("Usage: %s <ip mask gw | dhcp>\n", argv[0]);
@@ -2531,6 +2585,17 @@ main(int argc, char **argv)
         return 1;
     }
 
+    /* we need to get the host IP for two reasons: its checksums are sometimes
+     * bad (since we get them from pcap before the checksum has been properly
+     * calculated), and if we want to send packets to it, we actually need to
+     * send them to our local gateway. */
+    sprintf(ifr.ifr_name, "%s", libnet_getdevice(lnh_link));
+    if (ioctl(libnet_getfd(lnh_link), SIOCGIFADDR, &ifr) < 0) {
+        fprintf(stderr, "can't get host IP address\n");
+        return 1;
+    }
+    host_ip = ((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr.s_addr;
+
     memcpy(src_hw, libnet_get_hwaddr(lnh_link), ETHER_ADDR_LEN);
     libnet_seed_prand(lnh_link);
     ip_id = libnet_get_prand(LIBNET_PRu16);
@@ -2541,14 +2606,6 @@ main(int argc, char **argv)
     } else {
         if (setup_static(argv))
             return 1;
-    }
-
-    /* now that we've created all of our sockets and opened up pcap, drop root
-     * privileges and run as specified user (which defaults to 'nobody'). */
-    pswd = getpwnam(user);
-    if (!pswd || setuid(pswd->pw_uid)) {
-        fprintf(stderr, "I ain't %s! (can't drop root privs)\n", user);
-        return 1;
     }
 
     while (1) {

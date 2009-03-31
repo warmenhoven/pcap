@@ -1,4 +1,4 @@
-LDLIBS += -lnet -lpcap -lpthread
+LDLIBS += -lnet -lpcap
 
 TARGET = pctest
 
@@ -65,7 +65,7 @@ CFLAGS += $(NITPICKY_WARNINGS)
 endif
 
 ifneq "$(DEBUG)" ""
-CFLAGS += -g3 -O0
+CFLAGS += -g3 -O0 -funit-at-a-time
 else
 CFLAGS += -O3
 endif
