@@ -2539,12 +2539,13 @@ process_input(void)
         list *l = routing_table;
         printf("%-16s%-16s%s\n", "Destination", "Gateway", "Genmask");
         while (l) {
+            char dest[16], gw[16], mask[16];
             struct route_row *rt = l->data;
             l = l->next;
-            printf("%-16s%-16s%s\n",
-                   libnet_addr2name4(rt->dest, LIBNET_DONT_RESOLVE),
-                   libnet_addr2name4(rt->gw, LIBNET_DONT_RESOLVE),
-                   libnet_addr2name4(rt->mask, LIBNET_DONT_RESOLVE));
+            strcpy(dest, libnet_addr2name4(rt->dest, LIBNET_DONT_RESOLVE));
+            strcpy(gw, libnet_addr2name4(rt->gw, LIBNET_DONT_RESOLVE));
+            strcpy(mask, libnet_addr2name4(rt->mask, LIBNET_DONT_RESOLVE));
+            printf("%-16s%-16s%s\n", dest, gw, mask);
         }
     } else if (!strncasecmp(buf, "timer ", strlen("timer "))) {
         struct timeval tv;
