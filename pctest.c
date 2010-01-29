@@ -523,6 +523,7 @@ typedef struct tcp_session {
     uint32_t ackno;   /* aka RCV.NXT */
     uint32_t rcv_win; /* aka RCV.WND */
     uint32_t irs;
+    uint32_t unused;
 
     list *rx;
 
@@ -548,6 +549,7 @@ struct ip_pkt {
     u_char *options;
     u_char *data;
     int from_host;
+    int unused;
 };
 
 struct icmp_pkt {
@@ -562,6 +564,7 @@ struct tcp_pkt {
     u_char *tcp_options;
     u_char *data;
     uint32_t data_len;
+    int unused;
 };
 
 /* TCP UTIL { */
@@ -1730,13 +1733,13 @@ static int
 setup_dhcp(void)
 {
     char pcap_errbuf[PCAP_ERRBUF_SIZE];
-    char *dev;
+    const char *dev;
 
     /* XXX should try to bind port 68 on the host, to make sure it's not doing
      * DHCP as well, since we're using its MAC address. what would happen if
      * there were two DHCP clients on the same MAC address? */
 
-    dev = (char *)libnet_getdevice(lnh_link);
+    dev = libnet_getdevice(lnh_link);
 
     if (!(lph = pcap_open_live(dev, BUFSIZ, 0, 0, pcap_errbuf))) {
         fprintf(stderr, "%s\n", pcap_errbuf);
@@ -1762,10 +1765,10 @@ static int
 setup_static(char **argv)
 {
     char pcap_errbuf[PCAP_ERRBUF_SIZE];
-    char *dev;
+    const char *dev;
     uint32_t gw;
 
-    dev = (char *)libnet_getdevice(lnh_link);
+    dev = libnet_getdevice(lnh_link);
 
     /* you need to pick this IP address based on two characteristics:
      *

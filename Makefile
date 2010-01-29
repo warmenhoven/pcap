@@ -57,9 +57,7 @@ NITPICKY_WARNINGS +=	\
 			-Wunused \
 			-Wwrite-strings \
 			-pedantic \
-
-# libnet has an inline prototype
-#			-std=c99 \
+			-std=c99 \
 
 CFLAGS += $(NITPICKY_WARNINGS)
 endif
@@ -67,5 +65,5 @@ endif
 ifneq "$(DEBUG)" ""
 CFLAGS += -g3 -O0 -funit-at-a-time
 else
-CFLAGS += -O3
+CFLAGS += -O3 -fno-strict-aliasing
 endif
